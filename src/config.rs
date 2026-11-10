@@ -44,6 +44,7 @@ struct FileConfig {
     pub codex: Option<CodexConfig>,
     pub cursor: Option<CursorConfig>,
     pub grok: Option<GrokConfig>,
+    pub muse: Option<MuseConfig>,
     pub opencode: Option<OpenCodeConfig>,
 }
 
@@ -110,6 +111,18 @@ struct GrokConfig {
     pub base_url: Option<String>,
     #[serde(rename = "clientVersion")]
     pub client_version: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+struct MuseConfig {
+    #[serde(rename = "baseUrl")]
+    pub base_url: Option<String>,
+    #[serde(rename = "oauthHost")]
+    pub oauth_host: Option<String>,
+    #[serde(rename = "mintBaseUrl")]
+    pub mint_base_url: Option<String>,
+    #[serde(rename = "userAgent")]
+    pub user_agent: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -299,6 +312,18 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_GROK_CLIENT_VERSION") {
         out.push("grok.clientVersion (env)".to_string());
     }
+    if env.contains_key("CCP_MUSE_BASE_URL") {
+        out.push("muse.baseUrl (env)".to_string());
+    }
+    if env.contains_key("CCP_MUSE_OAUTH_HOST") {
+        out.push("muse.oauthHost (env)".to_string());
+    }
+    if env.contains_key("CCP_MUSE_MINT_BASE_URL") {
+        out.push("muse.mintBaseUrl (env)".to_string());
+    }
+    if env.contains_key("CCP_MUSE_USER_AGENT") {
+        out.push("muse.userAgent (env)".to_string());
+    }
     if env.contains_key("CCP_OPENCODE_API_KEY") {
         out.push("opencode.apiKey (env)".to_string());
     } else if env.contains_key("OPENCODE_API_KEY") {
@@ -417,6 +442,141 @@ pub fn grok_client_version() -> String {
         return version;
     }
     "1.0.13".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Muse config
+// ---------------------------------------------------------------------------
+
+fn muse_file_config() -> Option<MuseConfig> {
+    read_file_config(&paths::config_dir()).and_then(|f| f.muse)
+}
+
+/// Model API base URL. The key mint also returns one, which the provider
+/// accepts only when it points at this URL's host over https.
+pub fn muse_base_url() -> anyhow::Result<String> {
+    muse_endpoint(
+        "CCP_MUSE_BASE_URL",
+        "muse.baseUrl",
+        |muse| muse.base_url,
+        "https://api.meta.ai/v1",
+    )
+}
+
+/// Origin of the device-code OAuth endpoints.
+pub fn muse_oauth_host() -> anyhow::Result<String> {
+    muse_endpoint(
+        "CCP_MUSE_OAUTH_HOST",
+        "muse.oauthHost",
+        |muse| muse.oauth_host,
+        "https://auth.meta.com",
+    )
+}
+
+/// Origin of the API key mint. The mint lives at the API host root, not under
+/// the `/v1` prefix of the Model API.
+pub fn muse_mint_base_url() -> anyhow::Result<String> {
+    muse_endpoint(
+        "CCP_MUSE_MINT_BASE_URL",
+        "muse.mintBaseUrl",
+        |muse| muse.mint_base_url,
+        "https://api.meta.ai",
+    )
+}
+
+/// Reads one Muse endpoint. These hosts receive the Meta access token and the
+/// API key, so a value that is not https (or plain http to a loopback host)
+/// or that carries user info is an error naming the setting, never a silent
+/// fallback to the default.
+fn muse_endpoint(
+    env_name: &str,
+    file_key: &str,
+    from_file: impl FnOnce(MuseConfig) -> Option<String>,
+    default: &str,
+) -> anyhow::Result<String> {
+    muse_setting(
+        env_name,
+        file_key,
+        from_file,
+        default,
+        validate_muse_endpoint,
+    )
+}
+
+/// Reads one Muse setting with env over config.json over the default and
+/// returns it trimmed, as validated. An invalid value is an error naming the
+/// setting; the value is not repeated in it, since it may hold credentials.
+fn muse_setting(
+    env_name: &str,
+    file_key: &str,
+    from_file: impl FnOnce(MuseConfig) -> Option<String>,
+    default: &str,
+    validate: fn(&str) -> Result<(), &'static str>,
+) -> anyhow::Result<String> {
+    // An empty or blank value means "not set", as for the other providers'
+    // base URLs, and falls through to the next source.
+    let set = |raw: String| {
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    let (value, setting) = match std::env::var(env_name).ok().and_then(set) {
+        Some(value) => (value, env_name.to_string()),
+        None => match muse_file_config().and_then(from_file).and_then(set) {
+            Some(value) => (value, format!("{file_key} in config.json")),
+            None => return Ok(default.to_string()),
+        },
+    };
+    validate(&value)
+        .map_err(|reason| anyhow::anyhow!("Invalid Muse setting {setting}: {reason}"))?;
+    Ok(value)
+}
+
+fn validate_muse_endpoint(value: &str) -> Result<(), &'static str> {
+    let url = url::Url::parse(value).map_err(|_| "not a valid URL")?;
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        // `localhost.` is the same name written fully qualified.
+        Some(url::Host::Domain(domain)) => domain
+            .strip_suffix('.')
+            .unwrap_or(domain)
+            .eq_ignore_ascii_case("localhost"),
+        None => return Err("the URL has no host"),
+    };
+    match url.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        _ => return Err("must use https (plain http only for a loopback host)"),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("must not contain a user name or password");
+    }
+    Ok(())
+}
+
+/// User-Agent for every Muse request, including those that carry the access
+/// token or the API key. The OAuth host redirects requests that carry none,
+/// so the default is never empty.
+pub fn muse_user_agent() -> anyhow::Result<String> {
+    muse_setting(
+        "CCP_MUSE_USER_AGENT",
+        "muse.userAgent",
+        |muse| muse.user_agent,
+        &format!("claude-code-proxy/{}", env!("CARGO_PKG_VERSION")),
+        validate_muse_user_agent,
+    )
+}
+
+const MAX_MUSE_USER_AGENT_LEN: usize = 256;
+
+fn validate_muse_user_agent(value: &str) -> Result<(), &'static str> {
+    if value.len() > MAX_MUSE_USER_AGENT_LEN {
+        return Err("must be at most 256 characters");
+    }
+    if !value.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
+        return Err("must contain only printable ASCII characters");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,6 +1245,10 @@ mod tests {
             EnvGuard::unset("CCP_CODEX_HEADER_TIMEOUT_MS"),
             EnvGuard::unset("CCP_AUTO_REVIEW_MODEL"),
             EnvGuard::unset("CCP_GROK_CLIENT_VERSION"),
+            EnvGuard::unset("CCP_MUSE_BASE_URL"),
+            EnvGuard::unset("CCP_MUSE_OAUTH_HOST"),
+            EnvGuard::unset("CCP_MUSE_MINT_BASE_URL"),
+            EnvGuard::unset("CCP_MUSE_USER_AGENT"),
         ];
         guards.push(EnvGuard::set("CCP_CONFIG_DIR", config.path()));
         guards
@@ -1113,6 +1277,314 @@ mod tests {
 
         let _version = EnvGuard::set("CCP_GROK_CLIENT_VERSION", "1.0.15");
         assert_eq!(grok_client_version(), "1.0.15");
+    }
+
+    #[test]
+    fn muse_settings_default_then_config_then_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _guards = isolated_env(&config);
+        assert_eq!(muse_base_url().unwrap(), "https://api.meta.ai/v1");
+        assert_eq!(muse_oauth_host().unwrap(), "https://auth.meta.com");
+        assert_eq!(muse_mint_base_url().unwrap(), "https://api.meta.ai");
+        assert_eq!(
+            muse_user_agent().unwrap(),
+            format!("claude-code-proxy/{}", env!("CARGO_PKG_VERSION"))
+        );
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"muse":{"baseUrl":"https://file.example/v1","oauthHost":"https://auth.file.example","mintBaseUrl":"https://mint.file.example","userAgent":"file-agent/1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(muse_base_url().unwrap(), "https://file.example/v1");
+        assert_eq!(muse_oauth_host().unwrap(), "https://auth.file.example");
+        assert_eq!(muse_mint_base_url().unwrap(), "https://mint.file.example");
+        assert_eq!(muse_user_agent().unwrap(), "file-agent/1");
+
+        let _base = EnvGuard::set("CCP_MUSE_BASE_URL", "http://127.0.0.1:9/v1");
+        let _oauth = EnvGuard::set("CCP_MUSE_OAUTH_HOST", "http://127.0.0.1:9");
+        let _mint = EnvGuard::set("CCP_MUSE_MINT_BASE_URL", "http://127.0.0.1:10");
+        let _ua = EnvGuard::set("CCP_MUSE_USER_AGENT", "env-agent/2");
+        assert_eq!(muse_base_url().unwrap(), "http://127.0.0.1:9/v1");
+        assert_eq!(muse_oauth_host().unwrap(), "http://127.0.0.1:9");
+        assert_eq!(muse_mint_base_url().unwrap(), "http://127.0.0.1:10");
+        assert_eq!(muse_user_agent().unwrap(), "env-agent/2");
+    }
+
+    #[test]
+    fn muse_settings_partial_config_keeps_other_defaults() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _guards = isolated_env(&config);
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"muse":{"oauthHost":"https://auth.file.example"}}"#,
+        )
+        .unwrap();
+        assert_eq!(muse_oauth_host().unwrap(), "https://auth.file.example");
+        assert_eq!(muse_base_url().unwrap(), "https://api.meta.ai/v1");
+        assert_eq!(muse_mint_base_url().unwrap(), "https://api.meta.ai");
+    }
+
+    #[test]
+    fn muse_endpoint_synthetic_unsafe_values_are_rejected_with_the_setting_name() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _guards = isolated_env(&config);
+        type Getter = fn() -> anyhow::Result<String>;
+        let getters: [(&str, &str, Getter); 3] = [
+            ("CCP_MUSE_BASE_URL", "baseUrl", muse_base_url),
+            ("CCP_MUSE_OAUTH_HOST", "oauthHost", muse_oauth_host),
+            ("CCP_MUSE_MINT_BASE_URL", "mintBaseUrl", muse_mint_base_url),
+        ];
+        const NOT_HTTPS: &str = "must use https (plain http only for a loopback host)";
+        const USER_INFO: &str = "must not contain a user name or password";
+        let rejected = [
+            ("http://relay.example/v1", NOT_HTTPS),
+            ("http://10.0.0.1/v1", NOT_HTTPS),
+            ("ftp://127.0.0.1/v1", NOT_HTTPS),
+            ("https://user:synthetic-pass@api.meta.ai/v1", USER_INFO),
+            ("https://user@api.meta.ai/v1", USER_INFO),
+            ("http://user@127.0.0.1:9/v1", USER_INFO),
+            ("api.meta.ai/v1", "not a valid URL"),
+        ];
+        for (env_name, file_key, getter) in getters {
+            for (value, reason) in rejected {
+                let guard = EnvGuard::set(env_name, value);
+                let error = getter().unwrap_err().to_string();
+                assert_eq!(
+                    error,
+                    format!("Invalid Muse setting {env_name}: {reason}"),
+                    "{value}"
+                );
+                assert!(!error.contains("synthetic-pass"), "{error}");
+                drop(guard);
+
+                std::fs::write(
+                    config.path().join("config.json"),
+                    serde_json::json!({"muse": {file_key: value}}).to_string(),
+                )
+                .unwrap();
+                assert_eq!(
+                    getter().unwrap_err().to_string(),
+                    format!("Invalid Muse setting muse.{file_key} in config.json: {reason}"),
+                    "{value}"
+                );
+                std::fs::remove_file(config.path().join("config.json")).unwrap();
+            }
+            for accepted in [
+                "http://127.0.0.1:9/v1",
+                "http://127.1.2.3:9",
+                "http://[::1]:9/v1",
+                "http://localhost:9",
+                "http://localhost.:9",
+                "http://LocalHost.:9/v1",
+                "https://relay.example:8443/v1",
+            ] {
+                let _guard = EnvGuard::set(env_name, accepted);
+                assert_eq!(getter().unwrap(), accepted);
+            }
+        }
+    }
+
+    #[test]
+    fn muse_endpoint_synthetic_empty_values_fall_through_to_the_next_source() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _guards = isolated_env(&config);
+        type Getter = fn() -> anyhow::Result<String>;
+        let getters: [(&str, &str, Getter, &str); 3] = [
+            (
+                "CCP_MUSE_BASE_URL",
+                "baseUrl",
+                muse_base_url,
+                "https://api.meta.ai/v1",
+            ),
+            (
+                "CCP_MUSE_OAUTH_HOST",
+                "oauthHost",
+                muse_oauth_host,
+                "https://auth.meta.com",
+            ),
+            (
+                "CCP_MUSE_MINT_BASE_URL",
+                "mintBaseUrl",
+                muse_mint_base_url,
+                "https://api.meta.ai",
+            ),
+        ];
+        let path = config.path().join("config.json");
+        for (env_name, file_key, getter, default) in getters {
+            for blank in ["", "   ", "\t\n"] {
+                // Blank environment, nothing in the file: the default.
+                let env = EnvGuard::set(env_name, blank);
+                assert_eq!(getter().unwrap(), default, "{env_name}={blank:?}");
+
+                // Blank environment, a file value: the file value.
+                std::fs::write(
+                    &path,
+                    serde_json::json!({"muse": {file_key: "https://file.example/v1"}}).to_string(),
+                )
+                .unwrap();
+                assert_eq!(getter().unwrap(), "https://file.example/v1", "{env_name}");
+
+                // Blank in both: the default.
+                std::fs::write(
+                    &path,
+                    serde_json::json!({"muse": {file_key: blank}}).to_string(),
+                )
+                .unwrap();
+                assert_eq!(getter().unwrap(), default, "{file_key}={blank:?}");
+                drop(env);
+                assert_eq!(getter().unwrap(), default, "{file_key}={blank:?}");
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn muse_endpoint_synthetic_padded_values_are_returned_trimmed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _guards = isolated_env(&config);
+        type Getter = fn() -> anyhow::Result<String>;
+        let getters: [(&str, &str, Getter); 3] = [
+            ("CCP_MUSE_BASE_URL", "baseUrl", muse_base_url),
+            ("CCP_MUSE_OAUTH_HOST", "oauthHost", muse_oauth_host),
+            ("CCP_MUSE_MINT_BASE_URL", "mintBaseUrl", muse_mint_base_url),
+        ];
+        let path = config.path().join("config.json");
+        for (env_name, file_key, getter) in getters {
+            let env = EnvGuard::set(env_name, " https://relay.example/v1 \t\n");
+            assert_eq!(getter().unwrap(), "https://relay.example/v1", "{env_name}");
+            drop(env);
+            std::fs::write(
+                &path,
+                serde_json::json!({"muse": {file_key: "\thttp://localhost.:9 "}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(getter().unwrap(), "http://localhost.:9", "{file_key}");
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn muse_user_agent_synthetic_printable_ascii_up_to_256_characters_is_accepted() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _guards = isolated_env(&config);
+        let longest = "a".repeat(256);
+        for (value, expected) in [
+            // The Muse CLI's own User-Agents on the Model API and the mint.
+            (
+                "muse-build/1.4.14 (non-interactive; macos-aarch64; build dec7d7497fecdad135ec5835a8161dbc92e55b58)",
+                "muse-build/1.4.14 (non-interactive; macos-aarch64; build dec7d7497fecdad135ec5835a8161dbc92e55b58)",
+            ),
+            ("muse-build/0.1.0", "muse-build/0.1.0"),
+            ("  curl/8.7.1 ", "curl/8.7.1"),
+            (
+                "~!@#$%^&*()_+{}|:\"<>?`-=[]\\;',./",
+                "~!@#$%^&*()_+{}|:\"<>?`-=[]\\;',./",
+            ),
+            (longest.as_str(), longest.as_str()),
+        ] {
+            let _ua = EnvGuard::set("CCP_MUSE_USER_AGENT", value);
+            assert_eq!(muse_user_agent().unwrap(), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn muse_user_agent_synthetic_invalid_values_are_rejected_with_the_setting_name() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _guards = isolated_env(&config);
+        const TOO_LONG: &str = "must be at most 256 characters";
+        const NOT_PRINTABLE: &str = "must contain only printable ASCII characters";
+        let path = config.path().join("config.json");
+        let too_long = format!("synthetic-marker-{}", "a".repeat(240));
+        for (value, reason) in [
+            (too_long.as_str(), TOO_LONG),
+            ("synthetic-marker\r\nX-Injected: 1", NOT_PRINTABLE),
+            ("synthetic-marker\tagent", NOT_PRINTABLE),
+            ("synthetic-marker\u{7f}", NOT_PRINTABLE),
+            ("synthetic-marker\u{1b}[2J", NOT_PRINTABLE),
+            ("synthetic-marker/\u{e9}", NOT_PRINTABLE),
+        ] {
+            let guard = EnvGuard::set("CCP_MUSE_USER_AGENT", value);
+            let error = muse_user_agent().unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!("Invalid Muse setting CCP_MUSE_USER_AGENT: {reason}"),
+                "{value:?}"
+            );
+            assert!(!error.contains("synthetic-marker"), "{error}");
+            drop(guard);
+
+            std::fs::write(
+                &path,
+                serde_json::json!({"muse": {"userAgent": value}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(
+                muse_user_agent().unwrap_err().to_string(),
+                format!("Invalid Muse setting muse.userAgent in config.json: {reason}"),
+                "{value:?}"
+            );
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn muse_user_agent_synthetic_blank_values_fall_through_to_the_next_source() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _guards = isolated_env(&config);
+        let default = format!("claude-code-proxy/{}", env!("CARGO_PKG_VERSION"));
+        let path = config.path().join("config.json");
+        for blank in ["", "   ", "\t\n"] {
+            let env = EnvGuard::set("CCP_MUSE_USER_AGENT", blank);
+            assert_eq!(muse_user_agent().unwrap(), default, "{blank:?}");
+            std::fs::write(
+                &path,
+                serde_json::json!({"muse": {"userAgent": "file-agent/1"}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(muse_user_agent().unwrap(), "file-agent/1", "{blank:?}");
+            std::fs::write(
+                &path,
+                serde_json::json!({"muse": {"userAgent": blank}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(muse_user_agent().unwrap(), default, "{blank:?}");
+            drop(env);
+            assert_eq!(muse_user_agent().unwrap(), default, "{blank:?}");
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn muse_env_overrides_are_listed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _guards = isolated_env(&config);
+        let loaded = load_config_for_env(&config_env(&config));
+        let before = config_override_summary_lines(&loaded);
+        assert!(!before.iter().any(|line| line.starts_with("muse.")));
+
+        let _base = EnvGuard::set("CCP_MUSE_BASE_URL", "http://127.0.0.1:9/v1");
+        let _oauth = EnvGuard::set("CCP_MUSE_OAUTH_HOST", "http://127.0.0.1:9");
+        let _mint = EnvGuard::set("CCP_MUSE_MINT_BASE_URL", "http://127.0.0.1:10");
+        let _ua = EnvGuard::set("CCP_MUSE_USER_AGENT", "env-agent/2");
+        let lines = config_override_summary_lines(&loaded);
+        for expected in [
+            "muse.baseUrl (env)",
+            "muse.oauthHost (env)",
+            "muse.mintBaseUrl (env)",
+            "muse.userAgent (env)",
+        ] {
+            assert!(lines.iter().any(|line| line == expected), "{lines:?}");
+        }
     }
 
     #[test]
