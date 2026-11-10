@@ -71,6 +71,11 @@ enum Commands {
         #[command(subcommand)]
         command: ProviderGroup,
     },
+    /// Manage Meta Muse Code authentication
+    Muse {
+        #[command(subcommand)]
+        command: ProviderGroup,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -190,6 +195,7 @@ fn main() -> Result<()> {
         Commands::Kimi { command } => run_provider_cli("kimi", command),
         Commands::Cursor { command } => run_provider_cli("cursor", command),
         Commands::Grok { command } => run_provider_cli("grok", command),
+        Commands::Muse { command } => run_provider_cli("muse", command),
     }
 }
 
@@ -328,7 +334,7 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
 
 fn print_models(registry: &Registry, full: bool) {
     let grouped = registry.grouped_models();
-    for provider in ["codex", "kimi", "grok", "opencode", "cursor"] {
+    for provider in ["codex", "kimi", "grok", "muse", "opencode", "cursor"] {
         let Some(models) = grouped.get(provider) else {
             continue;
         };

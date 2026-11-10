@@ -14,6 +14,42 @@ use crate::auth::AuthStorage;
 use crate::provider::CliHandlers;
 use crate::providers::muse::usage::UsageWindow;
 
+/// The command runner exits 1 only for this exact message, so the reason
+/// and the login hint go to stderr instead of into the message.
+const NOT_AUTHENTICATED: &str = "Not authenticated";
+
+/// Why `status` could not describe the account.
+#[derive(Debug)]
+pub enum StatusFailure {
+    /// No stored login.
+    NotAuthenticated,
+    /// The mint answered 401: the stored login no longer works.
+    LoginInvalid,
+    /// Any other failure (unreachable, rejected, unreadable file).
+    Other(anyhow::Error),
+}
+
+impl StatusFailure {
+    /// Guidance for stderr, and the error the command runner maps to an
+    /// exit status: exactly "Not authenticated" (exit 1) when a new login
+    /// is the fix, the failure's own message (exit 2) otherwise.
+    pub fn into_guidance_and_error(self) -> (Option<String>, anyhow::Error) {
+        match self {
+            StatusFailure::NotAuthenticated => (
+                Some(format!("Run: {LOGIN_COMMAND}")),
+                anyhow::anyhow!(NOT_AUTHENTICATED),
+            ),
+            StatusFailure::LoginInvalid => (
+                Some(format!(
+                    "Muse login is no longer valid. Run: {LOGIN_COMMAND}"
+                )),
+                anyhow::anyhow!(NOT_AUTHENTICATED),
+            ),
+            StatusFailure::Other(error) => (None, error),
+        }
+    }
+}
+
 pub struct MuseCli;
 pub static MUSE_CLI: MuseCli = MuseCli;
 
@@ -38,9 +74,20 @@ impl CliHandlers for MuseCli {
             &target,
             now_ms(),
             &TimeZone::system(),
-        )?;
-        println!("{report}");
-        Ok(())
+        );
+        match report {
+            Ok(report) => {
+                println!("{report}");
+                Ok(())
+            }
+            Err(failure) => {
+                let (guidance, error) = failure.into_guidance_and_error();
+                if let Some(guidance) = guidance {
+                    eprintln!("{guidance}");
+                }
+                Err(error)
+            }
+        }
     }
 
     fn logout(&self) -> anyhow::Result<()> {
@@ -69,19 +116,16 @@ pub fn status_report<S: AuthStorage<StoredAuth>>(
     target: &MintTarget,
     now_ms: u64,
     time_zone: &TimeZone,
-) -> anyhow::Result<String> {
+) -> Result<String, StatusFailure> {
     let path = store.auth_path();
-    let Some(auth) = store.load_auth()? else {
-        anyhow::bail!("Not authenticated with Muse. Run: {LOGIN_COMMAND}");
+    let Some(auth) = store.load_auth().map_err(StatusFailure::Other)? else {
+        return Err(StatusFailure::NotAuthenticated);
     };
-    let minted = mint::mint_blocking(client, target, &auth.access_token).map_err(|error| {
-        match error {
-            MintError::Unauthorized => anyhow::anyhow!(
-                "Muse login stored in {path} is no longer valid (upstream HTTP 401). Run: {LOGIN_COMMAND}"
-            ),
-            other => anyhow::anyhow!("{}", other.message_with_status()),
-        }
-    })?;
+    let minted =
+        mint::mint_blocking(client, target, &auth.access_token).map_err(|error| match error {
+            MintError::Unauthorized => StatusFailure::LoginInvalid,
+            other => StatusFailure::Other(anyhow::anyhow!("{}", other.message_with_status())),
+        })?;
 
     let mut lines = vec![format!("Auth path: {path}"), "Authenticated: true".into()];
     if let Some(name) = minted
@@ -236,21 +280,46 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let store = store_at(temp.path().join("auth.json").to_string_lossy().into_owned());
         store.save_auth(stored()).unwrap();
-        let error = status_report(
+        let failure = status_report(
             &store,
             &blocking_client(),
             &target(&base),
             OBTAINED_AT_MS,
             &TimeZone::UTC,
         )
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("no longer valid"), "{error}");
+        .unwrap_err();
         assert!(
-            error.contains("claude-code-proxy muse auth login"),
-            "{error}"
+            matches!(failure, StatusFailure::LoginInvalid),
+            "{failure:?}"
         );
-        assert!(!error.contains(ACCESS_TOKEN));
+        let (guidance, error) = failure.into_guidance_and_error();
+        assert_eq!(
+            guidance.as_deref(),
+            Some("Muse login is no longer valid. Run: claude-code-proxy muse auth login")
+        );
+        assert_eq!(error.to_string(), "Not authenticated");
+    }
+
+    #[test]
+    fn status_with_an_unavailable_mint_keeps_its_own_message() {
+        let (_runtime, base, _) = with_mint(StatusCode::SERVICE_UNAVAILABLE, "{}".into());
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = store_at(temp.path().join("auth.json").to_string_lossy().into_owned());
+        store.save_auth(stored()).unwrap();
+        let failure = status_report(
+            &store,
+            &blocking_client(),
+            &target(&base),
+            OBTAINED_AT_MS,
+            &TimeZone::UTC,
+        )
+        .unwrap_err();
+        let (guidance, error) = failure.into_guidance_and_error();
+        assert_eq!(guidance, None);
+        assert_eq!(
+            error.to_string(),
+            "Muse key service is unavailable (upstream HTTP 503)"
+        );
     }
 
     #[test]
@@ -258,19 +327,24 @@ mod tests {
         let (_runtime, base, log) = with_mint(StatusCode::OK, observed_mint_body().to_string());
         let temp = tempfile::TempDir::new().unwrap();
         let store = store_at(temp.path().join("auth.json").to_string_lossy().into_owned());
-        let error = status_report(
+        let failure = status_report(
             &store,
             &blocking_client(),
             &target(&base),
             OBTAINED_AT_MS,
             &TimeZone::UTC,
         )
-        .unwrap_err()
-        .to_string();
-        assert_eq!(
-            error,
-            "Not authenticated with Muse. Run: claude-code-proxy muse auth login"
+        .unwrap_err();
+        assert!(
+            matches!(failure, StatusFailure::NotAuthenticated),
+            "{failure:?}"
         );
+        let (guidance, error) = failure.into_guidance_and_error();
+        assert_eq!(
+            guidance.as_deref(),
+            Some("Run: claude-code-proxy muse auth login")
+        );
+        assert_eq!(error.to_string(), "Not authenticated");
         assert!(log.lock().unwrap().is_empty());
     }
 

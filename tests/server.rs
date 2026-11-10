@@ -1806,3 +1806,635 @@ async fn models_endpoint_tolerates_unknown_query_params() {
     let (status, _) = get_models(app, "/v1/models?limit=1000&after_id=x").await;
     assert_eq!(status, StatusCode::OK);
 }
+
+mod muse {
+    use super::*;
+    use axum::routing::post;
+    use claude_code_proxy::providers::muse::MuseProvider;
+    use claude_code_proxy::providers::muse::auth::constants::MINT_TIMEOUT;
+    use claude_code_proxy::providers::muse::auth::manager::{
+        CALLER_DEADLINE, HttpMinter, MuseAuthManager,
+    };
+    use claude_code_proxy::providers::muse::auth::mint::{self, MintTarget};
+    use claude_code_proxy::providers::muse::auth::token_store::{StoredAuth, store_at};
+    use claude_code_proxy::providers::muse::client::{MuseResponsesClient, client_builder};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const MODELS: [&str; 5] = [
+        "muse-spark-1.3",
+        "muse-spark-1.2",
+        "muse-wonder-1.0",
+        "muse-wonder-full-1.0",
+        "muse-ember-1.0",
+    ];
+
+    /// The text-only stream recorded on the wire for "Reply with the single
+    /// word ok", event for event.
+    const OBSERVED_TEXT_STREAM: &[(&str, &str)] = &[
+        (
+            "response.created",
+            r#"{"response": {"background": false, "created_at": 1794274334.0, "error": null, "id": "resp_6af2741e267d9e80b98c465e", "incomplete_details": null, "instructions": "<instructions omitted: NoneType>", "model": "muse-spark-1.3", "object": "response", "output": [], "parallel_tool_calls": true, "reasoning": {"effort": "high"}, "service_tier": "default", "status": "in_progress", "store": true, "temperature": 1.0, "tool_choice": "auto", "tools": "<tools omitted: list>", "top_logprobs": 0, "top_p": 1.0, "truncation": "disabled"}, "sequence_number": 0, "type": "response.created"}"#,
+        ),
+        (
+            "response.in_progress",
+            r#"{"response": {"background": false, "created_at": 1794274334.0, "error": null, "id": "resp_6af2741e267d9e80b98c465e", "incomplete_details": null, "instructions": "<instructions omitted: NoneType>", "model": "muse-spark-1.3", "object": "response", "output": [], "parallel_tool_calls": true, "reasoning": {"effort": "high"}, "service_tier": "default", "status": "in_progress", "store": true, "temperature": 1.0, "tool_choice": "auto", "tools": "<tools omitted: list>", "top_logprobs": 0, "top_p": 1.0, "truncation": "disabled"}, "sequence_number": 1, "type": "response.in_progress"}"#,
+        ),
+        (
+            "response.output_item.added",
+            r#"{"item": {"id": "rs_6af2741e267d9e80b98c465e:rs_01a1c3159692719f9ff568e42c3d6492", "status": "in_progress", "summary": [], "type": "reasoning"}, "output_index": 0, "sequence_number": 2, "type": "response.output_item.added"}"#,
+        ),
+        (
+            "response.output_item.done",
+            r#"{"item": {"id": "rs_6af2741e267d9e80b98c465e:rs_01a1c3159692719f9ff568e42c3d6492", "status": "completed", "summary": [], "type": "reasoning"}, "output_index": 0, "sequence_number": 3, "type": "response.output_item.done"}"#,
+        ),
+        (
+            "response.output_item.added",
+            r#"{"item": {"content": [], "id": "msg_01a1c3159c0872d48e1f1d4210d984ae", "role": "assistant", "status": "in_progress", "type": "message"}, "output_index": 1, "sequence_number": 4, "type": "response.output_item.added"}"#,
+        ),
+        (
+            "response.content_part.added",
+            r#"{"content_index": 0, "item_id": "msg_01a1c3159c0872d48e1f1d4210d984ae", "output_index": 1, "part": {"annotations": [], "logprobs": [], "text": "", "type": "output_text"}, "sequence_number": 5, "type": "response.content_part.added"}"#,
+        ),
+        (
+            "response.output_text.delta",
+            r#"{"content_index": 0, "delta": "ok", "item_id": "msg_01a1c3159c0872d48e1f1d4210d984ae", "logprobs": [], "output_index": 1, "sequence_number": 6, "type": "response.output_text.delta"}"#,
+        ),
+        (
+            "response.output_text.done",
+            r#"{"content_index": 0, "item_id": "msg_01a1c3159c0872d48e1f1d4210d984ae", "logprobs": [], "output_index": 1, "sequence_number": 7, "text": "ok", "type": "response.output_text.done"}"#,
+        ),
+        (
+            "response.content_part.done",
+            r#"{"content_index": 0, "item_id": "msg_01a1c3159c0872d48e1f1d4210d984ae", "output_index": 1, "part": {"annotations": [], "logprobs": [], "text": "ok", "type": "output_text"}, "sequence_number": 8, "type": "response.content_part.done"}"#,
+        ),
+        (
+            "response.output_item.done",
+            r#"{"item": {"content": [{"annotations": [], "logprobs": [], "text": "ok", "type": "output_text"}], "id": "msg_01a1c3159c0872d48e1f1d4210d984ae", "role": "assistant", "status": "completed", "type": "message"}, "output_index": 1, "sequence_number": 9, "type": "response.output_item.done"}"#,
+        ),
+        (
+            "response.completed",
+            r#"{"response": {"background": false, "completed_at": 1794274335.0, "created_at": 1794274334.0, "error": null, "id": "resp_6af2741e267d9e80b98c465e", "incomplete_details": null, "instructions": "<instructions omitted: NoneType>", "model": "muse-spark-1.3", "object": "response", "output": [{"id": "rs_6af2741e267d9e80b98c465e:rs_01a1c3159692719f9ff568e42c3d6492", "status": "completed", "summary": [], "type": "reasoning"}, {"content": [{"annotations": [], "logprobs": [], "text": "ok", "type": "output_text"}], "id": "msg_01a1c3159c0872d48e1f1d4210d984ae", "role": "assistant", "status": "completed", "type": "message"}], "parallel_tool_calls": true, "reasoning": {"effort": "high"}, "service_tier": "default", "status": "completed", "store": true, "temperature": 1.0, "tool_choice": "auto", "tools": "<tools omitted: list>", "top_logprobs": 0, "top_p": 1.0, "truncation": "disabled", "usage": {"input_tokens": 14, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 307, "output_tokens_details": {"reasoning_tokens": 297}, "total_tokens": 321}}, "sequence_number": 10, "type": "response.completed"}"#,
+        ),
+        (
+            "response.subscription_usage",
+            r#"{"subscription":{"tier":"12345678901234567","weekly":{"resets_at":1794787200,"used_percent":0},"window":{"resets_at":1794291326,"used_percent":1,"window_duration_mins":300}},"type":"response.subscription_usage"}"#,
+        ),
+    ];
+
+    const OBSERVED_404: &str = r#"{"error":{"code":"model_not_found","message":"The requested model was not found. It may not exist, or this API key may not have access to it. Check the model name; GET /v1/models lists the models this API key can use.","param":null,"type":"invalid_request_error"}}"#;
+
+    fn observed_sse() -> String {
+        let mut sse = String::new();
+        for (event, data) in OBSERVED_TEXT_STREAM {
+            sse.push_str(&format!("event: {event}\ndata: {data}\n\n"));
+        }
+        sse.push_str("data: [DONE]\n\n");
+        sse
+    }
+
+    fn observed_mint_body() -> String {
+        json!({
+            "api_key": "synthetic-minted-api-key-48-chars-0000000000000",
+            "base_url": "https://api.meta.ai/v1",
+            "has_payment_method": false,
+            "require_payment": false,
+            "is_subs_active": true,
+            "can_subscribe": false,
+            "show_subs_upsell": true,
+            "user_full_name": "Synthetic Person",
+            "user_email": "synthetic.person@example.com",
+            "user_avatar_url": null,
+            "payment_method": null,
+            "action_url": null,
+            "subs_tier_id": "12345678901234567",
+            "subs_tier_name": "Muse Code Max Usage",
+            "is_subs_upgrade_available": false,
+            "subs_usage": {
+                "window": {"used_percent": 1, "window_duration_mins": 300, "resets_at": 1794291326},
+                "weekly": {"used_percent": 0, "resets_at": 1794787200},
+                "tier": "12345678901234567"
+            }
+        })
+        .to_string()
+    }
+
+    /// Model API and key mint on one local server. `error` replaces every
+    /// Model API answer when set.
+    struct Upstream {
+        _dir: tempfile::TempDir,
+        registry: Arc<Registry>,
+        responses: Arc<AtomicUsize>,
+        mints: Arc<AtomicUsize>,
+        bodies: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn spawn_upstream(error: Option<(StatusCode, &'static str)>) -> Upstream {
+        let responses = Arc::new(AtomicUsize::new(0));
+        let mints = Arc::new(AtomicUsize::new(0));
+        let bodies: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let (seen, recorded, minted) = (responses.clone(), bodies.clone(), mints.clone());
+        let app = axum::Router::new()
+            .route(
+                "/v1/responses",
+                post(move |body: String| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_str(&body).unwrap_or(Value::Null));
+                    async move {
+                        match error {
+                            // A 200 answer is a stream the test composed.
+                            Some((status, body)) => (
+                                status,
+                                [(
+                                    "content-type",
+                                    if status == StatusCode::OK {
+                                        "text/event-stream"
+                                    } else {
+                                        "application/json"
+                                    },
+                                )],
+                                body.to_string(),
+                            )
+                                .into_response(),
+                            None => (
+                                StatusCode::OK,
+                                [("content-type", "text/event-stream")],
+                                observed_sse(),
+                            )
+                                .into_response(),
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/muse-code/key",
+                post(move || {
+                    minted.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        (
+                            StatusCode::OK,
+                            [("content-type", "application/json")],
+                            observed_mint_body(),
+                        )
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("auth.json").to_string_lossy().into_owned();
+        store_at(path.clone())
+            .save_auth(StoredAuth {
+                access_token: "synthetic-oauth-access-token".into(),
+                obtained_at_ms: 1_794_274_189_000,
+                client_id: "1031625952748946".into(),
+                oauth_host: "https://auth.meta.com".into(),
+                user_full_name: None,
+                is_subs_active: true,
+                subs_tier_name: None,
+            })
+            .unwrap();
+        let model_base = format!("{base}/v1");
+        let minter = Arc::new(HttpMinter::with_client(
+            mint::async_client_builder(MINT_TIMEOUT)
+                .no_proxy()
+                .build()
+                .unwrap(),
+            MintTarget {
+                mint_base_url: base,
+                model_base_url: model_base.clone(),
+                user_agent: "claude-code-proxy/test".into(),
+            },
+        ));
+        let manager = Arc::new(MuseAuthManager::with_minter(
+            store_at(path),
+            minter,
+            MINT_TIMEOUT,
+            CALLER_DEADLINE,
+        ));
+        let client = MuseResponsesClient::with_client(
+            client_builder().no_proxy().build().unwrap(),
+            model_base,
+            "claude-code-proxy/test".into(),
+            manager,
+        )
+        .unwrap();
+        let registry = Arc::new(Registry::from_providers(
+            AliasProvider::Codex,
+            vec![Arc::new(MuseProvider::with_client(client)) as Arc<dyn Provider>],
+        ));
+        Upstream {
+            _dir: dir,
+            registry,
+            responses,
+            mints,
+            bodies,
+        }
+    }
+
+    async fn post_json(app: axum::Router, uri: &str, body: Value) -> (StatusCode, String) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(body_string(&body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn messages_body(model: &str, stream: bool) -> Value {
+        json!({
+            "model": model,
+            "max_tokens": 256,
+            "stream": stream,
+            "messages": [{"role": "user", "content": "Reply with the single word ok"}]
+        })
+    }
+
+    fn event_names(sse: &str) -> Vec<&str> {
+        sse.lines()
+            .filter_map(|line| line.strip_prefix("event: "))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn each_model_streams_messages_in_anthropic_order() {
+        for model in MODELS {
+            let upstream = spawn_upstream(None).await;
+            let (status, sse) = post_json(
+                app(upstream.registry.clone()),
+                "/v1/messages",
+                messages_body(model, true),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{model}: {sse}");
+            let events = event_names(&sse);
+            assert_eq!(events.first(), Some(&"message_start"), "{model}: {sse}");
+            assert_eq!(events.last(), Some(&"message_stop"), "{model}: {sse}");
+            let delta = events.iter().position(|e| *e == "message_delta").unwrap();
+            let first_block = events
+                .iter()
+                .position(|e| *e == "content_block_start")
+                .unwrap();
+            assert!(first_block < delta, "{model}: {events:?}");
+            assert!(sse.contains(r#""text":"ok""#), "{model}: {sse}");
+            assert!(!sse.contains("subscription_usage"), "{model}: {sse}");
+            assert!(!sse.contains("event: error"), "{model}: {sse}");
+            let sent = upstream.bodies.lock().unwrap()[0].clone();
+            assert_eq!(sent["model"], model);
+            assert_eq!(sent["store"], false);
+            assert_eq!(sent["include"], json!(["reasoning.encrypted_content"]));
+        }
+    }
+
+    #[tokio::test]
+    async fn each_model_answers_non_streaming_messages_with_a_message_object() {
+        for model in MODELS {
+            let upstream = spawn_upstream(None).await;
+            let (status, body) = post_json(
+                app(upstream.registry.clone()),
+                "/v1/messages",
+                messages_body(model, false),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{model}: {body}");
+            let message: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(message["type"], "message", "{model}");
+            assert_eq!(message["stop_reason"], "end_turn", "{model}");
+            assert!(
+                message["usage"]["output_tokens"].as_u64().is_some(),
+                "{model}"
+            );
+            let text: Vec<_> = message["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|block| block["type"] == "text")
+                .map(|block| block["text"].as_str().unwrap())
+                .collect();
+            assert_eq!(text, ["ok"], "{model}");
+        }
+    }
+
+    #[tokio::test]
+    async fn count_tokens_is_answered_locally_for_each_model() {
+        let upstream = spawn_upstream(None).await;
+        for model in MODELS {
+            let (status, body) = post_json(
+                app(upstream.registry.clone()),
+                "/v1/messages/count_tokens",
+                json!({"model": model, "messages": [{"role": "user", "content": "hello"}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{model}: {body}");
+            let value: Value = serde_json::from_str(&body).unwrap();
+            assert!(value["input_tokens"].as_u64().unwrap() > 0, "{model}");
+        }
+        assert_eq!(upstream.responses.load(Ordering::SeqCst), 0);
+        assert_eq!(upstream.mints.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn openai_routes_return_success_shapes_streaming_and_not() {
+        let upstream = spawn_upstream(None).await;
+        let (status, body) = post_json(
+            app_with_options(upstream.registry.clone(), None, true),
+            "/v1/chat/completions",
+            json!({"model": "muse-spark-1.3", "messages": [{"role": "user", "content": "Reply with the single word ok"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["choices"][0]["message"]["content"], "ok", "{body}");
+
+        let (status, body) = post_json(
+            app_with_options(upstream.registry.clone(), None, true),
+            "/v1/chat/completions",
+            json!({"model": "muse-spark-1.3", "stream": true, "messages": [{"role": "user", "content": "Reply with the single word ok"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains(r#""content":"ok""#), "{body}");
+        assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+
+        let (status, body) = post_json(
+            app_with_options(upstream.registry.clone(), None, true),
+            "/v1/responses",
+            json!({"model": "muse-spark-1.3", "input": "Reply with the single word ok"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        let text: Vec<_> = value["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "message")
+            .flat_map(|item| item["content"].as_array().unwrap().clone())
+            .filter_map(|part| part["text"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(text, ["ok"], "{body}");
+
+        let (status, body) = post_json(
+            app_with_options(upstream.registry.clone(), None, true),
+            "/v1/responses",
+            json!({"model": "muse-spark-1.3", "stream": true, "input": "Reply with the single word ok"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("event: response.completed"), "{body}");
+        assert!(body.contains(r#""delta":"ok""#), "{body}");
+    }
+
+    #[tokio::test]
+    async fn openai_routes_carry_the_upstream_status_and_code_on_error() {
+        let upstream = spawn_upstream(Some((StatusCode::NOT_FOUND, OBSERVED_404))).await;
+        for (uri, body) in [
+            (
+                "/v1/chat/completions",
+                json!({"model": "muse-spark-1.3", "messages": [{"role": "user", "content": "hello"}]}),
+            ),
+            (
+                "/v1/responses",
+                json!({"model": "muse-spark-1.3", "input": "hello"}),
+            ),
+        ] {
+            let (status, text) = post_json(
+                app_with_options(upstream.registry.clone(), None, true),
+                uri,
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {text}");
+            let value: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(value["error"]["code"], "model_not_found", "{uri}");
+            assert_eq!(value["error"]["type"], "invalid_request_error", "{uri}");
+            assert!(
+                value["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("(upstream HTTP 404)"),
+                "{uri}: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_shows_muse_requests_models_and_upstream_errors() {
+        let upstream = spawn_upstream(None).await;
+        let monitor = MonitorHandle::new(10);
+        let (status, _) = post_json(
+            app_with_monitor(upstream.registry.clone(), Some(monitor.clone())),
+            "/v1/messages",
+            messages_body("muse-wonder-full-1.0", false),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let snapshot = monitor.snapshot();
+        let recent = &snapshot.recent[0];
+        assert_eq!(recent.status, RequestStatus::Completed);
+        assert_eq!(recent.provider.as_deref(), Some("muse"));
+        assert_eq!(recent.model.as_deref(), Some("muse-wonder-full-1.0"));
+        assert_eq!(recent.output_tokens, Some(307));
+
+        let failing = spawn_upstream(Some((StatusCode::NOT_FOUND, OBSERVED_404))).await;
+        let monitor = MonitorHandle::new(10);
+        let (status, _) = post_json(
+            app_with_monitor(failing.registry.clone(), Some(monitor.clone())),
+            "/v1/messages",
+            messages_body("muse-spark-1.3", false),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let snapshot = monitor.snapshot();
+        let recent = &snapshot.recent[0];
+        assert_eq!(recent.status, RequestStatus::Failed);
+        assert_eq!(recent.provider.as_deref(), Some("muse"));
+        assert_eq!(recent.http_status, Some(404));
+        let error = recent.error.as_deref().unwrap();
+        assert!(
+            error.contains("The requested model was not found"),
+            "{error}"
+        );
+        assert!(error.ends_with("(upstream HTTP 404)"), "{error}");
+    }
+
+    const ACCESS_TOKEN: &str = "synthetic-oauth-access-token";
+    const API_KEY: &str = "synthetic-minted-api-key-48-chars-0000000000000";
+    const EMAIL: &str = "synthetic.person@example.com";
+
+    /// Upstream failures that carry both credentials and an e-mail address
+    /// in every text field: an HTTP error body, a `response.failed` frame
+    /// and an `error` frame.
+    fn hostile_answers() -> Vec<(StatusCode, &'static str)> {
+        let text = format!("key {API_KEY} token {ACCESS_TOKEN} owner {EMAIL}");
+        let http = json!({
+            "error": {"code": API_KEY, "message": text, "param": EMAIL, "type": "invalid_request_error"},
+            "detail": format!("detail {ACCESS_TOKEN} {EMAIL}"),
+            "title": format!("title {API_KEY}")
+        });
+        let failed = json!({
+            "type": "response.failed",
+            "response": {"status": "failed", "error": {"code": API_KEY, "message": text, "param": EMAIL}}
+        });
+        let error = json!({"type": "error", "code": API_KEY, "message": text, "param": EMAIL});
+        let leak = |body: String| -> &'static str { Box::leak(body.into_boxed_str()) };
+        vec![
+            (StatusCode::BAD_REQUEST, leak(http.to_string())),
+            (
+                StatusCode::OK,
+                leak(format!(
+                    "event: response.failed\ndata: {failed}\n\ndata: [DONE]\n\n"
+                )),
+            ),
+            (
+                StatusCode::OK,
+                leak(format!("event: error\ndata: {error}\n\ndata: [DONE]\n\n")),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn monitor_error_text_of_a_synthetic_hostile_upstream_failure_leaks_nothing() {
+        for (status, body) in hostile_answers() {
+            for stream in [false, true] {
+                let upstream = spawn_upstream(Some((status, body))).await;
+                let monitor = MonitorHandle::new(10);
+                let (answered, downstream) = post_json(
+                    app_with_monitor(upstream.registry.clone(), Some(monitor.clone())),
+                    "/v1/messages",
+                    messages_body("muse-spark-1.3", stream),
+                )
+                .await;
+                let case = format!("upstream {status}, stream {stream}");
+                // A failure inside a stream arrives with the stream's 200.
+                if stream && status == StatusCode::OK {
+                    assert_eq!(answered, StatusCode::OK, "{case}");
+                    assert!(event_names(&downstream).contains(&"error"), "{case}");
+                } else {
+                    assert!(
+                        answered.is_client_error() || answered.is_server_error(),
+                        "{case}"
+                    );
+                }
+                let snapshot = monitor.snapshot();
+                let recent = &snapshot.recent[0];
+                assert_eq!(recent.status, RequestStatus::Failed, "{case}");
+                let error = recent.error.as_deref().unwrap();
+                // The scrubbed upstream text is what the monitor shows.
+                assert!(
+                    error.contains("key [redacted] token [redacted] owner [redacted]"),
+                    "{case}: {error}"
+                );
+                assert!(
+                    error.ends_with(&format!("(upstream HTTP {})", status.as_u16())),
+                    "{case}: {error}"
+                );
+                for (place, text) in [("monitor", error), ("response", downstream.as_str())] {
+                    for secret in [API_KEY, ACCESS_TOKEN, EMAIL, "@example.com"] {
+                        assert!(
+                            !text.contains(secret),
+                            "{case}: {place} leaked {secret}: {text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn expected_cache_key(identity: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = hex::encode(Sha256::digest(identity.as_bytes()));
+        format!("ccp:{}", &digest[..32])
+    }
+
+    #[tokio::test]
+    async fn conversation_identity_becomes_the_prompt_cache_key() {
+        let upstream = spawn_upstream(None).await;
+        let app = app(upstream.registry.clone());
+        for (headers, expected) in [
+            (
+                vec![("x-claude-code-session-id", "session-main")],
+                Some(expected_cache_key("main\0session-main")),
+            ),
+            (
+                vec![
+                    ("x-claude-code-session-id", "session-agent"),
+                    ("x-claude-code-agent-id", "agent-direct"),
+                ],
+                Some(expected_cache_key("agent\0session-agent\0agent-direct")),
+            ),
+            (vec![], None),
+        ] {
+            let status = call_identity_ingress(
+                &app,
+                "/v1/messages",
+                &headers,
+                messages_body("muse-spark-1.3", false),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{headers:?}");
+            let sent = upstream.bodies.lock().unwrap().pop().unwrap();
+            assert_eq!(
+                sent.get("prompt_cache_key").and_then(Value::as_str),
+                expected.as_deref(),
+                "{headers:?}"
+            );
+            // The raw session id never leaves the proxy.
+            assert!(!sent.to_string().contains("session-"), "{sent}");
+        }
+    }
+
+    fn model_ids(value: &Value) -> Vec<String> {
+        value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_lists_exactly_the_five_muse_models() {
+        let upstream = spawn_upstream(None).await;
+        let (status, value) =
+            get_models(app(upstream.registry.clone()), "/v1/models?limit=1000").await;
+        assert_eq!(status, StatusCode::OK);
+        let mut ids = model_ids(&value);
+        ids.sort_unstable();
+        let mut expected: Vec<String> = MODELS.iter().map(|model| model.to_string()).collect();
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+
+        // In the full catalog the five are listed, the hidden image model is
+        // not, and the only contributor ids are the two OpenCode Go serves.
+        let registry = Arc::new(Registry::with_default_alias());
+        let (status, value) = get_models(app(registry.clone()), "/v1/models?limit=1000").await;
+        assert_eq!(status, StatusCode::OK);
+        let ids = model_ids(&value);
+        for model in MODELS {
+            assert!(ids.iter().any(|id| id == model), "{model}");
+        }
+        assert!(!ids.iter().any(|id| id == "muse-image-1.0"));
+        for id in ids.iter().filter(|id| id.ends_with("-contributor")) {
+            assert_eq!(
+                registry.provider_for_model(id, None).unwrap().name(),
+                "opencode",
+                "{id}"
+            );
+        }
+    }
+}

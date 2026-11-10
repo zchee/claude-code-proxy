@@ -65,6 +65,8 @@ pub(crate) const GROK_MODELS: &[&str] = &[
     "grok-4.7-build-fast",
     "grok-4.7-fast",
 ];
+pub(crate) const MUSE_MODELS: &[&str] =
+    crate::providers::muse::translate::model_allowlist::MUSE_MODELS;
 
 pub struct Registry {
     alias_provider: AliasProvider,
@@ -90,6 +92,13 @@ impl Registry {
                 .collect(),
         );
         models.insert(
+            "muse".into(),
+            MUSE_MODELS
+                .iter()
+                .map(|model| (*model).to_string())
+                .collect(),
+        );
+        models.insert(
             "opencode".into(),
             crate::providers::opencode::advertised_models(),
         );
@@ -101,6 +110,7 @@ impl Registry {
                 "kimi" => Arc::new(crate::providers::kimi::KimiProvider::new()),
                 "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
                 "grok" => Arc::new(crate::providers::grok::GrokProvider::new()),
+                "muse" => Arc::new(crate::providers::muse::MuseProvider::new()),
                 "opencode" => Arc::new(crate::providers::opencode::OpenCodeProvider::new()),
                 _ => Arc::new(PlaceholderProvider::new(name, entries.clone())),
             };
@@ -262,6 +272,7 @@ impl PlaceholderProvider {
             "kimi" => "kimi",
             "cursor" => "cursor",
             "grok" => "grok",
+            "muse" => "muse",
             _ => "codex",
         };
         Self { name, models }
@@ -284,6 +295,7 @@ impl Provider for PlaceholderProvider {
             "kimi" => &KIMI_CLI,
             "cursor" => &CURSOR_CLI,
             "grok" => &GROK_CLI,
+            "muse" => &MUSE_CLI,
             _ => &CODEX_CLI,
         }
     }
@@ -343,6 +355,7 @@ const CODEX_CLI: PlaceholderCli = PlaceholderCli { provider: "codex" };
 const KIMI_CLI: PlaceholderCli = PlaceholderCli { provider: "kimi" };
 const CURSOR_CLI: PlaceholderCli = PlaceholderCli { provider: "cursor" };
 const GROK_CLI: PlaceholderCli = PlaceholderCli { provider: "grok" };
+const MUSE_CLI: PlaceholderCli = PlaceholderCli { provider: "muse" };
 pub(crate) fn expand_codex_models() -> Vec<String> {
     let mut set = HashSet::new();
     let mut out = Vec::new();
@@ -467,6 +480,41 @@ mod tests {
                 .name(),
             "cursor"
         );
+    }
+
+    #[test]
+    fn the_five_muse_models_route_to_muse() {
+        let registry = Registry::new(AliasProvider::Codex);
+        for model in [
+            "muse-spark-1.3",
+            "muse-spark-1.2",
+            "muse-wonder-1.0",
+            "muse-wonder-full-1.0",
+            "muse-ember-1.0",
+            "muse-spark-1.3[1m]",
+        ] {
+            assert_eq!(
+                registry.provider_for_model(model, None).unwrap().name(),
+                "muse",
+                "{model}"
+            );
+        }
+        assert_eq!(registry.supported_models_for("muse").len(), 5);
+        // OpenCode Go serves two contributor ids itself; they stay its own.
+        for model in ["muse-spark-1.3-contributor", "muse-spark-1.2-contributor"] {
+            assert_eq!(
+                registry.provider_for_model(model, None).unwrap().name(),
+                "opencode",
+                "{model}"
+            );
+        }
+        for model in ["muse-wonder-full-1.0-contributor", "muse-image-1.0"] {
+            assert!(
+                registry.provider_for_model(model, None).is_none(),
+                "{model}"
+            );
+        }
+        assert!(registry.list_provider_names().contains(&"muse".to_string()));
     }
 
     #[test]
