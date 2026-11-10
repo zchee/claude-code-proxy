@@ -9,7 +9,7 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 
 - Provider subscriptions, allowed models, regions, quotas, and enforcement remain under each provider's control.
 - OpenAI has publicly welcomed using Codex through other coding harnesses, but public statements do not guarantee future policy or account treatment.
-- Kimi, Grok, and Cursor use unofficial client integrations. Review the terms and account risk for your use.
+- Kimi, Grok, Muse, and Cursor use unofficial client integrations. Review the terms and account risk for your use.
 - Upstream rate limits are shared with other clients on the same account.
 
 ## Listener security
@@ -31,7 +31,7 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 
 ## OpenAI API scope
 
-- `CCP_CODEX_RESPONSES_API=1` enables `/v1/chat/completions` and `/v1/responses` for Codex, Kimi, Grok, OpenCode Go, and Cursor models.
+- `CCP_CODEX_RESPONSES_API=1` enables `/v1/chat/completions` and `/v1/responses` for Codex, Kimi, Grok, Muse, OpenCode Go, and Cursor models.
 - Codex Responses requests use native passthrough. Requests for the other providers support their mapped subsets of text, reasoning, function tools, tool results, token limits, usage, streaming, aliases, and `[1m]` model hints; exact support depends on the selected provider and model.
 - Unsupported non-null request fields return an error instead of being ignored.
 - Grok search calls appear as Responses `web_search_call` items. Chat Completions returns the citations without a separate search item.
@@ -73,6 +73,15 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
   dropping them would weaken the caller's requested search scope.
 - The implemented multimodal path does not claim general image or video compatibility.
 
+## Muse
+
+- The proxy was checked against one account with an active Muse Code subscription. Other account types are untested.
+- Logins have no refresh token and an unknown lifetime. When one stops working, the proxy asks for `claude-code-proxy muse auth login`.
+- The API key is one per account and shared with the Muse CLI. The proxy's logout is local; logging out in the Muse CLI may also stop the proxy, which is unconfirmed.
+- Reasoning is sent back to Muse through thinking signatures on Anthropic Messages only, not on the OpenAI-compatible routes.
+- Anthropic server tools are rejected. Images are not resized or filtered, and very small images can be misread.
+- Subscription usage is not shown in the monitor.
+
 ## Cursor Agent
 
 - An installed Cursor Agent JavaScript bundle supplies protobuf classes.
@@ -86,7 +95,8 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 
 - Structured logs redact known credential keys, but user-provided strings can still contain secrets.
 - Error captures contain complete redacted failed responses.
-- Traffic captures intentionally preserve prompts and tool content for message/Responses diagnostics.
+- Traffic captures intentionally preserve prompts and tool content for message/Responses diagnostics. Image payloads, encrypted reasoning, and the proxy's reasoning signatures are replaced with length markers.
+- Muse traffic captures also replace the request's login token and API key wherever they appear, and scrub Muse error text, `code`, and `param` before writing them.
 - Image generation and edit routes never create traffic captures or persist prompts, uploads, data URLs, generated base64, or upstream error bodies.
 - Verbose logging and traffic capture should be scoped to a focused local investigation.
 

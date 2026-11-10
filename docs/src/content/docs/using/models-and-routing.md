@@ -12,9 +12,12 @@ The model ID in each request selects its provider. One proxy listener can serve 
 | Registered `gpt-*` IDs and their `-fast` and `-ultrafast` forms | Codex |
 | `kimi-for-coding`, `kimi-k2.6`, `k2.6` | Kimi |
 | `grok-composer-2.5-fast`, `grok-4.5`, `grok-4.6`, `grok-4.7`, `grok-4.7-build-fast`, `grok-4.7-fast` | Grok |
+| `muse-spark-1.3`, `muse-spark-1.2`, `muse-wonder-1.0`, `muse-wonder-full-1.0`, `muse-ember-1.0` | Muse |
 | Non-conflicting registered OpenCode Go IDs and every `opencode-go/<model-id>` | OpenCode Go |
 | `cursor`, Cursor legacy aliases, `cursor:<id>`, `cursor-plan:<id>`, `cursor-ask:<id>` | Cursor Agent |
 | Anthropic-style aliases such as `haiku`, `sonnet`, `opus`, `fable`, and registered `claude-*` aliases | The `aliasProvider`, Codex by default |
+
+`muse-spark-1.3-contributor` and `muse-spark-1.2-contributor` are OpenCode Go models and route to OpenCode Go, not to Muse.
 
 An unknown ID returns HTTP 400 with the supported provider catalog. There is no implicit fallback for arbitrary model names.
 

@@ -3,6 +3,15 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## Unreleased
+
+- Muse Code subscribers can use Meta's `muse-spark-1.3`, `muse-spark-1.2`,
+  `muse-wonder-1.0`, `muse-wonder-full-1.0`, and `muse-ember-1.0` after
+  `claude-code-proxy muse auth login`, with tools, image input, and reasoning
+  that carries over between turns. Logins do not refresh, and the API key is
+  shared with the Muse CLI; the proxy's logout leaves both untouched. See the
+  [Muse provider page](https://claude-code-proxy.raine.dev/providers/muse/).
+
 ## v0.1.48 (2026-11-01)
 
 - Codex users can select GPT-6.1 Terra with `gpt-6.1-terra` or its

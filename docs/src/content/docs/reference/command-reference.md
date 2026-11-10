@@ -69,6 +69,7 @@ claude-code-proxy <provider> auth <action>
 | `codex` | Browser PKCE | Device code | Account, expiry, storage | Delete proxy credential |
 | `kimi` | Device code | Unsupported | User, expiry, scope, storage | Delete proxy credential |
 | `grok` | Browser PKCE | Device code | Expiry and storage | Delete proxy credential |
+| `muse` | Device code | Device code | User, subscription, tier, usage windows, login age | Delete proxy credential only |
 | `cursor` | Browser polling flow | Unsupported | Source, claims, expiry | Delete proxy credential |
 
 Examples:
@@ -80,9 +81,9 @@ claude-code-proxy kimi auth status
 claude-code-proxy cursor auth logout
 ```
 
-A missing credential makes `auth status` exit with status 1. Other provider command failures exit with status 2. Successful commands exit with status 0.
+A missing credential makes `auth status` exit with status 1. For Muse, a stored login that Meta no longer accepts also exits with status 1 and prints the `claude-code-proxy muse auth login` hint. Other provider command failures exit with status 2. Successful commands exit with status 0.
 
-Logout removes the local proxy-owned credential. It does not call the provider to revoke a refresh token.
+Logout removes the local proxy-owned credential. It does not call the provider to revoke a refresh token. `muse auth logout` also leaves the Muse CLI's login and the API key it shares with the proxy untouched. `muse auth status` contacts Meta's key service to report the current subscription and usage.
 
 ## Development commands
 

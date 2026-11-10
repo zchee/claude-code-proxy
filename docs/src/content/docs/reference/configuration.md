@@ -41,6 +41,12 @@ These settings configure the proxy process. Claude Code client settings such as 
     "baseUrl": "https://cli-chat-proxy.grok.com/v1",
     "clientVersion": "1.0.13"
   },
+  "muse": {
+    "baseUrl": "https://api.meta.ai/v1",
+    "oauthHost": "https://auth.meta.com",
+    "mintBaseUrl": "https://api.meta.ai",
+    "userAgent": "claude-code-proxy/0.1.48"
+  },
   "opencode": {
     "apiKey": "YOUR_OPENCODE_GO_API_KEY",
     "baseUrl": "https://opencode.ai/zen/go/v1"
@@ -139,6 +145,17 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 | `CCP_GROK_TOOL_IMAGE` | none | `omit` | Selects `omit`, `reattach`, `inline`, or `reject` image handling. |
 | `CCP_GROK_HOSTED_SEARCH` | none | off | Set to `1`, `on`, or `true` to let hosted search tools replace the caller's own search tools and force them on an explicit search turn. |
 | `CCP_GROK_SEARCH_BLOCKS` | none | `text` | Selects how a hosted search is reported: `text` for a text block, `native` for `server_tool_use` plus a `*_tool_result` block. |
+
+## Muse
+
+| Environment | Config key | Default | Purpose |
+| --- | --- | --- | --- |
+| `CCP_MUSE_BASE_URL` | `muse.baseUrl` | `https://api.meta.ai/v1` | Changes the Responses API base URL. |
+| `CCP_MUSE_OAUTH_HOST` | `muse.oauthHost` | `https://auth.meta.com` | Changes the device-login host. |
+| `CCP_MUSE_MINT_BASE_URL` | `muse.mintBaseUrl` | `https://api.meta.ai` | Changes the host of the API key service, which lives at the host root rather than under `/v1`. |
+| `CCP_MUSE_USER_AGENT` | `muse.userAgent` | `claude-code-proxy/<version>` | Changes the user-agent of every Muse request. The value must be 1 to 256 printable ASCII characters; an empty value counts as not set, since Meta's login host rejects requests without one. |
+
+The three URL settings must use `https` (plain `http` only for a loopback host) and must not contain a user name or password. For all four settings an empty value counts as not set; a non-empty invalid value is an error that names the setting, not a fallback to the default. The key service also reports a base URL. The proxy uses only its path, and only when it is HTTPS and has the same host as `muse.baseUrl`; the scheme, host, and port stay those of `muse.baseUrl`. Otherwise it keeps `muse.baseUrl`.
 
 ## OpenCode Go
 

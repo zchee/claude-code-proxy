@@ -21,10 +21,20 @@ Check the provider selected by the model, then inspect its credential:
 claude-code-proxy codex auth status
 claude-code-proxy kimi auth status
 claude-code-proxy grok auth status
+claude-code-proxy muse auth status
 claude-code-proxy cursor auth status
 ```
 
 Use that provider's login command when credentials are missing or expired. Codex requires ChatGPT subscription auth, not an OpenAI API key. Each provider uses proxy-owned credentials.
+Muse logins do not refresh. When requests fail with `Muse login is no longer valid` or
+`Muse rejected the API key`, run `claude-code-proxy muse auth login` again; a
+running proxy picks up the new login without a restart. `muse auth status`
+checks the login against Meta and also shows the subscription state and how
+much of the 5-hour and weekly usage windows is used. A 403 from Muse links to
+Meta's Accounts Center when the subscription is inactive. An HTTP 500 with
+`Muse transport is unavailable: ...` means the proxy could not set up its Muse
+HTTP clients, which it does on the first Muse request rather than at startup;
+the message names the cause.
 OpenCode Go has no `auth status` command; configure its API key through
 `CCP_OPENCODE_API_KEY`, `OPENCODE_API_KEY`, or `opencode.apiKey` in
 `config.json`.
@@ -86,7 +96,7 @@ CCP_CURSOR_AGENT_BUNDLE=/path/to/cursor-agent/index.js \
 
 ## Rate limited
 
-Upstream limits are shared with other clients on the same account. Codex limit responses and Kimi HTTP 429 responses surface as HTTP 429 with `retry-after`. Wait for the indicated interval or reduce concurrent traffic.
+Upstream limits are shared with other clients on the same account. Codex limit responses and Kimi HTTP 429 responses surface as HTTP 429 with `retry-after`. Muse HTTP 429 responses carry `retry-after` when Muse sends one as whole seconds, or when the latest usage report shows a full window, in which case it is the time until that window resets; either value is capped at 86400 seconds. Wait for the indicated interval or reduce concurrent traffic.
 
 ## Find the complete error
 

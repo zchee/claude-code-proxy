@@ -47,6 +47,7 @@ export default defineConfig({
             { label: 'Codex', slug: 'providers/codex' },
             { label: 'Kimi', slug: 'providers/kimi' },
             { label: 'Grok', slug: 'providers/grok' },
+            { label: 'Muse', slug: 'providers/muse' },
             { label: 'OpenCode Go', slug: 'providers/opencode-go' },
             { label: 'Cursor Agent', slug: 'providers/cursor-agent' },
           ],

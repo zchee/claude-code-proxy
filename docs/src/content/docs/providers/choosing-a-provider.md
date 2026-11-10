@@ -10,6 +10,7 @@ One `serve` process supports every provider. Choose based on the account you hav
 | [Codex](/providers/codex/) | ChatGPT Plus or Pro | OpenAI Responses over WebSocket or HTTP SSE | Named Codex catalog, `-fast` and `-ultrafast` variants | Function tools, image input, hosted web search, reasoning summaries, optional native Responses route |
 | [Kimi](/providers/kimi/) | kimi.com with Kimi Code access | OpenAI-style chat completions | `kimi-for-coding` and aliases | Function tools, reasoning, image and video input |
 | [Grok](/providers/grok/) | grok.com | Responses API | `grok-composer-2.5-fast`, `grok-4.5`, `grok-4.6`, `grok-4.7`, `grok-4.7-build-fast`, `grok-4.7-fast` | Function tools, reasoning, web search, X search, citations |
+| [Muse](/providers/muse/) | Meta account with a Muse Code subscription | Meta Responses API | `muse-spark-1.3`, `muse-spark-1.2`, `muse-wonder-1.0`, `muse-wonder-full-1.0`, `muse-ember-1.0` | Function tools, reasoning summaries, image input, 1,007,997 token context |
 | [OpenCode Go](/providers/opencode-go/) | OpenCode Go subscription | OpenAI-compatible Chat Completions, OpenAI Responses, or Anthropic-compatible Messages | Non-conflicting bare IDs and `opencode-go/<model-id>` forms | Curated models tested and benchmarked for coding-agent use |
 | [Cursor Agent](/providers/cursor-agent/) | Cursor account | HTTP/2 Connect stream | Cursor modes and `cursor:<model-id>` prefixes | Dynamic model catalog, effort variants, images, plan and ask modes, session continuation |
 
@@ -18,6 +19,7 @@ One `serve` process supports every provider. Choose based on the account you hav
 - Start with **Codex** when you have a ChatGPT subscription and want the most developed Claude Code translation path.
 - Choose **Kimi** for the Kimi Code model and multimodal coding input.
 - Choose **Grok** for Grok models and hosted web or X search.
+- Choose **Muse** when you have a Muse Code subscription and want Meta's Muse models. Logins do not refresh, so plan for an occasional new login.
 - Choose **OpenCode Go** when you have a Go subscription and want its documented model catalog in Claude Code.
 - Choose **Cursor Agent** when you want Cursor's model catalog and agent modes. It depends on an installed Cursor Agent bundle for protobuf schemas.
 

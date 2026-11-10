@@ -28,7 +28,7 @@ On macOS, Codex and Cursor use Keychain services:
 - `claude-code-proxy.codex`
 - `claude-code-proxy.cursor`
 
-Kimi and Grok use `<configuration-root>/<provider>/auth.json` on every platform. Codex and Cursor use the same file layout on Linux and Windows. File-backed credentials are written with restrictive permissions where supported.
+Kimi, Grok, and Muse use `<configuration-root>/<provider>/auth.json` on every platform. The Muse file holds the Meta login token, the display name, the subscription state, and the tier name; the API key and e-mail address are not written to disk. Codex and Cursor use the same file layout on Linux and Windows. File-backed credentials are written with restrictive permissions where supported.
 
 When `CCP_CONFIG_DIR` is set, file-backed provider credentials use
 `<CCP_CONFIG_DIR>/<provider>/auth.json`, including Codex and Cursor on macOS.
@@ -71,7 +71,7 @@ Set `CCP_TRAFFIC_LOG=1` to create captures under `traffic/` in the state root. R
 Event filenames use monotonic sequence numbers so lexical order preserves emission order.
 
 <div class="security-callout">
-<strong>Traffic captures preserve content.</strong> Header and token redaction does not remove prompts, source code, tool definitions, tool inputs, tool results, images, or provider output. Treat the entire directory as sensitive user data.
+<strong>Traffic captures preserve content.</strong> Header and token redaction does not remove prompts, source code, tool definitions, tool inputs, tool results, or provider output. Image payloads are the exception: base64 image data and image data URLs are replaced with a length marker, as are encrypted reasoning blobs and the proxy's reasoning signatures. Treat the entire directory as sensitive user data.
 </div>
 
 Enable capture only for a focused reproduction, keep the directory local, and delete it after the investigation.
