@@ -8,6 +8,8 @@ use crate::config::AliasProvider;
 use crate::logging::REDACT_KEYS;
 use crate::paths;
 use crate::providers::codex::translate::reasoning_signature::is_proxy_reasoning_signature;
+use crate::providers::muse::sanitize::{redact_secrets, sanitize_error_value};
+use crate::providers::muse::translate::reasoning_signature::is_muse_reasoning_signature;
 
 #[derive(Debug)]
 pub struct TrafficCapture {
@@ -376,12 +378,15 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
                     // bulk payload, not debug signal, so only its size stays.
                     out.insert(key.clone(), redact_traffic_value(value));
                 } else if normalized == "signature"
-                    && value.as_str().is_some_and(is_proxy_reasoning_signature)
+                    && value.as_str().is_some_and(|signature| {
+                        is_proxy_reasoning_signature(signature)
+                            || is_muse_reasoning_signature(signature)
+                    })
                 {
-                    // The Codex translator replays reasoning as an Anthropic
-                    // thinking signature of the form
-                    // `ccp:codex:v1:<encoded-id>:<encrypted_content>`, which
-                    // carries the same opaque conversation handle as the
+                    // The Codex and Muse translators replay reasoning as an
+                    // Anthropic thinking signature of the form
+                    // `ccp:<provider>:v1:<encoded-id>:<encrypted_content>`,
+                    // which carries the same opaque conversation handle as the
                     // `encrypted_content` key. Only proxy-owned signatures are
                     // touched; foreign ones (for example, real Anthropic
                     // signatures) are preserved.
@@ -422,6 +427,54 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
         Value::String(text) if is_data_url(text) => {
             Value::String(format!("[redacted data-url len={}]", text.len()))
         }
+        _ => value.clone(),
+    }
+}
+
+/// Prepares a Muse stream event, or an event rendered from one, for a
+/// traffic capture. Key-based redaction cannot see a credential embedded in a
+/// string, so every string has the request's `secrets` replaced. The parts
+/// that carry upstream error text (a whole `error` event, a top-level `error`
+/// object, `response.error`) go through [`sanitize_error_value`], the same
+/// rules the client applies to HTTP error bodies. Conversation content keeps
+/// everything except the secrets.
+pub fn sanitize_muse_capture(value: &Value, secrets: &[&str]) -> Value {
+    let Some(object) = value.as_object() else {
+        return replace_secrets(value, secrets, 0);
+    };
+    if object.get("type").and_then(Value::as_str) == Some("error") {
+        return sanitize_error_value(value, secrets);
+    }
+    let mut object = object.clone();
+    if let Some(error) = object.get_mut("error") {
+        *error = sanitize_error_value(error, secrets);
+    }
+    if let Some(error) = object
+        .get_mut("response")
+        .and_then(|response| response.get_mut("error"))
+    {
+        *error = sanitize_error_value(error, secrets);
+    }
+    replace_secrets(&Value::Object(object), secrets, 0)
+}
+
+fn replace_secrets(value: &Value, secrets: &[&str], depth: u16) -> Value {
+    if depth > 100 {
+        return Value::String("[depth-limit]".to_string());
+    }
+    match value {
+        Value::String(text) => Value::String(redact_secrets(text, secrets)),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|value| replace_secrets(value, secrets, depth + 1))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), replace_secrets(value, secrets, depth + 1)))
+                .collect(),
+        ),
         _ => value.clone(),
     }
 }
@@ -841,5 +894,201 @@ mod tests {
             redacted["headers"]["proxy-authorization"],
             "[redacted len=18]"
         );
+    }
+
+    const MUSE_SIGNATURE: &str =
+        "ccp:muse:v1:cnNfNmFmMjc0NGQ4YWI1YjhkNTM1ODQzMWU:gAAAAABopaque-muse-replay";
+    const MUSE_SECRET: &str = "synthetic-muse-api-key-48-chars-0123456789abcdef";
+
+    fn captured_files(capture: &TrafficCapture) -> String {
+        let mut captured = String::new();
+        for dir in [capture.root().to_path_buf(), capture.root().join("events")] {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_file() {
+                    captured.push_str(&std::fs::read_to_string(path).unwrap());
+                }
+            }
+        }
+        captured
+    }
+
+    #[test]
+    fn traffic_capture_redacts_muse_signatures_in_requests_responses_and_deltas() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let capture = test_capture(temp.path().join("traffic"));
+        let codex = "ccp:codex:v1:cnNfMQ:gAAAAABopaque-reasoning-replay";
+        let foreign = "ErUBCkYIBRgCIkA-real-anthropic-signature";
+
+        capture.write_json(
+            "010-anthropic-request",
+            &serde_json::json!({
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "kept", "signature": MUSE_SIGNATURE},
+                    {"type": "thinking", "thinking": "kept", "signature": codex},
+                    {"type": "thinking", "thinking": "kept", "signature": foreign}
+                ]}]
+            }),
+        );
+        capture.write_json(
+            "051-downstream-response",
+            &serde_json::json!({
+                "type": "message",
+                "content": [{"type": "thinking", "thinking": "kept", "signature": MUSE_SIGNATURE}]
+            }),
+        );
+        let mut stream = capture.stream_capture();
+        stream.downstream_event(
+            "content_block_delta",
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": MUSE_SIGNATURE}
+            }),
+        );
+        stream.finish_named(&capture, serde_json::json!({}), "061-muse-stream-summary");
+
+        let captured = captured_files(&capture);
+        assert!(
+            !captured.contains("ccp:muse:v1:"),
+            "Muse signature leaked to capture: {captured}"
+        );
+        assert!(
+            !captured.contains("ccp:codex:v1:"),
+            "Codex signature leaked to capture: {captured}"
+        );
+        assert!(!captured.contains("gAAAAABopaque"), "{captured}");
+        assert!(captured.contains(foreign), "foreign signature lost");
+        assert_eq!(
+            captured
+                .matches(&format!("[redacted len={}]", MUSE_SIGNATURE.len()))
+                .count(),
+            3,
+            "{captured}"
+        );
+    }
+
+    fn assert_error_fields_removed(captured: &str) {
+        for leaked in [MUSE_SECRET, "owner@example.com", "billing@meta.example"] {
+            assert!(
+                !captured.contains(leaked),
+                "{leaked} leaked to capture: {captured}"
+            );
+        }
+    }
+
+    #[test]
+    fn synthetic_muse_error_bodies_and_events_are_sanitised_before_capture() {
+        let secrets = [MUSE_SECRET];
+        let message = format!("key {MUSE_SECRET} of owner@example.com was refused");
+        let http_body = serde_json::json!({"error": {
+            "code": MUSE_SECRET,
+            "message": message,
+            "param": "billing@meta.example",
+            "type": "authentication_error"
+        }});
+        let error_event = serde_json::json!({
+            "type": "error",
+            "code": "owner@example.com",
+            "param": MUSE_SECRET,
+            "message": message,
+            "error": {"code": "has spaces", "param": "billing@meta.example", "message": message}
+        });
+        let failed = serde_json::json!({
+            "type": "response.failed",
+            "response": {"status": "failed", "error": {
+                "code": "server_error",
+                "param": "owner@example.com",
+                "message": message
+            }}
+        });
+        let problem = serde_json::json!({
+            "title": "Authentication Error owner@example.com",
+            "detail": format!("token {MUSE_SECRET}"),
+            "status": 401
+        });
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let capture = test_capture(temp.path().join("traffic"));
+        // HTTP error bodies take the client's path; stream events take the
+        // capture path. Both apply the same field rules.
+        capture.write_json(
+            "030-upstream-error",
+            &sanitize_error_value(&http_body, &secrets),
+        );
+        capture.write_json(
+            "031-upstream-error",
+            &sanitize_error_value(&problem, &secrets),
+        );
+        let mut stream = capture.stream_capture();
+        for value in [&error_event, &failed] {
+            let event = value["type"].as_str().unwrap();
+            stream.upstream_event(Some(event), &sanitize_muse_capture(value, &secrets));
+        }
+        stream.downstream_event(
+            "error",
+            sanitize_muse_capture(
+                &serde_json::json!({"type": "error", "error": {"type": "api_error", "message": message}}),
+                &secrets,
+            ),
+        );
+        stream.finish_named(&capture, serde_json::json!({}), "061-muse-stream-summary");
+
+        let captured = captured_files(&capture);
+        assert_error_fields_removed(&captured);
+        assert!(captured.contains("key [redacted] of [redacted] was refused"));
+        assert!(captured.contains("authentication_error"));
+
+        // A valid code survives the sanitiser; the capture's key-based rules
+        // then redact `code` as they do for every provider.
+        let sanitised = sanitize_muse_capture(&failed, &secrets);
+        assert_eq!(sanitised["response"]["error"]["code"], "server_error");
+        assert_eq!(sanitised["response"]["error"]["param"], Value::Null);
+
+        let sanitised = sanitize_muse_capture(&error_event, &secrets);
+        assert_eq!(sanitised["code"], Value::Null);
+        assert_eq!(sanitised["param"], Value::Null);
+        assert_eq!(sanitised["error"]["code"], Value::Null);
+        assert_eq!(sanitised["error"]["param"], Value::Null);
+        let sanitised = sanitize_muse_capture(&http_body, &secrets);
+        assert_eq!(sanitised, sanitize_error_value(&http_body, &secrets));
+        assert_eq!(sanitised["error"]["code"], Value::Null);
+        assert_eq!(sanitised["error"]["type"], "authentication_error");
+    }
+
+    #[test]
+    fn synthetic_long_muse_error_text_is_redacted_before_it_is_cut() {
+        let message = format!("{}{MUSE_SECRET}", "x".repeat(490));
+        let sanitised = sanitize_muse_capture(
+            &serde_json::json!({"error": {"message": message}}),
+            &[MUSE_SECRET],
+        );
+        let text = sanitised["error"]["message"].as_str().unwrap();
+        assert!(!text.contains("synthetic-muse"), "{text}");
+        assert_eq!(text.chars().count(), 500);
+    }
+
+    #[test]
+    fn muse_conversation_content_keeps_email_addresses_but_not_secrets() {
+        let output = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": format!("Write to owner@example.com, not {MUSE_SECRET}"),
+            "item_id": "msg_01a1c3159c0872d48e1f1d4210d984ae"
+        });
+        let temp = tempfile::TempDir::new().unwrap();
+        let capture = test_capture(temp.path().join("traffic"));
+        let mut stream = capture.stream_capture();
+        stream.upstream_event(
+            Some("response.output_text.delta"),
+            &sanitize_muse_capture(&output, &[MUSE_SECRET]),
+        );
+        stream.finish_named(&capture, serde_json::json!({}), "061-muse-stream-summary");
+        let captured = captured_files(&capture);
+        assert!(captured.contains("owner@example.com"), "{captured}");
+        assert!(!captured.contains(MUSE_SECRET), "{captured}");
+        assert!(captured.contains("not [redacted]"), "{captured}");
     }
 }
