@@ -427,6 +427,11 @@ pub(crate) mod tests {
         })
     }
 
+    /// `subs_usage` of the observed mint response.
+    pub(crate) fn observed_usage() -> SubscriptionUsage {
+        serde_json::from_value(observed_mint_body()["subs_usage"].clone()).unwrap()
+    }
+
     #[derive(Debug, Clone)]
     pub(crate) struct Recorded {
         pub method: String,

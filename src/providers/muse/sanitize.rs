@@ -52,6 +52,42 @@ pub fn sanitize_upstream_token(value: &str, secrets: &[&str]) -> Option<String> 
     (well_formed && !carries_secret).then(|| value.to_string())
 }
 
+/// For a whole upstream error body on its way into a traffic capture: every
+/// string is redacted of the secrets, prose fields (`message`, `detail`,
+/// `title`) get `sanitize_upstream_text`, and `code` / `param` keep only a
+/// value `sanitize_upstream_token` accepts, else become null.
+pub fn sanitize_error_value(value: &serde_json::Value, secrets: &[&str]) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => Value::String(redact_secrets(text, secrets)),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| sanitize_error_value(item, secrets))
+                .collect(),
+        ),
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(name, field)| {
+                    let cleaned = match (name.as_str(), field) {
+                        ("message" | "detail" | "title", Value::String(text)) => {
+                            Value::String(sanitize_upstream_text(text, secrets))
+                        }
+                        ("code" | "param", Value::String(text)) => {
+                            sanitize_upstream_token(text, secrets)
+                                .map_or(Value::Null, Value::String)
+                        }
+                        _ => sanitize_error_value(field, secrets),
+                    };
+                    (name.clone(), cleaned)
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +192,47 @@ mod tests {
         assert_eq!(
             sanitize_upstream_token("invalid_api_key", &[""]).as_deref(),
             Some("invalid_api_key")
+        );
+    }
+
+    #[test]
+    fn sanitize_error_value_synthetic_scrubs_nested_error_fields() {
+        let body = serde_json::json!({
+            "error": {
+                "code": format!("key_{API_KEY}"),
+                "message": format!("bad key {API_KEY} for someone@example.com"),
+                "param": "someone@example.com",
+                "type": "invalid_request_error",
+                "extra": [ACCESS]
+            },
+            "title": "Authentication Error",
+            "detail": format!("token {ACCESS}"),
+            "status": 401
+        });
+        let cleaned = sanitize_error_value(&body, &[ACCESS, API_KEY]);
+        assert_eq!(
+            cleaned,
+            serde_json::json!({
+                "error": {
+                    "code": null,
+                    "message": "bad key [redacted] for [redacted]",
+                    "param": null,
+                    "type": "invalid_request_error",
+                    "extra": ["[redacted]"]
+                },
+                "title": "Authentication Error",
+                "detail": "token [redacted]",
+                "status": 401
+            })
+        );
+    }
+
+    #[test]
+    fn sanitize_error_value_keeps_observed_error_bodies() {
+        let observed = serde_json::json!({"error":{"code":"invalid_api_key","message":"Unauthorized","param":null,"type":"authentication_error"}});
+        assert_eq!(
+            sanitize_error_value(&observed, &[ACCESS, API_KEY]),
+            observed
         );
     }
 }
