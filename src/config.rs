@@ -46,6 +46,7 @@ struct FileConfig {
     pub grok: Option<GrokConfig>,
     pub muse: Option<MuseConfig>,
     pub opencode: Option<OpenCodeConfig>,
+    pub vertex: Option<VertexConfig>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -129,6 +130,14 @@ struct MuseConfig {
 struct OpenCodeConfig {
     #[serde(rename = "apiKey")]
     pub api_key: Option<String>,
+    #[serde(rename = "baseUrl")]
+    pub base_url: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+struct VertexConfig {
+    pub project: Option<String>,
+    pub location: Option<String>,
     #[serde(rename = "baseUrl")]
     pub base_url: Option<String>,
 }
@@ -260,6 +269,14 @@ pub fn log_stderr() -> bool {
 pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     let file = read_file_config(&cfg.config_dir);
     let env: HashMap<_, _> = std::env::vars().collect();
+    // Listed from the resolved sources so the summary cannot disagree with
+    // what the provider uses, including blank values that fall through.
+    let vertex = resolve_vertex_config(&env, &cfg.config_dir);
+    let vertex_settings = [
+        ("vertex.project", vertex.project_setting.as_ref()),
+        ("vertex.location", Some(&vertex.location_setting)),
+        ("vertex.baseUrl", vertex.base_url_setting.as_ref()),
+    ];
     let mut out = Vec::new();
     if env.contains_key("CCP_BIND_ADDRESS") {
         out.push("bindAddress (env)".to_string());
@@ -332,6 +349,15 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_OPENCODE_BASE_URL") {
         out.push("opencode.baseUrl (env)".to_string());
     }
+    for (key, setting) in vertex_settings {
+        match setting.map(|setting| setting.source) {
+            Some(VertexSettingSource::Env(name)) if name.starts_with("CCP_") => {
+                out.push(format!("{key} (env)"));
+            }
+            Some(VertexSettingSource::Env(_)) => out.push(format!("{key} (Google env)")),
+            _ => {}
+        }
+    }
     if env
         .get("CCP_CODEX_REASONING_SUMMARY")
         .is_some_and(|raw| !raw.is_empty())
@@ -380,6 +406,20 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if let Some(url) = opencode.base_url.filter(|raw| !raw.is_empty()) {
                 out.push(format!("opencode.baseUrl: {url}"));
+            }
+        }
+        for (key, setting) in vertex_settings {
+            let Some(setting) = setting
+                .filter(|setting| matches!(setting.source, VertexSettingSource::ConfigFile(_)))
+            else {
+                continue;
+            };
+            // The base URL receives the access token, and a rejected value may
+            // carry user info, so only its presence is listed.
+            if key == "vertex.baseUrl" {
+                out.push(format!("{key} (config)"));
+            } else {
+                out.push(format!("{key}: {}", setting.value));
             }
         }
         if let Some(codex) = file_cfg.codex {
@@ -499,7 +539,7 @@ fn muse_endpoint(
         file_key,
         from_file,
         default,
-        validate_muse_endpoint,
+        validate_token_endpoint,
     )
 }
 
@@ -531,7 +571,11 @@ fn muse_setting(
     Ok(value)
 }
 
-fn validate_muse_endpoint(value: &str) -> Result<(), &'static str> {
+/// Checks a URL that receives a credential (a bearer token, an access token
+/// or an API key): https, or plain http only to a loopback host, and no user
+/// info. The reasons are fixed strings so callers can name the setting without
+/// repeating a value that may itself carry a credential.
+fn validate_token_endpoint(value: &str) -> Result<(), &'static str> {
     let url = url::Url::parse(value).map_err(|_| "not a valid URL")?;
     let loopback = match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
@@ -750,6 +794,230 @@ pub fn opencode_api_key_source() -> Option<&'static str> {
 pub fn opencode_base_url() -> String {
     let env: HashMap<_, _> = std::env::vars().collect();
     resolve_opencode_config(&env, &paths::config_dir()).base_url
+}
+
+// ---------------------------------------------------------------------------
+// Vertex config
+// ---------------------------------------------------------------------------
+
+/// Location used when no setting names one. `global` serves every Gemini
+/// model and needs no regional quota.
+pub const VERTEX_DEFAULT_LOCATION: &str = "global";
+
+/// Where a resolved Vertex setting came from. `Display` gives the name a user
+/// edits to change it, which is also how errors refer to the setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VertexSettingSource {
+    /// The named environment variable.
+    Env(&'static str),
+    /// The named key of the `vertex` object in `config.json`.
+    ConfigFile(&'static str),
+    /// The built-in default.
+    Default,
+}
+
+impl std::fmt::Display for VertexSettingSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VertexSettingSource::Env(name) => f.write_str(name),
+            VertexSettingSource::ConfigFile(key) => write!(f, "{key} in config.json"),
+            VertexSettingSource::Default => f.write_str("default"),
+        }
+    }
+}
+
+/// One resolved Vertex setting: the trimmed value and where it came from.
+/// The value is not validated yet; the accessors on [`ResolvedVertexConfig`]
+/// do that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexSetting {
+    /// The value, with surrounding whitespace removed.
+    pub value: String,
+    /// The environment variable, config key or default it came from.
+    pub source: VertexSettingSource,
+}
+
+/// Vertex settings after applying the precedence `CCP_VERTEX_*` over the
+/// standard Google Cloud variables over `config.json`. Values are kept even
+/// when they are invalid so that a status command can show what was read and
+/// from where; the accessors return the validated value or an error that names
+/// the setting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedVertexConfig {
+    /// Google Cloud project ID. `None` when no source sets it: there is no
+    /// default, because guessing a project would bill the wrong one.
+    pub project_setting: Option<VertexSetting>,
+    /// Vertex AI location, `global` unless a source sets another.
+    pub location_setting: VertexSetting,
+    /// Replacement for the host derived from the location, for a relay or a
+    /// local test server.
+    pub base_url_setting: Option<VertexSetting>,
+}
+
+impl ResolvedVertexConfig {
+    /// The validated project ID.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no source sets a project, naming every setting that can, or
+    /// when the value cannot be a project ID, naming the setting it came from.
+    /// The project goes into the request path, so `/`, `?` and `#` never pass.
+    pub fn project(&self) -> anyhow::Result<&str> {
+        let Some(setting) = &self.project_setting else {
+            anyhow::bail!(
+                "Vertex project is not set: set CCP_VERTEX_PROJECT, GOOGLE_CLOUD_PROJECT or vertex.project in config.json"
+            );
+        };
+        validated_vertex_setting(setting, validate_vertex_project)
+    }
+
+    /// The validated location.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the value is not lowercase letters, digits and `-`, naming
+    /// the setting it came from. The location goes into both the host name
+    /// and the request path.
+    pub fn location(&self) -> anyhow::Result<&str> {
+        validated_vertex_setting(&self.location_setting, validate_vertex_location)
+    }
+
+    /// The validated base URL override, or `None` to use the host derived
+    /// from the location (see [`vertex_host`]).
+    ///
+    /// # Errors
+    ///
+    /// The URL receives the Google access token, so it must use https (plain
+    /// http only for a loopback host) and carry no user info. A value that
+    /// does not is an error naming the setting; the value itself is left out
+    /// because it may contain credentials.
+    pub fn base_url(&self) -> anyhow::Result<Option<&str>> {
+        self.base_url_setting
+            .as_ref()
+            .map(|setting| validated_vertex_setting(setting, validate_token_endpoint))
+            .transpose()
+    }
+}
+
+fn validated_vertex_setting(
+    setting: &VertexSetting,
+    validate: fn(&str) -> Result<(), &'static str>,
+) -> anyhow::Result<&str> {
+    validate(&setting.value)
+        .map_err(|reason| anyhow::anyhow!("Invalid Vertex setting {}: {reason}", setting.source))?;
+    Ok(&setting.value)
+}
+
+fn validate_vertex_project(value: &str) -> Result<(), &'static str> {
+    let mut bytes = value.bytes();
+    let starts_alphanumeric = bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric());
+    if !starts_alphanumeric
+        || !bytes
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(
+            "must be a Google Cloud project ID: letters, digits, '.', '_', ':' and '-', starting with a letter or digit",
+        );
+    }
+    Ok(())
+}
+
+fn validate_vertex_location(value: &str) -> Result<(), &'static str> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(
+            "must be a Vertex AI location such as global, us-central1 or europe-west4: lowercase letters, digits and '-'",
+        );
+    }
+    Ok(())
+}
+
+/// Resolves the Vertex settings from `env` and `config_dir/config.json`.
+///
+/// Each value is taken from the first source that sets it to something other
+/// than blank: `CCP_VERTEX_PROJECT`, `GOOGLE_CLOUD_PROJECT`, `vertex.project`
+/// for the project; `CCP_VERTEX_LOCATION`, `GOOGLE_CLOUD_LOCATION`,
+/// `vertex.location`, then `global` for the location; `CCP_VERTEX_BASE_URL`,
+/// `vertex.baseUrl` for the base URL. Reading the Google Cloud variables lets
+/// a shell already set up for `gcloud` or the Gemini CLI work unchanged, while
+/// the `CCP_` names can point the proxy elsewhere without touching them.
+pub fn resolve_vertex_config(
+    env: &HashMap<String, String>,
+    config_dir: &Path,
+) -> ResolvedVertexConfig {
+    let file = read_file_config(config_dir).and_then(|file| file.vertex);
+    let pick = |env_names: &[&'static str],
+                file_key: &'static str,
+                file_value: Option<&String>|
+     -> Option<VertexSetting> {
+        let set = |raw: &String| {
+            let trimmed = raw.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        };
+        env_names
+            .iter()
+            .find_map(|name| {
+                env.get(*name).and_then(set).map(|value| VertexSetting {
+                    value,
+                    source: VertexSettingSource::Env(name),
+                })
+            })
+            .or_else(|| {
+                file_value.and_then(set).map(|value| VertexSetting {
+                    value,
+                    source: VertexSettingSource::ConfigFile(file_key),
+                })
+            })
+    };
+
+    let project_setting = pick(
+        &["CCP_VERTEX_PROJECT", "GOOGLE_CLOUD_PROJECT"],
+        "vertex.project",
+        file.as_ref().and_then(|config| config.project.as_ref()),
+    );
+    let location_setting = pick(
+        &["CCP_VERTEX_LOCATION", "GOOGLE_CLOUD_LOCATION"],
+        "vertex.location",
+        file.as_ref().and_then(|config| config.location.as_ref()),
+    )
+    .unwrap_or_else(|| VertexSetting {
+        value: VERTEX_DEFAULT_LOCATION.to_string(),
+        source: VertexSettingSource::Default,
+    });
+    let base_url_setting = pick(
+        &["CCP_VERTEX_BASE_URL"],
+        "vertex.baseUrl",
+        file.as_ref().and_then(|config| config.base_url.as_ref()),
+    );
+
+    ResolvedVertexConfig {
+        project_setting,
+        location_setting,
+        base_url_setting,
+    }
+}
+
+/// Vertex settings for this process: its environment and the config file in
+/// the resolved config directory.
+pub fn vertex_config() -> ResolvedVertexConfig {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    resolve_vertex_config(&env, &paths::config_dir())
+}
+
+/// Host name that serves Vertex AI in `location`: the global endpoint for
+/// `global`, the multi-region endpoints for `us` and `eu`, and the regional
+/// endpoint for everything else. `location` must already be validated.
+pub fn vertex_host(location: &str) -> String {
+    match location {
+        "global" => "aiplatform.googleapis.com".to_string(),
+        "us" | "eu" => format!("aiplatform.{location}.rep.googleapis.com"),
+        region => format!("{region}-aiplatform.googleapis.com"),
+    }
 }
 
 pub fn is_verbose() -> bool {
@@ -1615,6 +1883,484 @@ mod tests {
         assert_eq!(resolved.api_key.as_deref(), Some("ccp-key"));
         assert_eq!(resolved.api_key_source, Some("CCP_OPENCODE_API_KEY"));
         assert_eq!(resolved.base_url, "https://env.example/v1");
+    }
+
+    fn vertex_env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    fn vertex_setting(value: &str, source: VertexSettingSource) -> Option<VertexSetting> {
+        Some(VertexSetting {
+            value: value.to_string(),
+            source,
+        })
+    }
+
+    const VERTEX_FILE: &str = r#"{"vertex":{"project":"file-project","location":"europe-west4","baseUrl":"https://file.example"}}"#;
+
+    #[test]
+    fn vertex_config_takes_ccp_env_over_google_env_over_config_file() {
+        use VertexSettingSource::{ConfigFile, Default, Env};
+        let with_file = tempfile::TempDir::new().unwrap();
+        std::fs::write(with_file.path().join("config.json"), VERTEX_FILE).unwrap();
+        let without_file = tempfile::TempDir::new().unwrap();
+        let all_env = [
+            ("CCP_VERTEX_PROJECT", "ccp-project"),
+            ("GOOGLE_CLOUD_PROJECT", "google-project"),
+            ("CCP_VERTEX_LOCATION", "us-central1"),
+            ("GOOGLE_CLOUD_LOCATION", "asia-northeast1"),
+            ("CCP_VERTEX_BASE_URL", "https://env.example"),
+        ];
+        let google_env = [
+            ("GOOGLE_CLOUD_PROJECT", "google-project"),
+            ("GOOGLE_CLOUD_LOCATION", "asia-northeast1"),
+        ];
+        // Name, environment, config directory, expected resolution.
+        type Case<'a> = (
+            &'a str,
+            &'a [(&'a str, &'a str)],
+            &'a tempfile::TempDir,
+            ResolvedVertexConfig,
+        );
+        let cases: [Case; 5] = [
+            (
+                "nothing set: no project, the global location, no base URL",
+                &[],
+                &without_file,
+                ResolvedVertexConfig {
+                    project_setting: None,
+                    location_setting: vertex_setting("global", Default).unwrap(),
+                    base_url_setting: None,
+                },
+            ),
+            (
+                "config.json only",
+                &[],
+                &with_file,
+                ResolvedVertexConfig {
+                    project_setting: vertex_setting("file-project", ConfigFile("vertex.project")),
+                    location_setting: vertex_setting("europe-west4", ConfigFile("vertex.location"))
+                        .unwrap(),
+                    base_url_setting: vertex_setting(
+                        "https://file.example",
+                        ConfigFile("vertex.baseUrl"),
+                    ),
+                },
+            ),
+            (
+                "Google env over config.json; the base URL has no Google variable",
+                &google_env,
+                &with_file,
+                ResolvedVertexConfig {
+                    project_setting: vertex_setting("google-project", Env("GOOGLE_CLOUD_PROJECT")),
+                    location_setting: vertex_setting(
+                        "asia-northeast1",
+                        Env("GOOGLE_CLOUD_LOCATION"),
+                    )
+                    .unwrap(),
+                    base_url_setting: vertex_setting(
+                        "https://file.example",
+                        ConfigFile("vertex.baseUrl"),
+                    ),
+                },
+            ),
+            (
+                "CCP env over Google env over config.json",
+                &all_env,
+                &with_file,
+                ResolvedVertexConfig {
+                    project_setting: vertex_setting("ccp-project", Env("CCP_VERTEX_PROJECT")),
+                    location_setting: vertex_setting("us-central1", Env("CCP_VERTEX_LOCATION"))
+                        .unwrap(),
+                    base_url_setting: vertex_setting(
+                        "https://env.example",
+                        Env("CCP_VERTEX_BASE_URL"),
+                    ),
+                },
+            ),
+            (
+                "Google env without config.json",
+                &google_env,
+                &without_file,
+                ResolvedVertexConfig {
+                    project_setting: vertex_setting("google-project", Env("GOOGLE_CLOUD_PROJECT")),
+                    location_setting: vertex_setting(
+                        "asia-northeast1",
+                        Env("GOOGLE_CLOUD_LOCATION"),
+                    )
+                    .unwrap(),
+                    base_url_setting: None,
+                },
+            ),
+        ];
+        for (name, env, config, expected) in cases {
+            let resolved = resolve_vertex_config(&vertex_env(env), config.path());
+            assert_eq!(resolved, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn vertex_config_blank_values_fall_through_and_padded_values_are_trimmed() {
+        use VertexSettingSource::{ConfigFile, Default, Env};
+        let config = tempfile::TempDir::new().unwrap();
+        let path = config.path().join("config.json");
+        for blank in ["", "   ", "\t\n"] {
+            // Blank CCP values fall through to the Google variables.
+            let env = vertex_env(&[
+                ("CCP_VERTEX_PROJECT", blank),
+                ("GOOGLE_CLOUD_PROJECT", " google-project "),
+                ("CCP_VERTEX_LOCATION", blank),
+                ("GOOGLE_CLOUD_LOCATION", "\tus-east5\n"),
+                ("CCP_VERTEX_BASE_URL", blank),
+            ]);
+            let resolved = resolve_vertex_config(&env, config.path());
+            assert_eq!(
+                resolved.project_setting,
+                vertex_setting("google-project", Env("GOOGLE_CLOUD_PROJECT")),
+                "{blank:?}"
+            );
+            assert_eq!(
+                Some(resolved.location_setting),
+                vertex_setting("us-east5", Env("GOOGLE_CLOUD_LOCATION")),
+                "{blank:?}"
+            );
+            assert_eq!(resolved.base_url_setting, None, "{blank:?}");
+
+            // Blank environment values fall through to config.json, and its
+            // padded values come back trimmed.
+            std::fs::write(
+                &path,
+                serde_json::json!({"vertex": {
+                    "project": " file-project\t",
+                    "location": " eu ",
+                    "baseUrl": "\thttp://localhost.:9 ",
+                }})
+                .to_string(),
+            )
+            .unwrap();
+            let env = vertex_env(&[
+                ("CCP_VERTEX_PROJECT", blank),
+                ("GOOGLE_CLOUD_PROJECT", blank),
+                ("CCP_VERTEX_LOCATION", blank),
+                ("GOOGLE_CLOUD_LOCATION", blank),
+                ("CCP_VERTEX_BASE_URL", blank),
+            ]);
+            let resolved = resolve_vertex_config(&env, config.path());
+            assert_eq!(resolved.project().unwrap(), "file-project", "{blank:?}");
+            assert_eq!(
+                resolved
+                    .project_setting
+                    .as_ref()
+                    .map(|setting| setting.source),
+                Some(ConfigFile("vertex.project")),
+                "{blank:?}"
+            );
+            assert_eq!(resolved.location().unwrap(), "eu", "{blank:?}");
+            assert_eq!(
+                resolved.base_url().unwrap(),
+                Some("http://localhost.:9"),
+                "{blank:?}"
+            );
+
+            // Blank everywhere: no project, the default location, no base URL.
+            std::fs::write(
+                &path,
+                serde_json::json!({"vertex": {
+                    "project": blank,
+                    "location": blank,
+                    "baseUrl": blank,
+                }})
+                .to_string(),
+            )
+            .unwrap();
+            let resolved = resolve_vertex_config(&env, config.path());
+            assert_eq!(resolved.project_setting, None, "{blank:?}");
+            assert_eq!(
+                Some(resolved.location_setting.clone()),
+                vertex_setting("global", Default),
+                "{blank:?}"
+            );
+            assert_eq!(resolved.base_url().unwrap(), None, "{blank:?}");
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn vertex_project_missing_is_an_error_naming_every_setting() {
+        let config = tempfile::TempDir::new().unwrap();
+        let resolved = resolve_vertex_config(&HashMap::new(), config.path());
+        let error = resolved.project().unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "Vertex project is not set: set CCP_VERTEX_PROJECT, GOOGLE_CLOUD_PROJECT or vertex.project in config.json"
+        );
+    }
+
+    #[test]
+    fn vertex_project_synthetic_values_are_checked_before_they_reach_the_url() {
+        const REASON: &str = "must be a Google Cloud project ID: letters, digits, '.', '_', ':' and '-', starting with a letter or digit";
+        let config = tempfile::TempDir::new().unwrap();
+        let path = config.path().join("config.json");
+        let rejected = [
+            "my-project/locations/us",
+            "my-project?alt=json",
+            "my-project#fragment",
+            "my project",
+            "-leading-dash",
+            ".leading-dot",
+            "my-project%2F",
+            "プロジェクト",
+        ];
+        for value in rejected {
+            for env_name in ["CCP_VERTEX_PROJECT", "GOOGLE_CLOUD_PROJECT"] {
+                let resolved =
+                    resolve_vertex_config(&vertex_env(&[(env_name, value)]), config.path());
+                assert_eq!(
+                    resolved.project().unwrap_err().to_string(),
+                    format!("Invalid Vertex setting {env_name}: {REASON}"),
+                    "{env_name}={value:?}"
+                );
+            }
+            std::fs::write(
+                &path,
+                serde_json::json!({"vertex": {"project": value}}).to_string(),
+            )
+            .unwrap();
+            let resolved = resolve_vertex_config(&HashMap::new(), config.path());
+            assert_eq!(
+                resolved.project().unwrap_err().to_string(),
+                format!("Invalid Vertex setting vertex.project in config.json: {REASON}"),
+                "{value:?}"
+            );
+            std::fs::remove_file(&path).unwrap();
+        }
+        for accepted in [
+            "my-project",
+            "my-project-123456",
+            "0starts-with-a-digit",
+            "example.com:my-project",
+            "Mixed_Case.project",
+        ] {
+            let resolved = resolve_vertex_config(
+                &vertex_env(&[("CCP_VERTEX_PROJECT", accepted)]),
+                config.path(),
+            );
+            assert_eq!(resolved.project().unwrap(), accepted);
+        }
+    }
+
+    #[test]
+    fn vertex_location_synthetic_values_must_be_lowercase_letters_digits_and_dashes() {
+        const REASON: &str = "must be a Vertex AI location such as global, us-central1 or europe-west4: lowercase letters, digits and '-'";
+        let config = tempfile::TempDir::new().unwrap();
+        let path = config.path().join("config.json");
+        let rejected = [
+            "US-CENTRAL1",
+            "Global",
+            "us-central1/publishers",
+            "us_central1",
+            "us-central1?x=1",
+            "us central1",
+            "evil.example.com#",
+        ];
+        for value in rejected {
+            for env_name in ["CCP_VERTEX_LOCATION", "GOOGLE_CLOUD_LOCATION"] {
+                let resolved =
+                    resolve_vertex_config(&vertex_env(&[(env_name, value)]), config.path());
+                assert_eq!(
+                    resolved.location().unwrap_err().to_string(),
+                    format!("Invalid Vertex setting {env_name}: {REASON}"),
+                    "{env_name}={value:?}"
+                );
+            }
+            std::fs::write(
+                &path,
+                serde_json::json!({"vertex": {"location": value}}).to_string(),
+            )
+            .unwrap();
+            let resolved = resolve_vertex_config(&HashMap::new(), config.path());
+            assert_eq!(
+                resolved.location().unwrap_err().to_string(),
+                format!("Invalid Vertex setting vertex.location in config.json: {REASON}"),
+                "{value:?}"
+            );
+            std::fs::remove_file(&path).unwrap();
+        }
+        for accepted in ["global", "us", "eu", "us-central1", "asia-northeast1"] {
+            let resolved = resolve_vertex_config(
+                &vertex_env(&[("CCP_VERTEX_LOCATION", accepted)]),
+                config.path(),
+            );
+            assert_eq!(resolved.location().unwrap(), accepted);
+        }
+    }
+
+    #[test]
+    fn vertex_base_url_synthetic_unsafe_values_are_rejected_without_repeating_them() {
+        const NOT_HTTPS: &str = "must use https (plain http only for a loopback host)";
+        const USER_INFO: &str = "must not contain a user name or password";
+        let config = tempfile::TempDir::new().unwrap();
+        let path = config.path().join("config.json");
+        let rejected = [
+            ("http://relay.example/v1", NOT_HTTPS),
+            ("http://10.0.0.1", NOT_HTTPS),
+            ("ftp://127.0.0.1", NOT_HTTPS),
+            (
+                "https://user:synthetic-pass@aiplatform.googleapis.com",
+                USER_INFO,
+            ),
+            ("https://user@aiplatform.googleapis.com", USER_INFO),
+            ("http://user@127.0.0.1:9", USER_INFO),
+            ("aiplatform.googleapis.com", "not a valid URL"),
+        ];
+        for (value, reason) in rejected {
+            let resolved = resolve_vertex_config(
+                &vertex_env(&[("CCP_VERTEX_BASE_URL", value)]),
+                config.path(),
+            );
+            let error = resolved.base_url().unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!("Invalid Vertex setting CCP_VERTEX_BASE_URL: {reason}"),
+                "{value}"
+            );
+            assert!(!error.contains("synthetic-pass"), "{error}");
+
+            std::fs::write(
+                &path,
+                serde_json::json!({"vertex": {"baseUrl": value}}).to_string(),
+            )
+            .unwrap();
+            let resolved = resolve_vertex_config(&HashMap::new(), config.path());
+            assert_eq!(
+                resolved.base_url().unwrap_err().to_string(),
+                format!("Invalid Vertex setting vertex.baseUrl in config.json: {reason}"),
+                "{value}"
+            );
+            std::fs::remove_file(&path).unwrap();
+        }
+        for accepted in [
+            "http://127.0.0.1:9",
+            "http://[::1]:9/v1",
+            "http://localhost:9",
+            "https://relay.example:8443",
+        ] {
+            let resolved = resolve_vertex_config(
+                &vertex_env(&[("CCP_VERTEX_BASE_URL", accepted)]),
+                config.path(),
+            );
+            assert_eq!(resolved.base_url().unwrap(), Some(accepted));
+        }
+    }
+
+    #[test]
+    fn vertex_host_follows_the_location_kind() {
+        let cases = [
+            ("global", "aiplatform.googleapis.com"),
+            ("us", "aiplatform.us.rep.googleapis.com"),
+            ("eu", "aiplatform.eu.rep.googleapis.com"),
+            (
+                "asia-northeast1",
+                "asia-northeast1-aiplatform.googleapis.com",
+            ),
+            ("us-central1", "us-central1-aiplatform.googleapis.com"),
+            ("us-east5", "us-east5-aiplatform.googleapis.com"),
+        ];
+        for (location, host) in cases {
+            assert_eq!(vertex_host(location), host, "{location}");
+        }
+    }
+
+    #[test]
+    fn vertex_setting_source_names_the_setting_to_edit() {
+        let cases = [
+            (
+                VertexSettingSource::Env("CCP_VERTEX_PROJECT"),
+                "CCP_VERTEX_PROJECT",
+            ),
+            (
+                VertexSettingSource::Env("GOOGLE_CLOUD_LOCATION"),
+                "GOOGLE_CLOUD_LOCATION",
+            ),
+            (
+                VertexSettingSource::ConfigFile("vertex.baseUrl"),
+                "vertex.baseUrl in config.json",
+            ),
+            (VertexSettingSource::Default, "default"),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(source.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn vertex_overrides_are_listed_with_their_source() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _guards = isolated_env(&config);
+        let _vertex_guards = [
+            EnvGuard::unset("CCP_VERTEX_PROJECT"),
+            EnvGuard::unset("CCP_VERTEX_LOCATION"),
+            EnvGuard::unset("CCP_VERTEX_BASE_URL"),
+            EnvGuard::unset("GOOGLE_CLOUD_PROJECT"),
+            EnvGuard::unset("GOOGLE_CLOUD_LOCATION"),
+        ];
+        let loaded = load_config_for_env(&config_env(&config));
+        let vertex_lines = || -> Vec<String> {
+            config_override_summary_lines(&loaded)
+                .into_iter()
+                .filter(|line| line.starts_with("vertex."))
+                .collect()
+        };
+        assert_eq!(vertex_lines(), Vec::<String>::new());
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"vertex":{"project":"file-project","location":"europe-west4","baseUrl":"https://user:synthetic-pass@file.example"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            vertex_lines(),
+            [
+                "vertex.project: file-project",
+                "vertex.location: europe-west4",
+                "vertex.baseUrl (config)",
+            ]
+        );
+
+        let _project = EnvGuard::set("GOOGLE_CLOUD_PROJECT", "google-project");
+        let _location = EnvGuard::set("GOOGLE_CLOUD_LOCATION", "us-central1");
+        assert_eq!(
+            vertex_lines(),
+            [
+                "vertex.project (Google env)",
+                "vertex.location (Google env)",
+                "vertex.baseUrl (config)",
+            ]
+        );
+
+        // A blank CCP value is unset and leaves the Google variable in effect.
+        let _blank_project = EnvGuard::set("CCP_VERTEX_PROJECT", " ");
+        let _ccp_location = EnvGuard::set("CCP_VERTEX_LOCATION", "us-east5");
+        let _ccp_base_url = EnvGuard::set("CCP_VERTEX_BASE_URL", "http://127.0.0.1:9");
+        let lines = vertex_lines();
+        assert_eq!(
+            lines,
+            [
+                "vertex.project (Google env)",
+                "vertex.location (env)",
+                "vertex.baseUrl (env)",
+            ]
+        );
+        assert!(
+            !config_override_summary_lines(&loaded)
+                .iter()
+                .any(|line| line.contains("synthetic-pass")),
+            "{lines:?}"
+        );
     }
 
     #[test]
