@@ -2292,6 +2292,531 @@ async fn vertex_mistral_synthetic_content_after_the_finish_reason_is_an_error() 
     assert_eq!(upstream.requests().len(), 2);
 }
 
+// Model Garden's managed open models.
+
+/// The six managed open models of Google's open-model catalog: the name the
+/// client asks for, where Vertex AI takes the request for project
+/// `ccp-project`, and the `model` value of the request body. The general
+/// open-model guide calls `v1` in `global`; the Llama 4 page calls
+/// `v1beta1` in `us-east5`.
+const OPEN_MODELS: [(&str, &str, &str); 6] = [
+    (
+        "vertex/openai/gpt-oss-120b-maas",
+        "/v1/projects/ccp-project/locations/global/endpoints/openapi/chat/completions",
+        "openai/gpt-oss-120b-maas",
+    ),
+    (
+        "vertex/zai-org/glm-5.2-maas",
+        "/v1/projects/ccp-project/locations/global/endpoints/openapi/chat/completions",
+        "zai-org/glm-5.2-maas",
+    ),
+    (
+        "vertex/google/gemma-4-26b-a4b-it-maas",
+        "/v1/projects/ccp-project/locations/global/endpoints/openapi/chat/completions",
+        "google/gemma-4-26b-a4b-it-maas",
+    ),
+    (
+        "vertex/meta/llama-4-maverick-17b-128e-instruct-maas",
+        "/v1beta1/projects/ccp-project/locations/us-east5/endpoints/openapi/chat/completions",
+        "meta/llama-4-maverick-17b-128e-instruct-maas",
+    ),
+    (
+        "vertex/meta/llama-4-scout-17b-16e-instruct-maas",
+        "/v1beta1/projects/ccp-project/locations/us-east5/endpoints/openapi/chat/completions",
+        "meta/llama-4-scout-17b-16e-instruct-maas",
+    ),
+    (
+        "vertex/deepseek-ai/deepseek-v4.1-flash-maas",
+        "/v1/projects/ccp-project/locations/global/endpoints/openapi/chat/completions",
+        "deepseek-ai/deepseek-v4.1-flash-maas",
+    ),
+];
+
+/// The fixed message a client sees when an open-model stream fails.
+const OPEN_MODEL_STREAM_INVALID: &str = "Vertex AI open model stream is invalid";
+
+/// One `chat.completion.chunk` as Google's open-model examples show it.
+fn open_model_chunk(delta: Value, finish_reason: Option<&str>) -> Value {
+    json!({
+        "id":"synthetic-open-model","object":"chat.completion.chunk","model":"zai-org/glm-5.2-maas",
+        "choices":[{"index":0,"delta":delta,"finish_reason":finish_reason}]
+    })
+}
+
+/// The last chunk of Google's open-model streaming example: `usage` and no
+/// choices.
+fn open_model_usage_chunk() -> Value {
+    json!({
+        "id":"synthetic-open-model","object":"chat.completion.chunk","model":"zai-org/glm-5.2-maas",
+        "choices":[],
+        "usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}
+    })
+}
+
+/// An open-model stream answering `text`: the text, the finish reason, the
+/// usage chunk and `data: [DONE]`.
+fn open_model_text(text: &str) -> Vec<Value> {
+    vec![
+        open_model_chunk(json!({"role":"assistant","content":text}), None),
+        open_model_chunk(json!({}), Some("stop")),
+        open_model_usage_chunk(),
+    ]
+}
+
+/// A 200 event stream with one `data:` frame per value, then
+/// `data: [DONE]`, closed after it.
+fn open_model_sse(frames: &[Value]) -> Answer {
+    let mut chunks: Vec<String> = frames
+        .iter()
+        .map(|frame| format!("data: {frame}\r\n\r\n"))
+        .collect();
+    chunks.push("data: [DONE]\r\n\r\n".to_string());
+    Answer::raw(200, "text/event-stream", chunks)
+}
+
+/// The request every open-model test sends: a system prompt, effort `max`,
+/// adaptive thinking and one tool.
+fn open_model_request(model: &str, stream: bool) -> Value {
+    json!({
+        "model": model,
+        "max_tokens": 256,
+        "stream": stream,
+        "system": "Be brief.",
+        "output_config": {"effort": "max"},
+        "thinking": {"type": "adaptive"},
+        "tools": [read_file_tool()],
+        "messages": [{"role":"user","content":"Say hello"}]
+    })
+}
+
+/// The body every open model gets for [`open_model_request`], before the
+/// model's own thinking field.
+fn open_model_expected_body(upstream_model: &str) -> Value {
+    json!({
+        "model": upstream_model,
+        "messages": [
+            {"role":"system","content":"Be brief."},
+            {"role":"user","content":"Say hello"}
+        ],
+        "tools": [{"type":"function","function":{
+            "name":"read_file",
+            "description":"Read a file",
+            "parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+        }}],
+        "stream": true,
+        "stream_options": {"include_usage": true},
+        "max_tokens": 256
+    })
+}
+
+#[tokio::test]
+async fn vertex_open_models_synthetic_each_row_reaches_its_documented_url_with_its_body() {
+    let upstream = FakeVertex::start(
+        OPEN_MODELS
+            .iter()
+            .flat_map(|_| {
+                [
+                    open_model_sse(&open_model_text("Hello")),
+                    open_model_sse(&open_model_text("Hello")),
+                ]
+            })
+            .collect(),
+    )
+    .await;
+    let registry = registry(provider(&upstream, &[]));
+    for (model, ..) in OPEN_MODELS {
+        for stream in [false, true] {
+            let (status, _, body) = send(
+                app_with_monitor(registry.clone(), None),
+                "/v1/messages",
+                &open_model_request(model, stream),
+                &[],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{model} stream={stream}: {body}");
+            assert_text_answer(stream, &body, model, "Hello");
+        }
+    }
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), OPEN_MODELS.len() * 2);
+    for (sent, (model, path, upstream_model)) in requests
+        .iter()
+        .zip(OPEN_MODELS.iter().flat_map(|row| [row, row]))
+    {
+        assert_eq!(sent.path_and_query, *path, "{model}");
+        assert_eq!(sent.accept.as_deref(), Some("text/event-stream"), "{model}");
+        assert_eq!(
+            sent.authorization.as_deref(),
+            Some(format!("Bearer {SYNTHETIC_TOKEN}").as_str()),
+            "{model}"
+        );
+        // The thinking field each model's documentation gives: effort for
+        // gpt-oss (max becomes high), the chat-template switch for GLM and
+        // Gemma, nothing for Llama and DeepSeek.
+        let mut expected = open_model_expected_body(upstream_model);
+        match *upstream_model {
+            "openai/gpt-oss-120b-maas" => expected["reasoning_effort"] = json!("high"),
+            "zai-org/glm-5.2-maas" | "google/gemma-4-26b-a4b-it-maas" => {
+                expected["chat_template_kwargs"] = json!({"enable_thinking": true});
+            }
+            _ => {}
+        }
+        assert_eq!(sent.body, expected, "{model}");
+    }
+}
+
+#[tokio::test]
+async fn vertex_open_models_synthetic_glm_thinking_off_unless_claude_code_turns_it_on() {
+    let upstream = FakeVertex::start(vec![
+        open_model_sse(&open_model_text("Hello")),
+        open_model_sse(&open_model_text("Hello")),
+    ])
+    .await;
+    let registry = registry(provider(&upstream, &[]));
+    for thinking in [json!({"type": "disabled"}), Value::Null] {
+        let mut request = message_request("vertex/zai-org/glm-5.2-maas", false);
+        if !thinking.is_null() {
+            request["thinking"] = thinking;
+        }
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages",
+            &request,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    for sent in upstream.requests() {
+        assert_eq!(
+            sent.body["chat_template_kwargs"],
+            json!({"enable_thinking": false}),
+            "{}",
+            sent.body
+        );
+        assert!(sent.body.get("reasoning_effort").is_none(), "{}", sent.body);
+    }
+}
+
+#[tokio::test]
+async fn vertex_open_models_synthetic_reasoning_becomes_thinking_in_both_modes() {
+    let frames = vec![
+        open_model_chunk(
+            json!({"role":"assistant","reasoning_content":"Thinking it over"}),
+            None,
+        ),
+        open_model_chunk(json!({"content":"Hello"}), None),
+        open_model_chunk(json!({}), Some("stop")),
+        open_model_usage_chunk(),
+    ];
+    let upstream = FakeVertex::start(vec![open_model_sse(&frames), open_model_sse(&frames)]).await;
+    let registry = registry(provider(&upstream, &[]));
+    let model = "vertex/zai-org/glm-5.2-maas";
+    for stream in [false, true] {
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages",
+            &open_model_request(model, stream),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "stream={stream}: {body}");
+        let content = if stream {
+            let events = sse_events(&body);
+            assert_eq!(
+                events.last().map(|(name, _)| name.as_str()),
+                Some("message_stop"),
+                "{body}"
+            );
+            assert_eq!(stop_reason(&events).as_deref(), Some("end_turn"), "{body}");
+            let usage = events
+                .iter()
+                .find(|(name, _)| name == "message_delta")
+                .map(|(_, data)| data["usage"].clone())
+                .unwrap_or_default();
+            assert_eq!(usage["output_tokens"], 3, "{body}");
+            streamed_content(&events)
+        } else {
+            let message: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(message["stop_reason"], "end_turn", "{body}");
+            assert_eq!(message["usage"]["input_tokens"], 11, "{body}");
+            assert_eq!(message["usage"]["output_tokens"], 3, "{body}");
+            message["content"].as_array().cloned().unwrap_or_default()
+        };
+        assert_eq!(content.len(), 2, "{body}");
+        assert_eq!(content[0]["type"], "thinking", "{body}");
+        assert_eq!(content[0]["thinking"], "Thinking it over", "{body}");
+        assert_eq!(content[1], json!({"type":"text","text":"Hello"}), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn vertex_open_models_synthetic_forced_tool_choice_on_gpt_oss_is_refused_without_a_request() {
+    let upstream = FakeVertex::start(Vec::new()).await;
+    let registry = registry(provider(&upstream, &[]));
+    for tool_choice in [
+        json!({"type":"any"}),
+        json!({"type":"tool","name":"read_file"}),
+    ] {
+        for stream in [false, true] {
+            let mut request = open_model_request("vertex/openai/gpt-oss-120b-maas", stream);
+            request["tool_choice"] = tool_choice.clone();
+            let (status, _, body) = send(
+                app_with_monitor(registry.clone(), None),
+                "/v1/messages",
+                &request,
+                &[],
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{tool_choice}: {body}");
+            let value: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["error"]["type"], "invalid_request_error", "{body}");
+            assert_eq!(
+                error_message(&body),
+                "Vertex AI model openai/gpt-oss-120b-maas does not support a forced tool choice (tool_choice any or tool); use tool_choice auto or none"
+            );
+        }
+    }
+    assert!(upstream.requests().is_empty());
+}
+
+#[tokio::test]
+async fn vertex_open_models_synthetic_glm_takes_every_tool_choice() {
+    let upstream = FakeVertex::start(vec![
+        open_model_sse(&open_model_text("Hello")),
+        open_model_sse(&open_model_text("Hello")),
+    ])
+    .await;
+    let registry = registry(provider(&upstream, &[]));
+    for tool_choice in [
+        json!({"type":"any"}),
+        json!({"type":"tool","name":"read_file"}),
+    ] {
+        let mut request = open_model_request("vertex/zai-org/glm-5.2-maas", false);
+        request["tool_choice"] = tool_choice;
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages",
+            &request,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let requests = upstream.requests();
+    assert_eq!(requests[0].body["tool_choice"], "required");
+    assert_eq!(
+        requests[1].body["tool_choice"],
+        json!({"type":"function","function":{"name":"read_file"}})
+    );
+}
+
+#[tokio::test]
+async fn vertex_open_models_synthetic_content_after_the_finish_reason_is_an_error() {
+    let mut frames = open_model_text("Hello");
+    frames.insert(2, open_model_chunk(json!({"content":"late"}), None));
+    let upstream = FakeVertex::start(vec![open_model_sse(&frames), open_model_sse(&frames)]).await;
+    let registry = registry(provider(&upstream, &[]));
+    for stream in [false, true] {
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages",
+            &message_request("vertex/deepseek-ai/deepseek-v4.1-flash-maas", stream),
+            &[],
+        )
+        .await;
+        if stream {
+            assert_stream_failed_with(status, &body, OPEN_MODEL_STREAM_INVALID);
+        } else {
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+            let value: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["error"]["type"], "api_error", "{body}");
+            assert_eq!(
+                error_message(&body),
+                "Vertex AI open model stream sent content after finish_reason"
+            );
+        }
+    }
+    assert_eq!(upstream.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn vertex_open_models_synthetic_404_names_model_garden_with_the_model_project_and_location() {
+    let not_found = google_error(404, "NOT_FOUND", "Publisher Model was not found.");
+    let upstream = FakeVertex::start(
+        (0..4)
+            .map(|_| Answer::error(404, not_found.clone()))
+            .collect(),
+    )
+    .await;
+    let registry = registry(provider(&upstream, &[]));
+    for (model, upstream_model, location) in [
+        (
+            "vertex/openai/gpt-oss-120b-maas",
+            "openai/gpt-oss-120b-maas",
+            "global",
+        ),
+        (
+            "vertex/meta/llama-4-scout-17b-16e-instruct-maas",
+            "meta/llama-4-scout-17b-16e-instruct-maas",
+            "us-east5",
+        ),
+    ] {
+        for stream in [false, true] {
+            let (status, _, body) = send(
+                app_with_monitor(registry.clone(), None),
+                "/v1/messages",
+                &message_request(model, stream),
+                &[],
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{model}: {body}");
+            let value: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["error"]["type"], "invalid_request_error", "{body}");
+            let message = error_message(&body);
+            let expected = format!(
+                ". Also check that model {upstream_model} is enabled in Model Garden for project ccp-project in location {location} and, for a preview model, that the project has been granted access; the status alone does not say which of these is the cause (upstream HTTP 404)"
+            );
+            assert!(message.ends_with(&expected), "{model}: {message}");
+            assert!(message.contains("Check the model ID"), "{model}: {message}");
+        }
+    }
+    assert_eq!(upstream.requests().len(), 4);
+}
+
+#[tokio::test]
+async fn vertex_open_models_synthetic_llama_location_moves_only_with_a_model_key() {
+    let upstream = FakeVertex::start(vec![
+        open_model_sse(&open_model_text("maverick")),
+        open_model_sse(&open_model_text("scout")),
+        open_model_sse(&open_model_text("glm")),
+        open_model_sse(&open_model_text("unlisted")),
+    ])
+    .await;
+    let registry = registry(provider(
+        &upstream,
+        &[
+            ("CCP_VERTEX_LOCATION", "us-central1"),
+            (
+                "CCP_VERTEX_LOCATION_OVERRIDES",
+                "meta=us, meta/llama-4-maverick-17b-128e-instruct-maas=europe-west4",
+            ),
+        ],
+    ));
+    let cases = [
+        (
+            "vertex/meta/llama-4-maverick-17b-128e-instruct-maas",
+            "/v1beta1/projects/ccp-project/locations/europe-west4/endpoints/openapi/chat/completions",
+        ),
+        (
+            "vertex/meta/llama-4-scout-17b-16e-instruct-maas",
+            "/v1beta1/projects/ccp-project/locations/us-east5/endpoints/openapi/chat/completions",
+        ),
+        (
+            "vertex/zai-org/glm-5.2-maas",
+            "/v1/projects/ccp-project/locations/us-central1/endpoints/openapi/chat/completions",
+        ),
+        (
+            "vertex/meta/llama-synthetic-5-maas",
+            "/v1/projects/ccp-project/locations/us/endpoints/openapi/chat/completions",
+        ),
+    ];
+    for (model, _) in &cases {
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages",
+            &message_request(model, false),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{model}: {body}");
+    }
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), cases.len());
+    for (request, (model, path)) in requests.iter().zip(&cases) {
+        assert_eq!(request.path_and_query, *path, "{model}");
+    }
+    assert_eq!(
+        requests[3].body["model"], "meta/llama-synthetic-5-maas",
+        "{}",
+        requests[3].body
+    );
+}
+
+#[tokio::test]
+async fn vertex_open_models_synthetic_echoed_secrets_are_redacted_in_errors() {
+    let echo = format!("saw token {SYNTHETIC_TOKEN} for synthetic.person@example.com");
+    let upstream = FakeVertex::start(vec![
+        Answer::error(
+            400,
+            json!({"object":"error","message":echo,"type":"invalid_request_error","code":null}),
+        ),
+        open_model_sse(&[json!({"error":{"message":echo}})]),
+        open_model_sse(&[
+            open_model_chunk(json!({"role":"assistant","content":"partial"}), None),
+            json!({"error":{"message":echo}}),
+        ]),
+    ])
+    .await;
+    let registry = registry(provider(&upstream, &[]));
+    let monitor = MonitorHandle::new(20);
+    let mut downstream = String::new();
+    for stream in [false, false, true] {
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), Some(monitor.clone())),
+            "/v1/messages",
+            &message_request("vertex/zai-org/glm-5.2-maas", stream),
+            &[],
+        )
+        .await;
+        if stream {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                sse_events(&body).last().map(|(name, _)| name.as_str()),
+                Some("error"),
+                "{body}"
+            );
+        } else {
+            assert_ne!(status, StatusCode::OK, "{body}");
+            assert!(error_message(&body).contains("[redacted]"), "{body}");
+        }
+        downstream.push_str(&body);
+    }
+    assert_eq!(upstream.requests().len(), 3);
+    let state = monitor.snapshot();
+    assert_eq!(state.recent.len(), 3);
+    let mut monitored = String::new();
+    for request in &state.recent {
+        assert_eq!(request.status, RequestStatus::Failed, "{request:?}");
+        monitored.push_str(request.error.as_deref().unwrap_or_default());
+        monitored.push('\n');
+    }
+    for (place, text) in [("responses", &downstream), ("monitor errors", &monitored)] {
+        for secret in [SYNTHETIC_TOKEN, "synthetic.person@example.com"] {
+            assert!(!text.contains(secret), "{place} leaked {secret}: {text}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn vertex_open_models_synthetic_count_tokens_is_answered_locally() {
+    let upstream = FakeVertex::start(Vec::new()).await;
+    let registry = registry(provider(&upstream, &[]));
+    for (model, ..) in OPEN_MODELS {
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages/count_tokens",
+            &message_request(model, false),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{model}: {body}");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert!(value["input_tokens"].as_u64().is_some(), "{body}");
+    }
+    assert!(upstream.requests().is_empty());
+}
+
 // Every family together.
 
 /// Every name the provider advertises, as Google's model pages spell them.

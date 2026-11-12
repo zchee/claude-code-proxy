@@ -1190,6 +1190,51 @@ fn models_lists_vertex_after_opencode_with_its_served_models()
     Ok(())
 }
 
+#[test]
+fn models_lists_the_managed_open_models_under_vertex_with_their_publishers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::cargo_bin("claude-code-proxy")?
+        .args(["models"])
+        .output()?;
+    let out = String::from_utf8(output.stdout)?;
+    let vertex = out
+        .lines()
+        .find(|line| line.starts_with("vertex:"))
+        .ok_or_else(|| format!("no vertex line: {out}"))?;
+    let models: Vec<&str> = vertex
+        .trim_start_matches("vertex:")
+        .split(',')
+        .map(str::trim)
+        .collect();
+    // The six models of Google's open-model catalog, each under its
+    // Model Garden publisher.
+    let open_models = [
+        "vertex/openai/gpt-oss-120b-maas",
+        "vertex/zai-org/glm-5.2-maas",
+        "vertex/google/gemma-4-26b-a4b-it-maas",
+        "vertex/meta/llama-4-maverick-17b-128e-instruct-maas",
+        "vertex/meta/llama-4-scout-17b-16e-instruct-maas",
+        "vertex/deepseek-ai/deepseek-v4.1-flash-maas",
+    ];
+    for model in open_models {
+        assert!(models.contains(&model), "missing {model}: {vertex}");
+        // Never without the prefix, and never without the publisher.
+        let bare = model.trim_start_matches("vertex/");
+        let id = bare.split_once('/').map_or(bare, |(_, id)| id);
+        assert!(!models.contains(&bare), "{bare}: {vertex}");
+        assert!(!models.contains(&id), "{id}: {vertex}");
+    }
+    assert_eq!(
+        models
+            .iter()
+            .filter(|model| model.ends_with("-maas"))
+            .count(),
+        open_models.len(),
+        "{vertex}"
+    );
+    Ok(())
+}
+
 /// The credential library picks its credential once, when it is built:
 /// without a file it settles on the metadata server. A request that could
 /// not get a token must therefore keep nothing, so that credentials created
