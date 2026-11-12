@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -6,7 +7,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 
 use crate::anthropic::schema::MessagesRequest;
-use crate::anthropic::sse::SseEvent;
+use crate::anthropic::sse::{SseEvent, encode_sse_event};
 use crate::monitor::{MonitorHandle, usage_from_anthropic_sse};
 use crate::providers::codex::translate::{
     IncompleteResponsePolicy, accumulate::accumulate_response_with_policy,
@@ -539,6 +540,98 @@ struct WiredResponsesStream {
 #[derive(Debug, Default)]
 struct StrictResponses {
     deltas: DeltasSeen,
+    /// The client has received a `message_start`.
+    message_started: bool,
+    /// The blocks the client has received a `content_block_start` for and
+    /// no `content_block_stop` yet, by index.
+    open_blocks: BTreeSet<usize>,
+}
+
+impl StrictResponses {
+    /// Notes which message and block events of `output` the client now
+    /// has. Called with every output a strict stream releases.
+    fn note_released(&mut self, output: &[u8]) {
+        let Ok(events) = SseDecoder::default().push(output) else {
+            return;
+        };
+        for event in events {
+            match event.event.as_deref() {
+                Some("message_start") => self.message_started = true,
+                Some("content_block_start") => {
+                    if let Some(index) = block_index(&event) {
+                        self.open_blocks.insert(index);
+                    }
+                }
+                Some("content_block_stop") => {
+                    if let Some(index) = block_index(&event) {
+                        self.open_blocks.remove(&index);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The events that end a strict stream with an error after the
+    /// translator's output for the last chunk, `discarded`, was withheld
+    /// from the client. The translator counts what that output started as
+    /// sent, so its closing events, `closing`, may stop a block the client
+    /// never saw start, or presuppose a `message_start` the client never
+    /// got. The result is a sequence the client can read: the
+    /// `message_start` from `discarded` when the client has none yet, the
+    /// events of `closing` except block events for blocks the client does
+    /// not have open, and a `content_block_stop` for each block the client
+    /// still has open, before the final `error` event.
+    fn error_sequence(&self, closing: &[u8], discarded: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        if !self.message_started
+            && let Ok(events) = SseDecoder::default().push(discarded)
+            && let Some(start) = events
+                .iter()
+                .find(|event| event.event.as_deref() == Some("message_start"))
+        {
+            out.extend(encode_sse_event(Some("message_start"), &start.data));
+        }
+        let Ok(events) = SseDecoder::default().push(closing) else {
+            return out;
+        };
+        let mut open = self.open_blocks.clone();
+        for event in events {
+            let name = event.event.as_deref();
+            match name {
+                Some("content_block_start" | "content_block_delta" | "content_block_stop") => {
+                    let Some(index) = block_index(&event).filter(|index| open.contains(index))
+                    else {
+                        continue;
+                    };
+                    if name == Some("content_block_stop") {
+                        open.remove(&index);
+                    }
+                }
+                Some("error") => {
+                    for index in std::mem::take(&mut open) {
+                        out.extend(encode_sse_event(
+                            Some("content_block_stop"),
+                            &serde_json::json!({"type": "content_block_stop", "index": index})
+                                .to_string(),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+            out.extend(encode_sse_event(name, &event.data));
+        }
+        out
+    }
+}
+
+/// The `index` of an Anthropic block event.
+fn block_index(event: &SseEvent) -> Option<usize> {
+    serde_json::from_str::<serde_json::Value>(&event.data)
+        .ok()?
+        .get("index")?
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok())
 }
 
 impl Drop for WiredResponsesStream {
@@ -618,8 +711,9 @@ where
             self.bytes = self.bytes.saturating_add(chunk.len() as u64);
             self.chunks = self.chunks.saturating_add(1);
             if context.is_strict() {
-                match self.strict_chunk(&chunk, context, strict) {
-                    Ok(output) if self.translator.is_finished() => {
+                let mut output = Vec::new();
+                match self.strict_chunk(&chunk, context, strict, &mut output) {
+                    Ok(()) if self.translator.is_finished() => {
                         self.terminal = true;
                         self.write_released_events(&output, context);
                         self.record_progress(&output);
@@ -627,14 +721,17 @@ where
                         self.finish_capture(true, context);
                         return Some(output);
                     }
-                    Ok(output) if output.is_empty() => continue,
-                    Ok(output) => {
+                    Ok(()) if output.is_empty() => continue,
+                    Ok(()) => {
+                        strict.note_released(&output);
                         self.write_released_events(&output, context);
                         self.record_progress(&output);
                         self.capture_downstream(&output, context);
                         return Some(output);
                     }
-                    Err((stage, kind)) => return Some(self.fail_at(stage, kind, context)),
+                    Err((stage, kind)) => {
+                        return Some(self.fail_discarding(stage, kind, context, strict, &output));
+                    }
                 }
             }
 
@@ -700,19 +797,21 @@ where
     /// [`super::chat::POST_TERMINAL_MAX_BYTES`] by position, so a tail counts
     /// the same in the completion's chunk as in later ones. When the
     /// translator closes the message by itself, the rest of the chunk is
-    /// left unread and the output ends with that closing.
+    /// left unread and the output ends with that closing. The translator's
+    /// output is added to `output`; on an error it holds what the chunk
+    /// produced before the rejected frame, which the client never gets.
     fn strict_chunk(
         &mut self,
         chunk: &[u8],
         context: &mut ReceiveContext,
         strict: &mut StrictResponses,
-    ) -> Result<Vec<u8>, (&'static str, &'static str)> {
+        output: &mut Vec<u8>,
+    ) -> Result<(), (&'static str, &'static str)> {
         let RawFrameEnds { continued, ends } = context.raw_frame_ends(chunk);
         let mut terminal = self.pending_completion.is_some();
         if terminal && context.charge_after_terminal(chunk, continued) {
             return Err(("protocol", "post_terminal_limit"));
         }
-        let mut output = Vec::new();
         let mut start = 0;
         for end in ends.into_iter().chain([chunk.len()]) {
             if end == start {
@@ -724,10 +823,10 @@ where
                 .map_err(|_| ("decoder", "malformed_sse"))?;
             start = end;
             for event in events {
-                self.strict_event(&event, context, strict, &mut output)?;
+                self.strict_event(&event, context, strict, output)?;
             }
             if self.translator.is_finished() {
-                return Ok(output);
+                return Ok(());
             }
             if !terminal && self.pending_completion.is_some() {
                 terminal = true;
@@ -737,7 +836,7 @@ where
                 }
             }
         }
-        Ok(output)
+        Ok(())
     }
 
     /// One frame of a strict stream: a `type` from neither list is an error,
@@ -884,6 +983,48 @@ where
             "api_error",
             self.traffic.as_deref(),
         );
+        self.capture_downstream(&output, context);
+        self.finish_capture(false, context);
+        output
+    }
+
+    /// [`Self::fail_at`] for a strict stream whose last chunk was rejected
+    /// after the translator had produced output for its earlier frames,
+    /// `discarded`, which the client never gets. The client receives
+    /// [`StrictResponses::error_sequence`] instead of the translator's
+    /// error events, and the downstream event files are written for those
+    /// events.
+    fn fail_discarding(
+        &mut self,
+        stage: &str,
+        kind: &str,
+        context: &ReceiveContext,
+        strict: &StrictResponses,
+        discarded: &[u8],
+    ) -> Vec<u8> {
+        let labels = context.labels();
+        self.error_sent = true;
+        if let Some(capture) = self.stream_capture.as_mut() {
+            capture.malformed(stage, kind);
+        }
+        if let Some(traffic) = self.traffic.as_ref() {
+            traffic.write_json(
+                &format!("060-{}-responses-stream-error", labels.capture_stem),
+                &serde_json::json!({
+                    "stage": stage,
+                    "kind": kind,
+                    "bytes": self.bytes,
+                    "chunks": self.chunks,
+                }),
+            );
+        }
+        let closing = self.translator.error_chunk(
+            &format!("{} Responses stream is invalid", labels.provider),
+            "api_error",
+            None,
+        );
+        let output = strict.error_sequence(&closing, discarded);
+        self.write_released_events(&output, context);
         self.capture_downstream(&output, context);
         self.finish_capture(false, context);
         output
@@ -2057,5 +2198,112 @@ mod tests {
             let sent = events_of(&text).len();
             assert_eq!(names.len(), 2 * sent, "redacted {redacted}: {names:?}");
         }
+    }
+
+    /// The name and block index of every event the client received.
+    fn synthetic_event_sequence(text: &str) -> Vec<(String, Option<u64>)> {
+        events_of(text)
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    name.unwrap_or_else(|| "message".to_string()),
+                    value.get("index").and_then(serde_json::Value::as_u64),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_discarded_output_leaves_a_well_formed_sequence_ending_in_the_error() {
+        let rejected =
+            "data: {\"type\":\"response.refusal.delta\",\"output_index\":0,\"delta\":\"no\"}\n\n";
+        let first_delta = "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Hi\"}\n\n";
+        let released = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_a\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"early\"}\n\n",
+        );
+        let second_block = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_b\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"late\"}\n\n",
+        );
+        let first_block_done = "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_a\"}}\n\n";
+        let event = |name: &str, index: Option<u64>| (name.to_string(), index);
+        let tests = [
+            (
+                "a delta and a rejected frame in the first chunk",
+                vec![format!("{first_delta}{rejected}")],
+                vec![event("message_start", None), event("error", None)],
+            ),
+            (
+                "a rejected frame alone in the first chunk",
+                vec![rejected.to_string()],
+                vec![event("message_start", None), event("error", None)],
+            ),
+            (
+                "a new block and a rejected frame after released output",
+                vec![released.to_string(), format!("{second_block}{rejected}")],
+                vec![
+                    event("message_start", None),
+                    event("content_block_start", Some(0)),
+                    event("content_block_delta", Some(0)),
+                    event("content_block_stop", Some(0)),
+                    event("error", None),
+                ],
+            ),
+            (
+                "the close of a released block and a rejected frame",
+                vec![
+                    released.to_string(),
+                    format!("{first_block_done}{rejected}"),
+                ],
+                vec![
+                    event("message_start", None),
+                    event("content_block_start", Some(0)),
+                    event("content_block_delta", Some(0)),
+                    event("content_block_stop", Some(0)),
+                    event("error", None),
+                ],
+            ),
+        ];
+        for (name, parts, expected) in tests {
+            let parts = parts.iter().map(String::as_str).collect::<Vec<_>>();
+            let text = body_text(strict_body(futures_util::stream::iter(chunks(&parts)))).await;
+            assert_eq!(synthetic_event_sequence(&text), expected, "{name}: {text}");
+            let events = events_of(&text);
+            assert_eq!(events[0].1["message"]["id"], "msg_strict", "{name}: {text}");
+            assert_eq!(
+                events[events.len() - 1].1,
+                json!({"type":"error","error":{"type":"api_error","message":INVALID}}),
+                "{name}: {text}"
+            );
+            assert!(!text.contains("late"), "{name}: {text}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_discarded_output_capture_records_the_events_the_client_received() {
+        let chunk = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Hi\"}\n\n",
+            "data: {\"type\":\"response.refusal.delta\",\"output_index\":0,\"delta\":\"no\"}\n\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("traffic");
+        let body = stream_body_with(
+            futures_util::stream::iter(chunks(&[chunk])),
+            "msg_strict".into(),
+            "synthetic-model".into(),
+            None,
+            "req".into(),
+            Some(Arc::new(crate::traffic::test_capture(root.clone()))),
+            strict_wiring(),
+        );
+        let text = body_text(body).await;
+        let (names, _) = synthetic_downstream_event_files(&root);
+        // Written when the error was sent, then the stream capture's copy.
+        assert_eq!(
+            names,
+            ["message_start", "error", "message_start", "error"],
+            "{text}"
+        );
     }
 }
