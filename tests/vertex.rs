@@ -3873,14 +3873,17 @@ async fn vertex_endpoint_synthetic_shared_and_dns_less_endpoints_fail_before_any
             unusable("no dedicatedEndpointDns"),
         ),
         (
-            "a DNS name without a scheme",
+            "a DNS name with a path",
             json!({
                 "dedicatedEndpointEnabled": true,
-                "dedicatedEndpointDns": "1234567890123456789.us-central1-987654321.prediction.vertexai.goog"
+                "dedicatedEndpointDns": "1234567890123456789.us-central1-987654321.prediction.vertexai.goog/v1"
             }),
             StatusCode::BAD_GATEWAY,
             "api_error",
-            unusable("a dedicatedEndpointDns that is not a valid URL"),
+            unusable(
+                "a dedicatedEndpointDns that must be a scheme and a host only, without a path, \
+                 query or fragment",
+            ),
         ),
         (
             "a host outside prediction.vertexai.goog",

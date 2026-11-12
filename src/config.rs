@@ -1497,7 +1497,7 @@ fn validate_vertex_endpoint(
         validate_vertex_project(project).map_err(|reason| invalid(format!("project {reason}")))?;
     }
     let host = text("host")?
-        .map(|host| validate_vertex_endpoint_host(&host))
+        .map(|host| normalize_vertex_dedicated_host(&host))
         .transpose()
         .map_err(|reason| invalid(format!("host {reason}")))?;
     let tools = match fields.get("tools") {
@@ -1536,10 +1536,18 @@ fn validate_vertex_endpoint_id(value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// A configured `host`: the dedicated endpoint URL, or its DNS name alone,
-/// which gets `https://` in front. Checked as
-/// [`validate_vertex_dedicated_url`] checks the URL the endpoint reports.
-fn validate_vertex_endpoint_host(value: &str) -> Result<String, &'static str> {
+/// A dedicated endpoint host as `scheme://host[:port]`, from a configured
+/// `host` or the `dedicatedEndpointDns` an endpoint reports. Google's
+/// sources disagree on whether that value is a full URL or a DNS name
+/// alone, so both are taken: a value with a scheme is checked as it is, and
+/// only a value without one gets `https://` in front, so a second scheme is
+/// never added. Either way the result passes
+/// [`validate_vertex_dedicated_url`].
+///
+/// # Errors
+///
+/// As for [`validate_vertex_dedicated_url`].
+pub fn normalize_vertex_dedicated_host(value: &str) -> Result<String, &'static str> {
     if value.contains("://") {
         validate_vertex_dedicated_url(value)
     } else {
@@ -1549,9 +1557,9 @@ fn validate_vertex_endpoint_host(value: &str) -> Result<String, &'static str> {
 
 /// A URL the access token may be sent to for a deployed endpoint, returned
 /// as `scheme://host[:port]`: https to a host under
-/// `.prediction.vertexai.goog`, or a loopback host over https or plain
-/// http. No user info, path, query or fragment: the request path is
-/// appended once, by the proxy.
+/// `.prediction.vertexai.goog` on the default port, or a loopback host over
+/// https or plain http on any port. No user info, path, query or fragment:
+/// the request path is appended once, by the proxy.
 ///
 /// # Errors
 ///
@@ -1584,6 +1592,10 @@ pub fn validate_vertex_dedicated_url(value: &str) -> Result<String, &'static str
         return Err(
             "must be a dedicated endpoint host, https://<endpoint-id>.<region>-<uid>.prediction.vertexai.goog, or a loopback host",
         );
+    }
+    // `port()` is `None` for the scheme's default port, 443 here.
+    if dedicated && url.port().is_some() {
+        return Err("must not name a port: a dedicated endpoint host takes the default https port");
     }
     if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
         return Err("must be a scheme and a host only, without a path, query or fragment");
@@ -3849,8 +3861,8 @@ mod tests {
             );
         }
         let refused = [
-            // A DNS name without a scheme is not a URL: nothing is put in
-            // front of what the endpoint reports.
+            // This check takes URLs only; a DNS name alone gets its scheme
+            // from `normalize_vertex_dedicated_host` first.
             (
                 "1234567890123456789.us-central1-987654321.prediction.vertexai.goog",
                 "is not a valid URL",
@@ -3871,9 +3883,77 @@ mod tests {
                 "ftp://1.us-central1-9.prediction.vertexai.goog",
                 "must use https (plain http only for a loopback host)",
             ),
+            (
+                "https://1.us-central1-9.prediction.vertexai.goog:8443",
+                "must not name a port: a dedicated endpoint host takes the default https port",
+            ),
         ];
         for (value, reason) in refused {
             assert_eq!(validate_vertex_dedicated_url(value), Err(reason), "{value}");
         }
+        // The default port is the same host.
+        assert_eq!(
+            validate_vertex_dedicated_url("https://1.us-central1-9.prediction.vertexai.goog:443")
+                .as_deref(),
+            Ok("https://1.us-central1-9.prediction.vertexai.goog")
+        );
+    }
+
+    #[test]
+    fn vertex_dedicated_host_synthetic_takes_a_url_or_a_bare_name_and_adds_one_scheme_at_most() {
+        let dedicated =
+            "https://1234567890123456789.us-central1-987654321.prediction.vertexai.goog";
+        let tests = [
+            (dedicated, Ok(dedicated)),
+            (
+                "1234567890123456789.us-central1-987654321.prediction.vertexai.goog",
+                Ok(dedicated),
+            ),
+            (
+                "1234567890123456789.us-central1-987654321.prediction.vertexai.goog/",
+                Ok(dedicated),
+            ),
+            ("127.0.0.1:18080", Ok("https://127.0.0.1:18080")),
+            ("http://127.0.0.1:18080", Ok("http://127.0.0.1:18080")),
+            (
+                "http://1234567890123456789.us-central1-987654321.prediction.vertexai.goog",
+                Err("must use https (plain http only for a loopback host)"),
+            ),
+            (
+                "ftp://1234567890123456789.us-central1-987654321.prediction.vertexai.goog",
+                Err("must use https (plain http only for a loopback host)"),
+            ),
+            (
+                "user:synthetic-pass@1234567890123456789.us-central1-987654321.prediction.vertexai.goog",
+                Err("must not contain a user name or password"),
+            ),
+            (
+                "1234567890123456789.us-central1-987654321.prediction.vertexai.goog/v1",
+                Err("must be a scheme and a host only, without a path, query or fragment"),
+            ),
+            (
+                "1234567890123456789.us-central1-987654321.prediction.vertexai.goog:8443",
+                Err("must not name a port: a dedicated endpoint host takes the default https port"),
+            ),
+            (
+                "synthetic.example",
+                Err(
+                    "must be a dedicated endpoint host, https://<endpoint-id>.<region>-<uid>.prediction.vertexai.goog, or a loopback host",
+                ),
+            ),
+        ];
+        for (value, expected) in tests {
+            let result = normalize_vertex_dedicated_host(value);
+            assert_eq!(result.as_deref(), expected.as_deref(), "{value}");
+            if let Ok(host) = result {
+                assert_eq!(host.matches("://").count(), 1, "{value}: {host}");
+            }
+        }
+        // A value that already has a scheme never gets another one.
+        let doubled = format!("https://{dedicated}");
+        assert!(
+            normalize_vertex_dedicated_host(&doubled).is_err(),
+            "{doubled}"
+        );
     }
 }

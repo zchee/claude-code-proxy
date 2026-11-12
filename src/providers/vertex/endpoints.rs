@@ -32,7 +32,7 @@ use serde_json::{Value, json};
 use crate::anthropic::schema::MessagesRequest;
 use crate::config::{
     ResolvedVertexConfig, VERTEX_ENDPOINTS_KEY, VertexEndpointConfig, VertexEndpoints,
-    validate_vertex_dedicated_url,
+    normalize_vertex_dedicated_host,
 };
 use crate::provider::{ProviderErrorKind, RequestContext};
 use crate::providers::opencode::chat::{
@@ -315,9 +315,12 @@ async fn dedicated_host(
 }
 
 /// Reads `dedicatedEndpointEnabled` and `dedicatedEndpointDns` from an
-/// `endpoints.get` answer. The DNS value is documented as a full
-/// `https://{endpoint_id}.{region}-{uid}.prediction.vertexai.goog` URL, so
-/// it is read as a URL and nothing is put in front of it.
+/// `endpoints.get` answer. The API reference describes the DNS value as a
+/// full `https://{endpoint_id}.{region}-{uid}.prediction.vertexai.goog`
+/// URL, while Google's client library puts `https://` in front of it, so
+/// both forms are taken by the rule a configured `host` follows
+/// ([`normalize_vertex_dedicated_host`]): a URL as it is, a DNS name alone
+/// with `https://`.
 ///
 /// # Errors
 ///
@@ -354,7 +357,7 @@ fn host_from_metadata(metadata: &Value, call: &EndpointCall) -> Result<reqwest::
     else {
         return Err(unusable("no dedicatedEndpointDns"));
     };
-    let origin = validate_vertex_dedicated_url(dns.trim())
+    let origin = normalize_vertex_dedicated_host(dns.trim())
         .map_err(|reason| unusable(&format!("a dedicatedEndpointDns that {reason}")))?;
     reqwest::Url::parse(&origin).map_err(|_| unusable("a dedicatedEndpointDns that is not a URL"))
 }
@@ -719,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_synthetic_dedicated_dns_is_read_as_a_url_and_never_given_a_scheme() {
+    fn metadata_synthetic_the_dedicated_flag_decides_and_a_dedicated_endpoint_needs_its_dns() {
         let config = synthetic_config(None, true);
         let host = host_from_metadata(
             &json!({
@@ -776,14 +779,6 @@ mod tests {
                 Some("returned no dedicatedEndpointDns"),
             ),
             (
-                "a DNS name without a scheme",
-                json!({"dedicatedEndpointEnabled": true,
-                       "dedicatedEndpointDns": "1234567890123456789.us-central1-987654321.prediction.vertexai.goog"}),
-                StatusCode::BAD_GATEWAY,
-                None,
-                Some("returned a dedicatedEndpointDns that is not a valid URL"),
-            ),
-            (
                 "plain http",
                 json!({"dedicatedEndpointEnabled": true,
                        "dedicatedEndpointDns": "http://1234567890123456789.us-central1-987654321.prediction.vertexai.goog"}),
@@ -823,6 +818,109 @@ mod tests {
                 assert_eq!(error.kind, ProviderErrorKind::Api, "{case}");
             }
         }
+    }
+
+    #[test]
+    fn metadata_synthetic_dns_as_a_url_or_a_bare_name_gives_one_host_and_others_are_refused() {
+        let config = synthetic_config(None, true);
+        let unusable = |reason: &str| {
+            format!(
+                "Vertex AI endpoint my-llm is a dedicated endpoint, but endpoints.get returned \
+                 {reason} (endpoint 1234567890123456789 in project synthetic-project, location \
+                 us-central1 (vertex.endpoints.my-llm in config.json)). The proxy sends the \
+                 access token only to https://<endpoint-id>.<region>-<uid>.prediction.vertexai.goog \
+                 and never to the shared host, which a dedicated endpoint does not answer on; set \
+                 \"host\" in vertex.endpoints.my-llm to the endpoint's dedicated URL"
+            )
+        };
+        let that = |reason: &str| unusable(&format!("a dedicatedEndpointDns that {reason}"));
+        let bare = "1234567890123456789.us-central1-987654321.prediction.vertexai.goog";
+        let base = "https://1234567890123456789.us-central1-987654321.prediction.vertexai.goog/";
+        let tests: [(&str, Option<String>, Result<&str, String>); 10] = [
+            ("full URL", Some(SYNTHETIC_DEDICATED.to_string()), Ok(base)),
+            ("bare DNS name", Some(bare.to_string()), Ok(base)),
+            (
+                "plain http",
+                Some(format!("http://{bare}")),
+                Err(that("must use https (plain http only for a loopback host)")),
+            ),
+            (
+                "user info",
+                Some(format!("https://user:synthetic-pass@{bare}")),
+                Err(that("must not contain a user name or password")),
+            ),
+            (
+                "a path",
+                Some(format!(
+                    "{SYNTHETIC_DEDICATED}/v1/projects/synthetic-project"
+                )),
+                Err(that(
+                    "must be a scheme and a host only, without a path, query or fragment",
+                )),
+            ),
+            (
+                "a port",
+                Some(format!("{SYNTHETIC_DEDICATED}:8443")),
+                Err(that(
+                    "must not name a port: a dedicated endpoint host takes the default https port",
+                )),
+            ),
+            (
+                "a foreign host",
+                Some("https://synthetic.example".to_string()),
+                Err(that(
+                    "must be a dedicated endpoint host, \
+                     https://<endpoint-id>.<region>-<uid>.prediction.vertexai.goog, or a \
+                     loopback host",
+                )),
+            ),
+            (
+                "a bare foreign host",
+                Some("synthetic.example".to_string()),
+                Err(that(
+                    "must be a dedicated endpoint host, \
+                     https://<endpoint-id>.<region>-<uid>.prediction.vertexai.goog, or a \
+                     loopback host",
+                )),
+            ),
+            (
+                "an empty string",
+                Some(String::new()),
+                Err(unusable("no dedicatedEndpointDns")),
+            ),
+            ("no field", None, Err(unusable("no dedicatedEndpointDns"))),
+        ];
+        for (case, dns, expected) in tests {
+            let mut metadata = json!({"dedicatedEndpointEnabled": true});
+            if let Some(dns) = dns {
+                metadata["dedicatedEndpointDns"] = json!(dns);
+            }
+            match (host_from_metadata(&metadata, &call(&config)), expected) {
+                (Ok(host), Ok(expected)) => {
+                    assert_eq!(host.as_str(), expected, "{case}");
+                    assert_eq!(host.as_str().matches("://").count(), 1, "{case}");
+                    let (_, url) = chat_url(&host, &call(&config)).unwrap();
+                    assert_eq!(
+                        url.as_str(),
+                        "https://1234567890123456789.us-central1-987654321.prediction.vertexai.goog/v1/projects/synthetic-project/locations/us-central1/endpoints/1234567890123456789/chat/completions",
+                        "{case}"
+                    );
+                }
+                (Err(error), Err(expected)) => {
+                    assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{case}");
+                    assert_eq!(error.kind, ProviderErrorKind::Api, "{case}");
+                    assert_eq!(error.message, expected, "{case}");
+                    assert!(!error.message.contains("synthetic-pass"), "{case}");
+                }
+                (got, expected) => panic!("{case}: got {got:?}, expected {expected:?}"),
+            }
+        }
+        // A value that already carries a scheme never gets a second one.
+        let doubled = json!({
+            "dedicatedEndpointEnabled": true,
+            "dedicatedEndpointDns": format!("https://{SYNTHETIC_DEDICATED}"),
+        });
+        assert!(host_from_metadata(&doubled, &call(&config)).is_err());
     }
 
     fn google_error(code: u16, status: &str, message: &str) -> UpstreamErrorDetail {
