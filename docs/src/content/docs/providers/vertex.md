@@ -47,6 +47,8 @@ The library looks for a credential in this order:
 2. `~/.config/gcloud/application_default_credentials.json` (`%APPDATA%\gcloud\application_default_credentials.json` on Windows), which `gcloud auth application-default login` writes.
 3. The metadata server, which exists only on Google Cloud (Compute Engine, GKE, Cloud Run).
 
+The credentials file is trusted input: the library sends its refresh token or key material to the token endpoint and other URLs the file names, and the proxy does not check those endpoints, so whoever can write the file decides where that material goes.
+
 The lookup does not follow `CLOUDSDK_CONFIG`. If you run gcloud with `CLOUDSDK_CONFIG` pointing at another directory, `gcloud auth application-default login` writes the credentials there, and the proxy does not find them. Point `GOOGLE_APPLICATION_CREDENTIALS` at that file instead:
 
 ```sh
@@ -126,7 +128,9 @@ Invalid Vertex setting CCP_VERTEX_LOCATION: must be a Vertex AI location such as
 
 The base URL receives the access token, so it must use `https` (plain `http` only for a loopback host) and must not contain a user name or password. It replaces `https://<host>` and keeps its own path prefix; `/v1/projects/...` is appended after it, and its query and fragment are dropped.
 
-The server reads these settings and loads the credentials on the first Vertex AI request, then keeps them until it exits. Restart the proxy after changing the environment, `config.json`, or the credentials file, including after a new `gcloud auth application-default login`. When that first attempt fails, for example because no project is set, nothing is kept, and the next request reads `config.json` again.
+The server reads these settings on the first Vertex AI request and keeps them until it exits, so restart the proxy after changing the environment or `config.json`. When the settings are invalid, for example because no project is set, nothing is kept, and the next request reads `config.json` again.
+
+Credentials are kept only once they have produced an access token. Until then, every request looks for them again, so after a 401 from a proxy that has not obtained a token yet, running `gcloud auth application-default login` or fixing the file named by `GOOGLE_APPLICATION_CREDENTIALS` takes effect on the next request. Once a token has been obtained, the proxy keeps those credentials until it exits: restart it after a new login or after changing the credentials file. Setting or changing `GOOGLE_APPLICATION_CREDENTIALS` itself always needs a restart, because the proxy reads its environment only when it starts.
 
 ## Start Claude Code
 
@@ -241,7 +245,7 @@ The proxy chooses the error type from the HTTP status of Vertex AI. When Vertex 
 
 What to check for each status:
 
-- **401**: the credential is expired or revoked. Run `gcloud auth application-default login` again, or check the key file named by `GOOGLE_APPLICATION_CREDENTIALS`, then restart the proxy, because it keeps the credentials it loaded on the first request.
+- **401**: the credential is expired or revoked. Run `gcloud auth application-default login` again, or check the key file named by `GOOGLE_APPLICATION_CREDENTIALS`, then restart the proxy, because it keeps the credentials from the first request that obtained an access token. If no request has obtained one since the proxy started, no restart is needed: the next request looks for the credentials again.
 - **403**: the account lacks `roles/aiplatform.user` on the project, the Vertex AI API is not enabled in it, or user credentials have no quota project.
 - **404**: the model ID is wrong, or the model is not offered in that location. Try `global`, or a region where the model page lists it.
 - **429**: the project's quota or Google's shared capacity for the model in that location is used up. Wait for `retry-after`, or set another location.

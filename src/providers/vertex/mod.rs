@@ -59,12 +59,15 @@ pub const MAX_BUFFERED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// `061-vertex-stream-summary`; the name says which path produced the files.
 const BUFFERED_SUMMARY_NAME: &str = "061-vertex-buffered-summary";
 
-/// What every request needs once the settings, credentials and HTTP client
-/// exist.
+/// What every request needs once the settings and HTTP client exist.
 struct Ready {
     config: ResolvedVertexConfig,
-    credentials: VertexCredentials,
     client: VertexClient,
+    /// Set by the first request that obtains an access token with them, and
+    /// kept from then on. Until then each request looks for Application
+    /// Default Credentials again, so a login or key file supplied after a
+    /// failed request is found without a restart.
+    credentials: OnceLock<VertexCredentials>,
 }
 
 /// One request that Vertex AI accepted: the response body is still unread.
@@ -82,10 +85,10 @@ pub struct VertexProvider {
 
 impl VertexProvider {
     /// The server's provider. Settings, credentials and the HTTP client are
-    /// created on the first request rather than here: building the client
-    /// loads the system root certificates, loading credentials reads files
-    /// and needs the async runtime, and every CLI command and server start
-    /// constructs every provider.
+    /// created on first use rather than here: building the client loads the
+    /// system root certificates, loading credentials reads files and needs
+    /// the async runtime, and every CLI command and server start constructs
+    /// every provider.
     pub fn new() -> Self {
         Self {
             ready: OnceLock::new(),
@@ -102,23 +105,22 @@ impl VertexProvider {
         Self {
             ready: OnceLock::from(Arc::new(Ready {
                 config,
-                credentials,
                 client,
+                credentials: OnceLock::from(credentials),
             })),
         }
     }
 
-    /// The shared request state, built on first use. A failure is returned
-    /// and not kept, so the next request tries again.
+    /// The settings and HTTP client, built on first use. A failure is
+    /// returned and not kept, so the next request tries again.
     fn ready(&self) -> Result<&Arc<Ready>, ProviderError> {
         if let Some(ready) = self.ready.get() {
             return Ok(ready);
         }
         let config = crate::config::vertex_config();
-        // Checked first so a missing project is reported by its setting
-        // names before any credential file is read.
+        // Checked before any credential lookup, so a missing project is
+        // reported by its setting names.
         VertexTarget::from_config(&config).map_err(VertexError::into_provider_error)?;
-        let credentials = VertexCredentials::adc().map_err(VertexAuthError::into_provider_error)?;
         let client = VertexClient::new().map_err(|error| {
             ProviderError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -128,11 +130,32 @@ impl VertexProvider {
         })?;
         let built = Arc::new(Ready {
             config,
-            credentials,
             client,
+            credentials: OnceLock::new(),
         });
         // Concurrent first requests may each build one; all use the first.
         Ok(self.ready.get_or_init(|| built))
+    }
+
+    /// The credentials for a request. Without credentials that have already
+    /// produced a token, Application Default Credentials are resolved and a
+    /// token is fetched; only when that succeeds are they kept. The crate
+    /// resolves ADC once, when the credentials are built (no file means the
+    /// metadata server, for good), so keeping a selection that never
+    /// produced a token would keep failing until the proxy restarts. The
+    /// crate caches the token, so the request's own header fetch that
+    /// follows does not ask again.
+    async fn credentials(ready: &Ready) -> Result<&VertexCredentials, ProviderError> {
+        if let Some(credentials) = ready.credentials.get() {
+            return Ok(credentials);
+        }
+        let loaded = VertexCredentials::adc().map_err(VertexAuthError::into_provider_error)?;
+        loaded
+            .headers()
+            .await
+            .map_err(VertexAuthError::into_provider_error)?;
+        // Concurrent first requests may each load one; all use the first.
+        Ok(ready.credentials.get_or_init(|| loaded))
     }
 
     /// Resolves the model, translates the request and sends it. The
@@ -153,13 +176,14 @@ impl VertexProvider {
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
+        let credentials = Self::credentials(ready).await?;
         let upstream = ready
             .client
             .stream_generate_content(
                 &ready.config,
                 &model.id,
                 &translated,
-                &ready.credentials,
+                credentials,
                 ctx.traffic.as_deref(),
             )
             .await

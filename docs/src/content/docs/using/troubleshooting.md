@@ -44,8 +44,11 @@ file and type, the project, location and endpoint with the setting each came
 from, the quota project, and whether an access token was obtained. An HTTP 401
 that starts with `Google credentials are not available` or `Google access token
 could not be obtained` means Application Default Credentials found nothing
-usable: run `gcloud auth application-default login`, or set
-`GOOGLE_APPLICATION_CREDENTIALS` to a key file, then restart the proxy. When gcloud runs with
+usable: run `gcloud auth application-default login` and retry, or set
+`GOOGLE_APPLICATION_CREDENTIALS` to a key file and restart the proxy so it sees
+the variable. Until a request has obtained an access token, every request looks
+for the credentials again; after that, the proxy keeps them until it exits, so a
+later login needs a restart. When gcloud runs with
 `CLOUDSDK_CONFIG`, point `GOOGLE_APPLICATION_CREDENTIALS` at
 `$CLOUDSDK_CONFIG/application_default_credentials.json`, because the lookup does
 not follow that variable. An HTTP 500 with `Invalid Vertex configuration` names
@@ -55,7 +58,7 @@ the missing or invalid setting, usually the project.
 
 Each message ends with `(upstream HTTP <status>)` and names what to check:
 
-- **401**: Google rejected the access token. Run `gcloud auth application-default login` again, or check the key file named by `GOOGLE_APPLICATION_CREDENTIALS`, then restart the proxy: it keeps the credentials it loaded on the first Vertex AI request.
+- **401**: Google rejected the access token. Run `gcloud auth application-default login` again, or check the key file named by `GOOGLE_APPLICATION_CREDENTIALS`, then restart the proxy: it keeps the credentials from the first Vertex AI request that obtained an access token.
 - **403**: the account needs `roles/aiplatform.user` on the project, the Vertex AI API (`aiplatform.googleapis.com`) must be enabled there, and user credentials may need a quota project. Set one with `gcloud auth application-default set-quota-project PROJECT_ID`.
 - **404**: the model is not available in that project and location. Check the model ID, then try `global` or a region where the model is offered, through `CCP_VERTEX_LOCATION`, `GOOGLE_CLOUD_LOCATION`, or `vertex.location`.
 - **429**: the project's quota or Google's shared capacity for the model in that location is used up. The response carries `retry-after` when Google sends a delay.

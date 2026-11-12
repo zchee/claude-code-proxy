@@ -181,7 +181,7 @@ The three URL settings must use `https` (plain `http` only for a loopback host) 
 
 The precedence is `CCP_VERTEX_*`, then `GOOGLE_CLOUD_PROJECT` or `GOOGLE_CLOUD_LOCATION`, then `config.json`. An empty or blank value counts as not set. A project may contain letters, digits, `.`, `_`, `:`, and `-`, starting with a letter or digit; a location may contain lowercase letters, digits, and `-`. The base URL receives the Google access token, so it must use `https` (plain `http` only for a loopback host) and must not contain a user name or password. A non-empty invalid value is an error that names the setting, not a fallback to the default. The startup summary lists a project or location taken from the Google variables as `vertex.project (Google env)` or `vertex.location (Google env)`.
 
-The server reads these settings on the first Vertex AI request and keeps them until it exits, so restart the proxy after changing them. A first attempt that fails keeps nothing, and the next request reads `config.json` again.
+The server reads these settings on the first Vertex AI request and keeps them until it exits, so restart the proxy after changing them. When they are invalid, for example because no project is set, nothing is kept, and the next request reads `config.json` again. A request that fails only because no access token could be obtained keeps the settings and leaves the credentials to be looked up again; see [Vertex AI](/providers/vertex/#project-and-location).
 
 Credentials are not configured here. The Google library reads `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_QUOTA_PROJECT` itself; see [Vertex AI](/providers/vertex/#credentials).
 

@@ -916,20 +916,58 @@ fn vertex_fixture(answers: Vec<(u16, &'static str, String)>) -> VertexFixture {
     }
 }
 
-/// A user credential file in gcloud's format whose token endpoint is the
+/// A user credential in gcloud's format whose token endpoint is the
 /// fixture, so the credential library refreshes against loopback.
-fn write_vertex_credentials(home: &TempDir, fixture: &VertexFixture) -> std::path::PathBuf {
-    let path = home.path().join("synthetic-adc.json");
-    let value = serde_json::json!({
+fn vertex_user_credentials(fixture: &VertexFixture) -> String {
+    serde_json::json!({
         "type": "authorized_user",
         "client_id": "synthetic-client-id.apps.googleusercontent.com",
         "client_secret": VERTEX_CLIENT_SECRET,
         "refresh_token": VERTEX_REFRESH_TOKEN,
         "token_uri": format!("{}/token", fixture.base),
         "universe_domain": "googleapis.com"
-    });
-    std::fs::write(&path, value.to_string()).unwrap();
+    })
+    .to_string()
+}
+
+/// [`vertex_user_credentials`] in a file of its own inside `home`.
+fn write_vertex_credentials(home: &TempDir, fixture: &VertexFixture) -> std::path::PathBuf {
+    let path = home.path().join("synthetic-adc.json");
+    std::fs::write(&path, vertex_user_credentials(fixture)).unwrap();
     path
+}
+
+/// `claude-code-proxy serve` on `port` with the Vertex settings isolated in
+/// `home`, the project set and Vertex AI pointed at `fixture`. `extra_env`
+/// adds variables, such as `GOOGLE_APPLICATION_CREDENTIALS`.
+#[cfg(unix)]
+fn vertex_server(
+    home: &TempDir,
+    fixture: &VertexFixture,
+    port: u16,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> Result<ChildGuard, Box<dyn std::error::Error>> {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"));
+    command.args(["serve", "--no-monitor", "--port", &port.to_string()]);
+    for name in VERTEX_REAL_ENV {
+        command.env_remove(name);
+    }
+    for (name, value) in vertex_isolated_env(home.path()) {
+        command.env(name, value);
+    }
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    let child = command
+        .env("CCP_VERTEX_PROJECT", "synthetic-project")
+        .env("CCP_VERTEX_BASE_URL", &fixture.base)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut child = ChildGuard(child);
+    drop(wait_for_service(&mut child, port)?);
+    Ok(child)
 }
 
 #[test]
@@ -1121,6 +1159,78 @@ fn models_lists_vertex_after_opencode_with_its_eighteen_models()
             "missing {prefixed}: {vertex}"
         );
     }
+    Ok(())
+}
+
+/// The credential library picks its credential once, when it is built:
+/// without a file it settles on the metadata server. A request that could
+/// not get a token must therefore keep nothing, so that credentials created
+/// afterwards (here `gcloud auth application-default login`'s default file)
+/// are used by the next request without restarting the proxy.
+#[cfg(unix)]
+#[test]
+fn vertex_server_synthetic_credentials_created_after_a_failed_request_are_used_without_a_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::atomic::Ordering;
+    let text = serde_json::json!({
+        "candidates": [{"content": {"role": "model", "parts": [{"text": "Hello from Vertex"}]}}]
+    });
+    let finish = serde_json::json!({
+        "candidates": [{"content": {"role": "model", "parts": []}, "finishReason": "STOP"}]
+    });
+    let answer = format!("data: {text}\n\ndata: {finish}\n\n");
+    let fixture = vertex_fixture(vec![
+        (200, "text/event-stream", answer.clone()),
+        (200, "text/event-stream", answer),
+    ]);
+    let home = TempDir::new()?;
+    let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    // No GOOGLE_APPLICATION_CREDENTIALS and no default file: the library
+    // falls back to the metadata server, which is a closed loopback port.
+    let _child = vertex_server(&home, &fixture, port, &[])?;
+    let body = serde_json::json!({
+        "model": "gemini-3.5-flash",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hello"}]
+    })
+    .to_string();
+
+    let first = post_raw(port, &body)?;
+    assert!(first.starts_with("HTTP/1.1 401"), "{first}");
+    assert!(first.contains("authentication_error"), "{first}");
+    assert!(
+        first.contains("Google access token could not be obtained"),
+        "{first}"
+    );
+    assert!(
+        first.contains("gcloud auth application-default login"),
+        "{first}"
+    );
+    assert_eq!(fixture.token_requests.load(Ordering::SeqCst), 0);
+
+    let default_file = home
+        .path()
+        .join(".config")
+        .join("gcloud")
+        .join("application_default_credentials.json");
+    std::fs::create_dir_all(default_file.parent().unwrap())?;
+    std::fs::write(&default_file, vertex_user_credentials(&fixture))?;
+
+    let second = post_raw(port, &body)?;
+    assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+    assert!(second.contains("Hello from Vertex"), "{second}");
+    let fetched = fixture.token_requests.load(Ordering::SeqCst);
+    assert!(fetched >= 1, "no token was fetched from the new file");
+
+    // From now on the credentials are kept: the next request uses the
+    // cached token instead of loading them again.
+    let third = post_raw(port, &body)?;
+    assert!(third.starts_with("HTTP/1.1 200"), "{third}");
+    assert_eq!(
+        fixture.token_requests.load(Ordering::SeqCst),
+        fetched,
+        "the credentials were loaded again"
+    );
     Ok(())
 }
 
