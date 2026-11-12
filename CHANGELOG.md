@@ -11,6 +11,14 @@ description: Release notes for claude-code-proxy.
   that carries over between turns. Logins do not refresh, and the API key is
   shared with the Muse CLI; the proxy's logout leaves both untouched. See the
   [Muse provider page](https://claude-code-proxy.raine.dev/providers/muse/).
+- Google Cloud users can run Gemini models on Vertex AI, such as
+  `gemini-4-argon` and `gemini-3.5-flash`, or any Gemini model as
+  `vertex/<model-id>`, with tools, image input, thinking levels, and thought
+  signatures that carry over between turns. The proxy uses Google Application
+  Default Credentials and stores none of its own; set the project with
+  `CCP_VERTEX_PROJECT` or `GOOGLE_CLOUD_PROJECT`, and check the setup with
+  `claude-code-proxy vertex auth status`. Requests are billed to that project.
+  See the [Vertex AI provider page](https://claude-code-proxy.raine.dev/providers/vertex/).
 
 ## v0.1.48 (2026-11-01)
 

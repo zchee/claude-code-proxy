@@ -49,6 +49,7 @@ export default defineConfig({
             { label: 'Grok', slug: 'providers/grok' },
             { label: 'Muse', slug: 'providers/muse' },
             { label: 'OpenCode Go', slug: 'providers/opencode-go' },
+            { label: 'Vertex AI', slug: 'providers/vertex' },
             { label: 'Cursor Agent', slug: 'providers/cursor-agent' },
           ],
         },

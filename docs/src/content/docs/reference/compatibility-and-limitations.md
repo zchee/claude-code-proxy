@@ -11,13 +11,14 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 - OpenAI has publicly welcomed using Codex through other coding harnesses, but public statements do not guarantee future policy or account treatment.
 - Kimi, Grok, Muse, and Cursor use unofficial client integrations. Review the terms and account risk for your use.
 - Upstream rate limits are shared with other clients on the same account.
+- Vertex AI has no subscription: requests are billed at pay-as-you-go rates to the configured Google Cloud project, and that project's quotas in the chosen location apply.
 
 ## Listener security
 
 - Incoming clients are not authenticated.
 - The default bind address is `127.0.0.1`.
 - A non-loopback listener requires an external firewall or authenticating reverse proxy.
-- The proxy stores subscription credentials and can consume account quota, so an exposed listener is equivalent to exposing that capability.
+- The proxy stores subscription credentials and can consume account quota, so an exposed listener is equivalent to exposing that capability. With Vertex AI it uses your Google credentials and spends money on your Google Cloud project.
 
 ## Anthropic API scope
 
@@ -31,7 +32,7 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 
 ## OpenAI API scope
 
-- `CCP_CODEX_RESPONSES_API=1` enables `/v1/chat/completions` and `/v1/responses` for Codex, Kimi, Grok, Muse, OpenCode Go, and Cursor models.
+- `CCP_CODEX_RESPONSES_API=1` enables `/v1/chat/completions` and `/v1/responses` for Codex, Kimi, Grok, Muse, OpenCode Go, Vertex AI, and Cursor models.
 - Codex Responses requests use native passthrough. Requests for the other providers support their mapped subsets of text, reasoning, function tools, tool results, token limits, usage, streaming, aliases, and `[1m]` model hints; exact support depends on the selected provider and model.
 - Unsupported non-null request fields return an error instead of being ignored.
 - Grok search calls appear as Responses `web_search_call` items. Chat Completions returns the citations without a separate search item.
@@ -82,6 +83,15 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 - Anthropic server tools are rejected. Images are not resized or filtered, and very small images can be misread.
 - Subscription usage is not shown in the monitor.
 
+## Vertex AI
+
+- Only Gemini models are supported. Claude, partner and open models, and deployed endpoints on Vertex AI are not; `vertex/<publisher>/<model-id>` for any publisher other than `google` is rejected.
+- The proxy stores no Google credentials and has no login of its own. Application Default Credentials do not follow `CLOUDSDK_CONFIG`.
+- The provider was built from Google's API reference without observing live traffic. The [provider page](/providers/vertex/#implemented-from-documentation-only) lists the assumptions and the symptom of each.
+- Thought signatures travel in Claude Code thinking blocks. When one is missing, the proxy sends Google's `skip_thought_signature_validator` placeholder, which Google says can lower answer quality.
+- Tool schemas are sent unchanged; a schema Gemini rejects fails the request with HTTP 400. Anthropic server tools, Gemini's built-in tools, structured output, document blocks, and image URLs are not supported.
+- Requests are not retried and there is no model fallback.
+
 ## Cursor Agent
 
 - An installed Cursor Agent JavaScript bundle supplies protobuf classes.
@@ -97,6 +107,7 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 - Error captures contain complete redacted failed responses.
 - Traffic captures intentionally preserve prompts and tool content for message/Responses diagnostics. Image payloads, encrypted reasoning, and the proxy's reasoning signatures are replaced with length markers.
 - Muse traffic captures also replace the request's login token and API key wherever they appear, and scrub Muse error text, `code`, and `param` before writing them.
+- Vertex AI traffic captures show the `authorization` header as `[redacted]` and keep the quota project in `x-goog-user-project`. Gemini `thoughtSignature` values and inline image data are replaced with length markers. The upstream response is recorded as decoded events with Google's error and finish messages cleaned, including in `032-upstream-response-body.sse`, never as the raw bytes.
 - Image generation and edit routes never create traffic captures or persist prompts, uploads, data URLs, generated base64, or upstream error bodies.
 - Verbose logging and traffic capture should be scoped to a focused local investigation.
 

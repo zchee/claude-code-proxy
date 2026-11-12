@@ -14,10 +14,13 @@ The model ID in each request selects its provider. One proxy listener can serve 
 | `grok-composer-2.5-fast`, `grok-4.5`, `grok-4.6`, `grok-4.7`, `grok-4.7-build-fast`, `grok-4.7-fast` | Grok |
 | `muse-spark-1.3`, `muse-spark-1.2`, `muse-wonder-1.0`, `muse-wonder-full-1.0`, `muse-ember-1.0` | Muse |
 | Non-conflicting registered OpenCode Go IDs and every `opencode-go/<model-id>` | OpenCode Go |
+| `gemini-4-argon`, `gemini-4-carbon`, `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, and every `vertex/<model-id>` | Vertex AI |
 | `cursor`, Cursor legacy aliases, `cursor:<id>`, `cursor-plan:<id>`, `cursor-ask:<id>` | Cursor Agent |
 | Anthropic-style aliases such as `haiku`, `sonnet`, `opus`, `fable`, and registered `claude-*` aliases | The `aliasProvider`, Codex by default |
 
 `muse-spark-1.3-contributor` and `muse-spark-1.2-contributor` are OpenCode Go models and route to OpenCode Go, not to Muse.
+
+`vertex/<model-id>` also reaches Gemini models that are not registered, and `vertex/google/<model-id>` is accepted as the same thing. A bare ID that is not registered, such as a new `gemini-*` model, is not routed to Vertex AI; use the `vertex/` form. Other `vertex/<publisher>/<model-id>` names return HTTP 400; Claude and partner models on Vertex AI are not supported.
 
 An unknown ID returns HTTP 400 with the supported provider catalog. There is no implicit fallback for arbitrary model names.
 

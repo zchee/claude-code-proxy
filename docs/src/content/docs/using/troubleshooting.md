@@ -22,10 +22,11 @@ claude-code-proxy codex auth status
 claude-code-proxy kimi auth status
 claude-code-proxy grok auth status
 claude-code-proxy muse auth status
+claude-code-proxy vertex auth status
 claude-code-proxy cursor auth status
 ```
 
-Use that provider's login command when credentials are missing or expired. Codex requires ChatGPT subscription auth, not an OpenAI API key. Each provider uses proxy-owned credentials.
+Use that provider's login command when credentials are missing or expired. Codex requires ChatGPT subscription auth, not an OpenAI API key. Each provider uses proxy-owned credentials, except Vertex AI, which uses Google Application Default Credentials.
 Muse logins do not refresh. When requests fail with `Muse login is no longer valid` or
 `Muse rejected the API key`, run `claude-code-proxy muse auth login` again; a
 running proxy picks up the new login without a restart. `muse auth status`
@@ -38,6 +39,28 @@ the message names the cause.
 OpenCode Go has no `auth status` command; configure its API key through
 `CCP_OPENCODE_API_KEY`, `OPENCODE_API_KEY`, or `opencode.apiKey` in
 `config.json`.
+Vertex AI has no login in the proxy. `vertex auth status` shows the credential
+file and type, the project, location and endpoint with the setting each came
+from, the quota project, and whether an access token was obtained. An HTTP 401
+that starts with `Google credentials are not available` or `Google access token
+could not be obtained` means Application Default Credentials found nothing
+usable: run `gcloud auth application-default login`, or set
+`GOOGLE_APPLICATION_CREDENTIALS` to a key file, then restart the proxy. When gcloud runs with
+`CLOUDSDK_CONFIG`, point `GOOGLE_APPLICATION_CREDENTIALS` at
+`$CLOUDSDK_CONFIG/application_default_credentials.json`, because the lookup does
+not follow that variable. An HTTP 500 with `Invalid Vertex configuration` names
+the missing or invalid setting, usually the project.
+
+## Vertex AI returns 401, 403, 404, or 429
+
+Each message ends with `(upstream HTTP <status>)` and names what to check:
+
+- **401**: Google rejected the access token. Run `gcloud auth application-default login` again, or check the key file named by `GOOGLE_APPLICATION_CREDENTIALS`, then restart the proxy: it keeps the credentials it loaded on the first Vertex AI request.
+- **403**: the account needs `roles/aiplatform.user` on the project, the Vertex AI API (`aiplatform.googleapis.com`) must be enabled there, and user credentials may need a quota project. Set one with `gcloud auth application-default set-quota-project PROJECT_ID`.
+- **404**: the model is not available in that project and location. Check the model ID, then try `global` or a region where the model is offered, through `CCP_VERTEX_LOCATION`, `GOOGLE_CLOUD_LOCATION`, or `vertex.location`.
+- **429**: the project's quota or Google's shared capacity for the model in that location is used up. The response carries `retry-after` when Google sends a delay.
+
+See [Vertex AI errors](/providers/vertex/#errors) for the full table.
 
 ## Model returns HTTP 400
 
@@ -96,7 +119,7 @@ CCP_CURSOR_AGENT_BUNDLE=/path/to/cursor-agent/index.js \
 
 ## Rate limited
 
-Upstream limits are shared with other clients on the same account. Codex limit responses and Kimi HTTP 429 responses surface as HTTP 429 with `retry-after`. Muse HTTP 429 responses carry `retry-after` when Muse sends one as whole seconds, or when the latest usage report shows a full window, in which case it is the time until that window resets; either value is capped at 86400 seconds. Wait for the indicated interval or reduce concurrent traffic.
+Upstream limits are shared with other clients on the same account. Codex limit responses and Kimi HTTP 429 responses surface as HTTP 429 with `retry-after`. Muse HTTP 429 responses carry `retry-after` when Muse sends one as whole seconds, or when the latest usage report shows a full window, in which case it is the time until that window resets; either value is capped at 86400 seconds. Vertex AI HTTP 429 responses carry `retry-after` from Google's `RetryInfo` or a whole-second `Retry-After` header, capped at 86400 seconds. Wait for the indicated interval or reduce concurrent traffic.
 
 ## Find the complete error
 

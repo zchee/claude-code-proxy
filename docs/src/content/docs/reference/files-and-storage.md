@@ -39,7 +39,14 @@ OpenCode Go is the exception: it reads its API key from
 `CCP_OPENCODE_API_KEY`, `OPENCODE_API_KEY`, or `opencode.apiKey` in
 `config.json` and does not create a provider auth store.
 
-The proxy owns these credentials independently of native Codex, Grok, and Cursor Agent stores.
+Vertex AI does not store credentials either. The Google library reads Application
+Default Credentials from `GOOGLE_APPLICATION_CREDENTIALS`, from
+`~/.config/gcloud/application_default_credentials.json`
+(`%APPDATA%\gcloud\application_default_credentials.json` on Windows), or from
+the metadata server, and keeps the access token in memory only. It does not
+follow `CLOUDSDK_CONFIG`.
+
+The proxy owns these credentials independently of native Codex, Grok, and Cursor Agent stores. Vertex AI is the exception: its credential belongs to gcloud, a key file, or the metadata server, not to the proxy.
 
 ## Kimi device ID
 

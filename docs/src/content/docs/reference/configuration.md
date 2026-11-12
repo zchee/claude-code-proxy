@@ -51,6 +51,10 @@ These settings configure the proxy process. Claude Code client settings such as 
     "apiKey": "YOUR_OPENCODE_GO_API_KEY",
     "baseUrl": "https://opencode.ai/zen/go/v1"
   },
+  "vertex": {
+    "project": "YOUR_GOOGLE_CLOUD_PROJECT_ID",
+    "location": "global"
+  },
   "cursor": {
     "baseUrl": "https://api2.cursor.sh",
     "clientVersion": "0.48.5",
@@ -164,6 +168,22 @@ The three URL settings must use `https` (plain `http` only for a loopback host) 
 | `CCP_OPENCODE_API_KEY` | `opencode.apiKey` | unset | OpenCode Go API key; takes precedence over `OPENCODE_API_KEY` and config. |
 | `OPENCODE_API_KEY` | `opencode.apiKey` | unset | Fallback API-key variable accepted by the proxy when the CCP-specific variable is unset. |
 | `CCP_OPENCODE_BASE_URL` | `opencode.baseUrl` | `https://opencode.ai/zen/go/v1` | Changes the OpenCode Go API base URL. |
+
+## Vertex AI
+
+| Environment | Config key | Default | Purpose |
+| --- | --- | --- | --- |
+| `CCP_VERTEX_PROJECT` | `vertex.project` | unset | Google Cloud project that requests go to and are billed to. Required; there is no default. Takes precedence over `GOOGLE_CLOUD_PROJECT` and config. |
+| `GOOGLE_CLOUD_PROJECT` | `vertex.project` | unset | Standard Google Cloud project variable, used when `CCP_VERTEX_PROJECT` is unset. |
+| `CCP_VERTEX_LOCATION` | `vertex.location` | `global` | Vertex AI location, such as `global`, `us`, `eu`, or `us-central1`. Takes precedence over `GOOGLE_CLOUD_LOCATION` and config. |
+| `GOOGLE_CLOUD_LOCATION` | `vertex.location` | `global` | Standard Google Cloud location variable, used when `CCP_VERTEX_LOCATION` is unset. |
+| `CCP_VERTEX_BASE_URL` | `vertex.baseUrl` | Derived from the location | Replaces `https://<host>`, for a relay or a local test server. Its path prefix is kept and `/v1/projects/...` is appended. |
+
+The precedence is `CCP_VERTEX_*`, then `GOOGLE_CLOUD_PROJECT` or `GOOGLE_CLOUD_LOCATION`, then `config.json`. An empty or blank value counts as not set. A project may contain letters, digits, `.`, `_`, `:`, and `-`, starting with a letter or digit; a location may contain lowercase letters, digits, and `-`. The base URL receives the Google access token, so it must use `https` (plain `http` only for a loopback host) and must not contain a user name or password. A non-empty invalid value is an error that names the setting, not a fallback to the default. The startup summary lists a project or location taken from the Google variables as `vertex.project (Google env)` or `vertex.location (Google env)`.
+
+The server reads these settings on the first Vertex AI request and keeps them until it exits, so restart the proxy after changing them. A first attempt that fails keeps nothing, and the next request reads `config.json` again.
+
+Credentials are not configured here. The Google library reads `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_QUOTA_PROJECT` itself; see [Vertex AI](/providers/vertex/#credentials).
 
 ## Cursor Agent
 

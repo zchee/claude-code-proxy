@@ -1,7 +1,7 @@
 # claude-code-proxy
 
 Claude Code, powered by **OpenAI Codex**, **Kimi**, **Grok**, **Muse**,
-**OpenCode Go**, or **Cursor Agent**.
+**OpenCode Go**, **Vertex AI**, or **Cursor Agent**.
 
 Docs: <https://claude-code-proxy.raine.dev>
 
@@ -101,6 +101,7 @@ The opt-in Images API returns base64 image data and consumes the signed-in accou
 | Grok         | grok.com                       | Registered Grok models                          |
 | Muse         | Meta account with Muse Code    | Registered `muse-*` models                      |
 | OpenCode Go  | OpenCode Go subscription       | Non-conflicting IDs and `opencode-go/<model-id>` |
+| Vertex AI    | Google Cloud project           | Registered `gemini-*` models, `vertex/<model-id>` |
 | Cursor Agent | Cursor account                 | Cursor aliases and `cursor:<model-id>` prefixes |
 
 Run `claude-code-proxy models` for the current catalog or
