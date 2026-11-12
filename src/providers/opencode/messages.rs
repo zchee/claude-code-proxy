@@ -1083,4 +1083,39 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_fails_a_frame_that_never_ends_at_the_frame_limit() {
+        let head = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n";
+        let opening = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"";
+        let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&pulled);
+        // A frame that never ends: its opening, then 64 KiB items of text
+        // without a line break, for as long as they are read.
+        let upstream = futures_util::stream::iter(chunks(&[head, opening]))
+            .chain(futures_util::stream::repeat_with(|| {
+                Ok(Bytes::from(vec![b'a'; 64 * 1024]))
+            }))
+            .inspect(move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        let mut body = strict_body(upstream).into_data_stream();
+
+        let first = body.next().await.unwrap().unwrap();
+        assert_eq!(first, head.as_bytes());
+        // The complete frame went out before anything after it was read.
+        assert_eq!(pulled.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let error = body.next().await.unwrap().unwrap();
+        let events = SseDecoder::default().push(&error).unwrap();
+        assert_eq!(events.len(), 1, "{error:?}");
+        assert_eq!(events[0].event.as_deref(), Some("error"));
+        let value: serde_json::Value = serde_json::from_str(&events[0].data).unwrap();
+        assert_eq!(value["error"]["message"], INVALID);
+        assert!(body.next().await.is_none());
+        // The head, the opening and sixteen 64 KiB items: the frame passed
+        // the 1 MiB frame limit in the last of them, and nothing more was
+        // read.
+        assert_eq!(pulled.load(std::sync::atomic::Ordering::SeqCst), 18);
+    }
 }
