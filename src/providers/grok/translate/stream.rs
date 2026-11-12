@@ -5,14 +5,31 @@ use crate::config::GrokSearchBlocks;
 
 pub const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 
-#[derive(Default)]
 pub struct SseDecoder {
     frame: Vec<u8>,
     line_start: usize,
     skip_lf: bool,
+    max_frame_bytes: usize,
+}
+
+impl Default for SseDecoder {
+    fn default() -> Self {
+        Self::with_max_frame_bytes(MAX_SSE_FRAME_BYTES)
+    }
 }
 
 impl SseDecoder {
+    /// A decoder that rejects any frame larger than `max_frame_bytes`.
+    /// [`Default`] uses [`MAX_SSE_FRAME_BYTES`].
+    pub fn with_max_frame_bytes(max_frame_bytes: usize) -> Self {
+        Self {
+            frame: Vec::new(),
+            line_start: 0,
+            skip_lf: false,
+            max_frame_bytes,
+        }
+    }
+
     pub fn push(&mut self, input: &[u8]) -> anyhow::Result<Vec<SseEvent>> {
         let mut events = Vec::new();
         for &byte in input {
@@ -43,7 +60,7 @@ impl SseDecoder {
     }
 
     fn push_byte(&mut self, byte: u8) -> anyhow::Result<()> {
-        if self.frame.len() >= MAX_SSE_FRAME_BYTES {
+        if self.frame.len() >= self.max_frame_bytes {
             anyhow::bail!("Grok SSE frame exceeds the size limit");
         }
         self.frame.push(byte);
@@ -458,6 +475,28 @@ mod tests {
         assert!(decoder.push(b"data: ").is_ok());
         assert!(decoder.push(&vec![b'x'; exact.len() + 1]).is_ok());
         assert!(decoder.push(b"\n").is_err());
+    }
+
+    #[test]
+    fn decoder_with_a_custom_limit_bounds_frames_at_that_limit() {
+        let limit = MAX_SSE_FRAME_BYTES * 2;
+        let exact = vec![b'x'; limit - b"data: \n".len()];
+        let mut decoder = SseDecoder::with_max_frame_bytes(limit);
+        decoder.push(b"data: ").unwrap();
+        decoder.push(&exact).unwrap();
+        let events = decoder.push(b"\n\n").unwrap();
+        assert_eq!(events[0].data.len(), exact.len());
+        decoder.finish().unwrap();
+
+        let mut decoder = SseDecoder::with_max_frame_bytes(limit);
+        decoder.push(b"data: ").unwrap();
+        decoder.push(&vec![b'x'; exact.len() + 1]).unwrap();
+        assert!(decoder.push(b"\n").is_err());
+
+        // The default limit is unchanged.
+        let mut decoder = SseDecoder::default();
+        decoder.push(b"data: ").unwrap();
+        assert!(decoder.push(&exact).is_err());
     }
 
     #[test]

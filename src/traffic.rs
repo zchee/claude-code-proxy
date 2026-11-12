@@ -10,6 +10,7 @@ use crate::paths;
 use crate::providers::codex::translate::reasoning_signature::is_proxy_reasoning_signature;
 use crate::providers::muse::sanitize::{redact_secrets, sanitize_error_value};
 use crate::providers::muse::translate::reasoning_signature::is_muse_reasoning_signature;
+use crate::providers::vertex::translate::thought_signature::is_vertex_thought_signature;
 
 #[derive(Debug)]
 pub struct TrafficCapture {
@@ -372,6 +373,14 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
                     // Anthropic image blocks carry raw base64 under
                     // `source.data`; redact it for the same reason.
                     out.insert(key.clone(), redact_traffic_value(value));
+                } else if normalized == "data" && looks_like_inline_data(map) {
+                    // Gemini `inlineData` parts carry raw base64 media beside
+                    // `mimeType`.
+                    out.insert(key.clone(), redact_traffic_value(value));
+                } else if normalized == "thoughtsignature" || normalized == "thought_signature" {
+                    // Gemini thought signatures are opaque model state replayed
+                    // with function calls; only their size is kept.
+                    out.insert(key.clone(), redact_traffic_value(value));
                 } else if normalized == "encrypted_content" {
                     // Codex `compaction` and `reasoning` items carry an opaque
                     // blob that replays a whole conversation's context; it is
@@ -381,15 +390,17 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
                     && value.as_str().is_some_and(|signature| {
                         is_proxy_reasoning_signature(signature)
                             || is_muse_reasoning_signature(signature)
+                            || is_vertex_thought_signature(signature)
                     })
                 {
                     // The Codex and Muse translators replay reasoning as an
                     // Anthropic thinking signature of the form
                     // `ccp:<provider>:v1:<encoded-id>:<encrypted_content>`,
                     // which carries the same opaque conversation handle as the
-                    // `encrypted_content` key. Only proxy-owned signatures are
-                    // touched; foreign ones (for example, real Anthropic
-                    // signatures) are preserved.
+                    // `encrypted_content` key; the Vertex translator carries a
+                    // Gemini thought signature as `ccp:vertex:v1:<model>:<sig>`.
+                    // Only proxy-owned signatures are touched; foreign ones
+                    // (for example, real Anthropic signatures) are preserved.
                     out.insert(key.clone(), redact_traffic_value(value));
                 } else if REDACT_KEYS.contains(&normalized.as_str())
                     || matches!(
@@ -501,6 +512,12 @@ fn looks_like_image_source(map: &Map<String, Value>) -> bool {
         Some(media_type) => media_type.to_ascii_lowercase().starts_with("image/"),
         None => true,
     }
+}
+
+/// An object shaped like a Gemini `Blob` (`inlineData`): a `mimeType` key
+/// beside `data`. Any media type is redacted, not only images.
+fn looks_like_inline_data(map: &Map<String, Value>) -> bool {
+    map.keys().any(|key| key.eq_ignore_ascii_case("mimetype"))
 }
 
 fn redact_traffic_value(value: &Value) -> Value {
@@ -1090,5 +1107,91 @@ mod tests {
         assert!(captured.contains("owner@example.com"), "{captured}");
         assert!(!captured.contains(MUSE_SECRET), "{captured}");
         assert!(captured.contains("not [redacted]"), "{captured}");
+    }
+
+    const VERTEX_ENVELOPE: &str = "ccp:vertex:v1:gemini-3.5-flash:c3ludGhldGljLWdlbWluaS10aG91Z2h0";
+    const VERTEX_SIGNATURE: &str = "c3ludGhldGljLWdlbWluaS10aG91Z2h0";
+
+    #[test]
+    fn redact_traffic_strips_vertex_envelopes_thought_signatures_and_inline_data() {
+        let value = serde_json::json!({
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "kept", "signature": VERTEX_ENVELOPE}
+            ]}],
+            "contents": [
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "Read", "args": {"path": "a"}}, "thoughtSignature": VERTEX_SIGNATURE}
+                ]},
+                {"role": "user", "parts": [
+                    {"inlineData": {"mimeType": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"}},
+                    {"functionResponse": {"name": "Read", "response": {"output": "kept"}, "parts": [
+                        {"inlineData": {"mimeType": "application/pdf", "data": "JVBERi0xLjQKJcfsj6IKNSAwIG9iago"}}
+                    ]}}
+                ]}
+            ],
+            "delta": {"type": "signature_delta", "signature": VERTEX_ENVELOPE},
+            "thought_signature": VERTEX_SIGNATURE
+        });
+        let redacted = redact_traffic(&value);
+        let rendered = redacted.to_string();
+        for leaked in [
+            VERTEX_SIGNATURE,
+            "ccp:vertex:v1:",
+            "iVBORw0KGgo",
+            "JVBERi0x",
+        ] {
+            assert!(!rendered.contains(leaked), "{leaked} leaked: {rendered}");
+        }
+        assert_eq!(
+            redacted["contents"][0]["parts"][0]["thoughtSignature"],
+            format!("[redacted len={}]", VERTEX_SIGNATURE.len())
+        );
+        assert_eq!(
+            redacted["delta"]["signature"],
+            format!("[redacted len={}]", VERTEX_ENVELOPE.len())
+        );
+        assert_eq!(
+            redacted["contents"][1]["parts"][0]["inlineData"]["mimeType"],
+            "image/png"
+        );
+        assert_eq!(
+            redacted["contents"][0]["parts"][0]["functionCall"]["name"],
+            "Read"
+        );
+        assert_eq!(redacted["messages"][0]["content"][0]["thinking"], "kept");
+        assert!(rendered.contains("\"output\":\"kept\""), "{rendered}");
+    }
+
+    #[test]
+    fn traffic_capture_redacts_vertex_signatures_in_stream_events() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let capture = test_capture(temp.path().join("traffic"));
+        let mut stream = capture.stream_capture();
+        stream.upstream_event(
+            None,
+            &serde_json::json!({"candidates": [{"content": {"role": "model", "parts": [
+                {"functionCall": {"name": "Read", "args": {}}, "thoughtSignature": VERTEX_SIGNATURE}
+            ]}}]}),
+        );
+        stream.downstream_event(
+            "content_block_delta",
+            serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": VERTEX_ENVELOPE}}),
+        );
+        stream.finish_named(&capture, serde_json::json!({}), "061-vertex-stream-summary");
+        let captured = captured_files(&capture);
+        assert!(!captured.contains(VERTEX_SIGNATURE), "{captured}");
+        assert!(!captured.contains("ccp:vertex:v1:"), "{captured}");
+        assert!(captured.contains("signature_delta"), "{captured}");
+    }
+
+    #[test]
+    fn redact_traffic_keeps_data_without_a_mime_type_and_vertex_like_foreign_values() {
+        let value = serde_json::json!({
+            "data": "some-non-image-payload",
+            "signature": "ccp:vertexish:v1:not-ours",
+            "nested": {"data": "kept", "media": "png"}
+        });
+        let redacted = redact_traffic(&value);
+        assert_eq!(redacted, value);
     }
 }
