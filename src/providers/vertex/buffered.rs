@@ -125,6 +125,9 @@ pub(super) enum TerminalRule {
     /// `response.done`. A `[DONE]` after it does not start the window again,
     /// as in the streaming path.
     Responses,
+    /// Chat Completions: a `finish_reason` or `[DONE]`. A `[DONE]` after the
+    /// `finish_reason` starts the window again, as in the streaming path.
+    ChatCompletions,
 }
 
 /// Keeps an event-stream body whole for a translator that takes the whole
@@ -135,7 +138,10 @@ pub(super) struct EventStreamSink {
     bytes: Vec<u8>,
     decoder: SseDecoder,
     rule: TerminalRule,
-    completed: bool,
+    /// The completion event, or the first `finish_reason`.
+    finished: bool,
+    /// `[DONE]`, counted for [`TerminalRule::ChatCompletions`] only.
+    done: bool,
 }
 
 impl EventStreamSink {
@@ -146,7 +152,8 @@ impl EventStreamSink {
             // limit here means both fail on the same frame.
             decoder: SseDecoder::default(),
             rule,
-            completed: false,
+            finished: false,
+            done: false,
         }
     }
 
@@ -170,26 +177,39 @@ impl BufferedSink for EventStreamSink {
             .push(chunk)
             .map_err(|_| StreamError::Malformed("the response is not a readable event stream"))?;
         for event in events {
-            match self.rule {
-                TerminalRule::Responses => {
-                    let terminal = serde_json::from_str::<serde_json::Value>(event.data.trim())
-                        .ok()
-                        .and_then(|value| {
-                            value
-                                .get("type")
-                                .and_then(serde_json::Value::as_str)
-                                .map(|kind| RESPONSES_TERMINAL_EVENT_TYPES.contains(&kind))
-                        })
-                        .unwrap_or(false);
-                    self.completed |= terminal;
-                }
+            let data = event.data.trim();
+            if data == "[DONE]" {
+                self.done = true;
+                continue;
             }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            self.finished |= match self.rule {
+                TerminalRule::Responses => value
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| RESPONSES_TERMINAL_EVENT_TYPES.contains(&kind)),
+                TerminalRule::ChatCompletions => value
+                    .get("choices")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|choices| {
+                        choices.iter().any(|choice| {
+                            choice
+                                .get("finish_reason")
+                                .is_some_and(|reason| reason.is_string())
+                        })
+                    }),
+            };
         }
         Ok(())
     }
 
     fn terminal_events(&self) -> usize {
-        usize::from(self.completed)
+        match self.rule {
+            TerminalRule::Responses => usize::from(self.finished),
+            TerminalRule::ChatCompletions => usize::from(self.finished) + usize::from(self.done),
+        }
     }
 }
 
@@ -386,5 +406,89 @@ mod tests {
                 "{kind}"
             );
         }
+    }
+
+    const CHAT_DELTA: &str =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n";
+    const CHAT_FINISH: &str =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+
+    #[test]
+    fn chat_terminal_events_synthetic_count_the_finish_reason_and_done() {
+        let mut sink = EventStreamSink::new(TerminalRule::ChatCompletions);
+        sink.push(CHAT_DELTA.as_bytes()).unwrap();
+        assert_eq!(sink.terminal_events(), 0);
+        // A null finish_reason is not a terminal event.
+        sink.push(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\n\n")
+            .unwrap();
+        assert_eq!(sink.terminal_events(), 0);
+        sink.push(CHAT_FINISH.as_bytes()).unwrap();
+        assert_eq!(sink.terminal_events(), 1);
+        sink.push(b"data: [DONE]\n\n").unwrap();
+        assert_eq!(sink.terminal_events(), 2);
+
+        let mut sink = EventStreamSink::new(TerminalRule::ChatCompletions);
+        sink.push(b"data: [DONE]\n\n").unwrap();
+        assert_eq!(sink.terminal_events(), 1);
+
+        // For Responses, [DONE] is not counted.
+        let mut sink = EventStreamSink::new(TerminalRule::Responses);
+        sink.push(format!("{COMPLETED}data: [DONE]\n\n").as_bytes())
+            .unwrap();
+        assert_eq!(sink.terminal_events(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_sink_synthetic_a_late_done_starts_the_read_window_again() {
+        let mut sink = EventStreamSink::new(TerminalRule::ChatCompletions);
+        let started = tokio::time::Instant::now();
+        let upstream = stream::iter([chunk(CHAT_DELTA), chunk(CHAT_FINISH)])
+            .chain(stream::once(async {
+                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                chunk("data: [DONE]\n\n")
+            }))
+            .chain(stream::pending());
+        let end = tokio::time::timeout(
+            Duration::from_secs(60),
+            read_upstream(upstream, &mut sink, &sanitizer(), None),
+        )
+        .await
+        .expect("an upstream left open after [DONE] must not hold the read")
+        .expect("the read ends without an error");
+        assert_eq!(end, ReadEnd::ReadLimit);
+        assert_eq!(started.elapsed(), Duration::from_millis(3_500));
+        assert_eq!(
+            String::from_utf8(sink.into_body(end)).unwrap(),
+            format!("{CHAT_DELTA}{CHAT_FINISH}data: [DONE]\n\n")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_sink_synthetic_finish_reason_then_open_upstream_ends_at_the_read_limit() {
+        let mut sink = EventStreamSink::new(TerminalRule::ChatCompletions);
+        let started = tokio::time::Instant::now();
+        let upstream =
+            stream::iter([chunk(CHAT_DELTA), chunk(CHAT_FINISH)]).chain(stream::pending());
+        let end = tokio::time::timeout(
+            Duration::from_secs(60),
+            read_upstream(upstream, &mut sink, &sanitizer(), None),
+        )
+        .await
+        .expect("an upstream left open after the finish_reason must not hold the read")
+        .expect("the read ends without an error");
+        assert_eq!(end, ReadEnd::ReadLimit);
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_sink_synthetic_silence_before_any_terminal_event_is_not_cut() {
+        let mut sink = EventStreamSink::new(TerminalRule::ChatCompletions);
+        let upstream = stream::iter([chunk(CHAT_DELTA)]).chain(stream::pending());
+        let pending = tokio::time::timeout(
+            Duration::from_secs(600),
+            read_upstream(upstream, &mut sink, &sanitizer(), None),
+        )
+        .await;
+        assert!(pending.is_err(), "the read ended without a terminal event");
     }
 }

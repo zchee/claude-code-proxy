@@ -146,7 +146,12 @@ impl Family {
     pub const fn is_served(self) -> bool {
         matches!(
             self,
-            Family::Gemini | Family::Claude | Family::Grok | Family::OpenAi | Family::MetaMuse
+            Family::Gemini
+                | Family::Claude
+                | Family::Grok
+                | Family::OpenAi
+                | Family::MetaMuse
+                | Family::Mistral
         )
     }
 
@@ -742,7 +747,7 @@ mod tests {
     #[test]
     fn advertised_models_are_the_nine_ids_bare_and_prefixed() {
         let advertised = advertised_models();
-        assert_eq!(advertised.len(), 44);
+        assert_eq!(advertised.len(), 47);
         for (id, _) in EXPECTED {
             assert!(advertised.contains(&id.to_string()), "{id}");
             assert!(advertised.contains(&format!("vertex/{id}")), "{id}");
@@ -1145,7 +1150,7 @@ mod tests {
             );
             assert!(
                 message.ends_with(
-                    "supported families: Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse"
+                    "supported families: Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, Mistral"
                 ),
                 "{message}"
             );
@@ -1384,6 +1389,9 @@ mod tests {
                     "vertex/openai/gpt-6.1-sol",
                     "vertex/openai/gpt-6.1-terra",
                     "vertex/openai/gpt-6-luna",
+                    "vertex/mistralai/mistral-medium-3",
+                    "vertex/mistralai/mistral-small-2503",
+                    "vertex/mistralai/codestral-2",
                 ]
                 .map(str::to_string),
             )
@@ -1391,8 +1399,8 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(advertised_models(), expected);
         // Only Gemini IDs are advertised bare; a partner name always carries
-        // `vertex/`, so bare claude-*, gpt-*, grok-* and muse-* stay with the
-        // providers that own them.
+        // `vertex/`, so bare claude-*, gpt-*, grok-*, muse-* and mistral-*
+        // stay with the providers that own them.
         for name in advertised_models() {
             assert!(
                 name.starts_with("gemini-") || name.starts_with("vertex/"),
@@ -1409,7 +1417,8 @@ mod tests {
                 Family::Claude,
                 Family::Grok,
                 Family::OpenAi,
-                Family::MetaMuse
+                Family::MetaMuse,
+                Family::Mistral
             ]
         );
         let mut claude = Family::Claude.model_names();

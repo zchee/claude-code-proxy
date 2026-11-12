@@ -1,7 +1,8 @@
 //! Google Cloud Vertex AI provider: Anthropic Messages requests with
 //! Application Default Credentials, for Gemini models (sent as
-//! `streamGenerateContent`) and for the xAI Grok, OpenAI and Meta Muse
-//! partner models (sent as OpenAI Responses requests).
+//! `streamGenerateContent`), for the xAI Grok, OpenAI and Meta Muse partner
+//! models (sent as OpenAI Responses requests) and for Mistral (sent in
+//! Mistral's chat format on `streamRawPredict`).
 //!
 //! The upstream is always asked for a stream. A non-streaming client gets a
 //! message built from the same translation, so both modes decide the stop
@@ -15,6 +16,7 @@ mod buffered;
 pub mod claude;
 pub mod cli;
 pub mod client;
+mod mistral;
 pub mod models;
 mod responses;
 pub mod sanitize;
@@ -94,6 +96,9 @@ enum Reception {
     /// An OpenAI Responses stream (xAI Grok, OpenAI, Meta Muse).
     /// `model` is the name the client asked for.
     Responses { message_id: String, model: String },
+    /// A Mistral Chat-Completions-shaped stream. `model` is the name the
+    /// client asked for.
+    Mistral { message_id: String, model: String },
 }
 
 /// The `vertex` provider.
@@ -211,11 +216,29 @@ impl VertexProvider {
                     model_id: model.upstream_model,
                 })
             }
+            WireFormat::MistralChat => {
+                let translated = mistral::prepare_request(body, &model).map_err(invalid_request)?;
+                let upstream = self
+                    .send_partner(
+                        &model,
+                        |target| mistral::url(target, &model),
+                        &translated,
+                        ctx,
+                    )
+                    .await?;
+                Ok(Started {
+                    sanitize: sanitizer(&upstream),
+                    upstream,
+                    reception: Reception::Mistral {
+                        message_id: new_message_id(),
+                        model: requested,
+                    },
+                    model_id: model.upstream_model,
+                })
+            }
             // Claude requests are passed through by `claude` before this
             // point and never translated here.
-            WireFormat::AnthropicMessages | WireFormat::MistralChat => {
-                Err(family_not_supported(&requested, &model))
-            }
+            WireFormat::AnthropicMessages => Err(family_not_supported(&requested, &model)),
         }
     }
 
@@ -429,6 +452,10 @@ fn stream_response_body(
             responses::stream_body(upstream, message_id, model, ctx, sanitize),
             outcome,
         ),
+        Reception::Mistral { message_id, model } => report_error_events(
+            mistral::stream_body(upstream, message_id, model, ctx, sanitize),
+            outcome,
+        ),
     }
 }
 
@@ -481,6 +508,9 @@ async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
         Reception::Responses { message_id, model } => {
             responses::read_response(upstream, &message_id, &model, &sanitize, capture.as_mut())
                 .await
+        }
+        Reception::Mistral { message_id, model } => {
+            mistral::read_response(upstream, &message_id, &model, &sanitize, capture.as_mut()).await
         }
     };
     match result {
@@ -661,15 +691,14 @@ fn check_settings(config: &ResolvedVertexConfig) -> Result<(), ProviderError> {
     Ok(())
 }
 
-/// Refuses a model this version cannot send: the wire formats whose
-/// handler does not exist yet. The 400 comes before any setting or
+/// Refuses a model whose family this version does not send
+/// ([`models::Family::is_served`]). The 400 comes before any setting or
 /// credential is read.
 fn require_served(requested: &str, model: &ResolvedModel) -> Result<(), ProviderError> {
-    match model.wire {
-        WireFormat::GenerateContent
-        | WireFormat::AnthropicMessages
-        | WireFormat::Responses { .. } => Ok(()),
-        WireFormat::MistralChat => Err(family_not_supported(requested, model)),
+    if model.family.is_served() {
+        Ok(())
+    } else {
+        Err(family_not_supported(requested, model))
     }
 }
 
@@ -756,7 +785,7 @@ mod tests {
         assert!(provider.ready.get().is_none());
         assert_eq!(provider.name(), "vertex");
         let models = provider.supported_models();
-        assert_eq!(models.len(), 44, "{models:?}");
+        assert_eq!(models.len(), 47, "{models:?}");
         assert!(
             models
                 .iter()
@@ -1066,7 +1095,6 @@ mod tests {
             monitor: None,
         };
         for (model, family) in [
-            ("vertex/mistralai/mistral-medium-3", "Mistral"),
             (
                 "vertex/openai/gpt-oss-120b-maas",
                 "Model Garden managed open model (<publisher>/<model-id>-maas)",
@@ -1095,7 +1123,7 @@ mod tests {
                 assert_eq!(
                     message,
                     format!(
-                        "this version of claude-code-proxy does not support the {family} model family on Vertex AI (requested {model:?}); supported families: Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse"
+                        "this version of claude-code-proxy does not support the {family} model family on Vertex AI (requested {model:?}); supported families: Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, Mistral"
                     ),
                     "{model}"
                 );
@@ -1251,5 +1279,72 @@ mod tests {
         );
         axum::body::to_bytes(body, usize::MAX).await.unwrap();
         assert_eq!(outcome.failure(), None);
+    }
+
+    #[tokio::test]
+    async fn mistral_synthetic_outside_its_locations_is_a_400_naming_the_settings() {
+        // An unroutable base URL: if the location were not refused first,
+        // the request would fail to connect instead of reaching anyone.
+        let config_dir = tempfile::TempDir::new().unwrap();
+        let env = std::collections::HashMap::from([
+            (
+                "CCP_VERTEX_PROJECT".to_string(),
+                "synthetic-project".to_string(),
+            ),
+            (
+                "CCP_VERTEX_BASE_URL".to_string(),
+                "http://127.0.0.1:9".to_string(),
+            ),
+        ]);
+        let config = crate::config::resolve_vertex_config(&env, config_dir.path());
+        let provider = VertexProvider::with_client(
+            VertexClient::with_client(client::client_builder().no_proxy().build().unwrap()),
+            VertexCredentials::fixed(http::HeaderMap::new()),
+            config,
+        );
+        for stream in [false, true] {
+            let body: MessagesRequest = serde_json::from_value(json!({
+                "model": "vertex/mistralai/mistral-medium-3",
+                "stream": stream,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .expect("valid request");
+            let response = provider.handle_messages(body, synthetic_context()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "stream {stream}"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["error"]["type"], "invalid_request_error", "{value}");
+            assert_eq!(
+                value["error"]["message"],
+                "Vertex AI models of publisher mistralai are not served in location global: set \
+                 CCP_VERTEX_LOCATION_OVERRIDES=mistralai=<location>, \"mistralai\": \"<location>\" \
+                 in vertex.locationOverrides in config.json, or the location itself \
+                 (CCP_VERTEX_LOCATION, GOOGLE_CLOUD_LOCATION or vertex.location), with \
+                 us-central1 or europe-west4 as <location>",
+                "{value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mistral_synthetic_counts_tokens_locally_without_settings() {
+        let provider = VertexProvider::new();
+        let body: MessagesRequest = serde_json::from_value(json!({
+            "model": "vertex/mistralai/codestral-2",
+            "messages": [{"role": "user", "content": "hello world"}]
+        }))
+        .expect("valid request");
+        let response = provider
+            .handle_count_tokens(body, synthetic_context())
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(provider.ready.get().is_none());
     }
 }
