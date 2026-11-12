@@ -570,6 +570,7 @@ where
             }
             if !terminal && self.pending_completion.is_some() {
                 terminal = true;
+                context.start_read_window();
                 if context.terminal_frame_ended(chunk, end) {
                     return Err(("protocol", "post_terminal_limit"));
                 }
@@ -1530,6 +1531,50 @@ mod tests {
                 "{} tail bytes: {buffered:?}",
                 tail.len()
             );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_starts_the_read_window_at_the_completion_not_at_the_next_poll()
+    {
+        let text_then_completion = format!(
+            "{}{}{COMPLETION}",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_a\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hello\"}\n\n",
+        );
+        let late = "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"late\"}\n\n";
+        for (delay_ms, settles) in [(3_000, true), (1_000, false)] {
+            let items = chunks(&[&text_then_completion, late]);
+            let (upstream, pulled) = synthetic_counted_upstream(items, None);
+            let started = tokio::time::Instant::now();
+            let mut body = strict_body(upstream).into_data_stream();
+            let first = body.next().await.unwrap().unwrap();
+            assert!(
+                String::from_utf8_lossy(&first).contains("hello"),
+                "{delay_ms} ms: {first:?}"
+            );
+            // The client takes its time before it asks for more.
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            let mut rest = String::new();
+            while let Some(item) = body.next().await {
+                rest.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+            }
+            let case = format!("next poll after {delay_ms} ms: {rest}");
+            assert_eq!(rest.contains("message_stop"), settles, "{case}");
+            assert_eq!(rest.contains(INVALID), !settles, "{case}");
+            if settles {
+                // The window had passed: the waiting chunk was not read.
+                assert_eq!(
+                    pulled.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "{case}"
+                );
+                assert_eq!(
+                    started.elapsed(),
+                    std::time::Duration::from_millis(3_000),
+                    "{case}"
+                );
+            }
         }
     }
 }

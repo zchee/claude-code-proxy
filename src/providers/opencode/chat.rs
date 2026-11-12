@@ -214,8 +214,10 @@ impl ReceiveContext {
     }
 
     /// The next upstream item after the terminal event, or `None` when
-    /// [`POST_TERMINAL_READ_LIMIT`] passed first. The limit runs from the
-    /// first call.
+    /// [`POST_TERMINAL_READ_LIMIT`] passed first. The limit runs from
+    /// [`Self::start_read_window`], or from the first call when the window
+    /// was not started. When it has already passed, the upstream is not
+    /// polled, even if an item is waiting there.
     pub(super) async fn read_after_terminal<S>(
         &mut self,
         upstream: &mut S,
@@ -226,15 +228,21 @@ impl ReceiveContext {
         let deadline = *self
             .read_deadline
             .get_or_insert_with(|| tokio::time::Instant::now() + POST_TERMINAL_READ_LIMIT);
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
         tokio::time::timeout_at(deadline, upstream.next())
             .await
             .ok()
     }
 
-    /// Starts the read window again at the next read, for a terminal event
-    /// that follows an earlier one (`[DONE]` after a `finish_reason`).
-    pub(super) fn restart_read_window(&mut self) {
-        self.read_deadline = None;
+    /// Starts the read window now, when a terminal frame has been parsed,
+    /// and starts it again for a terminal event that follows an earlier one
+    /// (`[DONE]` after a `finish_reason`). The window runs while the client
+    /// takes the output released before it, so a slow client does not give
+    /// the upstream more time.
+    pub(super) fn start_read_window(&mut self) {
+        self.read_deadline = Some(tokio::time::Instant::now() + POST_TERMINAL_READ_LIMIT);
     }
 
     /// Counts bytes read after the terminal event; `true` once they exceed
@@ -1918,10 +1926,11 @@ where
             }
             start = end;
             if !done_before && self.translator.has_seen_done() {
-                context.restart_read_window();
+                context.start_read_window();
             }
             if !terminal && self.translator.is_terminal() {
                 terminal = true;
+                context.start_read_window();
                 if context.terminal_frame_ended(chunk, end) {
                     return Err(("protocol", "post_terminal_limit"));
                 }
@@ -3316,6 +3325,59 @@ mod tests {
                 "{} tail bytes: {buffered:?}",
                 tail.len()
             );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_starts_the_read_window_at_the_finish_reason_not_at_the_next_poll()
+     {
+        let late = "data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n";
+        for (delay_ms, settles) in [(3_000, true), (1_000, false)] {
+            let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = Arc::clone(&pulled);
+            // The late chunk is ready as soon as it is polled for.
+            let upstream = futures_util::stream::iter(chunks(&[TEXT_THEN_STOP, late]))
+                .chain(futures_util::stream::pending())
+                .inspect(move |_| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            let started = tokio::time::Instant::now();
+            let mut body = strict_body(upstream).into_data_stream();
+            let first = body.next().await.unwrap().unwrap();
+            assert!(
+                String::from_utf8_lossy(&first).contains("hello"),
+                "{delay_ms} ms: {first:?}"
+            );
+            // The client takes its time before it asks for more.
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            let mut rest = String::new();
+            while let Some(item) = body.next().await {
+                rest.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+            }
+            let case = format!("next poll after {delay_ms} ms: {rest}");
+            assert_eq!(
+                rest.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+                settles,
+                "{case}"
+            );
+            assert_eq!(
+                rest.contains("Synthetic Gateway stream is invalid"),
+                !settles,
+                "{case}"
+            );
+            if settles {
+                // The window had passed: the waiting chunk was not read.
+                assert_eq!(
+                    pulled.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "{case}"
+                );
+                assert_eq!(
+                    started.elapsed(),
+                    std::time::Duration::from_millis(3_000),
+                    "{case}"
+                );
+            }
         }
     }
 }
