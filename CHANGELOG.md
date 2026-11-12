@@ -32,6 +32,17 @@ description: Release notes for claude-code-proxy.
   Muse, and Mistral do not carry reasoning across turns. Requests are billed
   to the Google Cloud project.
   See the [Vertex AI provider page](https://claude-code-proxy.raine.dev/providers/vertex/).
+- Vertex AI also serves Model Garden's managed open models enabled in the
+  project, named `vertex/<publisher>/<model-id>-maas`, such as
+  `vertex/openai/gpt-oss-120b-maas`, `vertex/zai-org/glm-5.2-maas`,
+  `vertex/google/gemma-4-26b-a4b-it-maas`,
+  `vertex/meta/llama-4-scout-17b-16e-instruct-maas`, and
+  `vertex/deepseek-ai/deepseek-v4.1-flash-maas`, through Vertex AI's OpenAI
+  Chat Completions endpoint. gpt-oss takes Claude Code's effort and refuses a
+  forced tool choice with HTTP 400; GLM and Gemma think only when Claude Code
+  turns thinking on. The Llama 4 models use `us-east5` unless a location
+  override names the model. Reasoning does not carry across turns.
+  See the [Vertex AI provider page](https://claude-code-proxy.raine.dev/providers/vertex/#managed-open-models).
 
 ## v0.1.48 (2026-11-01)
 

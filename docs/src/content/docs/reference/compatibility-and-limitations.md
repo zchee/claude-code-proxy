@@ -85,14 +85,15 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 
 ## Vertex AI
 
-- Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, and Mistral models are supported. Partner models are reached only as `vertex/<publisher>/<model-id>` and must be enabled in Model Garden first. Managed open models (`-maas`) and deployed endpoints are rejected with HTTP 400.
+- Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, Mistral, and Model Garden's managed open models are supported. Partner models are reached only as `vertex/<publisher>/<model-id>`, managed open models only as `vertex/<publisher>/<model-id>-maas`, and both must be enabled in Model Garden first. Deployed endpoints are rejected with HTTP 400.
 - The proxy stores no Google credentials and has no login of its own. Application Default Credentials do not follow `CLOUDSDK_CONFIG`.
 - The provider was built from Google's API reference without observing live traffic. The [provider page](/providers/vertex/#implemented-from-documentation-only) lists the assumptions and the symptom of each.
-- Each family is served only in some locations. Mistral needs `us-central1` or `europe-west4`, Muse always uses `global`, and `CCP_VERTEX_LOCATION_OVERRIDES` or `vertex.locationOverrides` sets the location per publisher or model.
+- Each family is served only in some locations. Mistral needs `us-central1` or `europe-west4`, Muse always uses `global`, the Llama 4 open models always use `us-east5`, and `CCP_VERTEX_LOCATION_OVERRIDES` or `vertex.locationOverrides` sets the location per publisher or model.
 - Gemini thought signatures travel in Claude Code thinking blocks. When one is missing, the proxy sends Google's `skip_thought_signature_validator` placeholder, which Google says can lower answer quality.
 - For Gemini, tool schemas are sent unchanged; a schema Gemini rejects fails the request with HTTP 400. Anthropic server tools, Gemini's built-in tools, structured output, document blocks, and image URLs are not supported.
 - Claude requests are passed through. Only `anthropic-beta` values on the list Claude Code uses for Vertex AI are sent, others are dropped without an error, and thinking blocks from other providers are removed. Features Vertex AI does not accept are not checked; the upstream error is returned.
-- Grok, OpenAI, Muse, and Mistral do not carry reasoning across turns, the hosted web search tool is refused with HTTP 400, and their streams end with an error on any event the proxy does not recognise.
+- Grok, OpenAI, Muse, Mistral, and the managed open models do not carry reasoning across turns, and their streams end with an error on any event the proxy does not recognise. Grok, OpenAI, and Muse refuse the hosted web search tool with HTTP 400.
+- Among the managed open models, only gpt-oss takes Claude Code's effort and only GLM and Gemma its thinking setting. gpt-oss refuses a forced tool choice with HTTP 400.
 - Requests are not retried and there is no model fallback.
 
 ## Cursor Agent

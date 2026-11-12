@@ -1,9 +1,9 @@
 ---
 title: Vertex AI
-description: Use Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, and Mistral models on Google Cloud Vertex AI with Application Default Credentials, project, location and per-model location settings, errors, and limits.
+description: Use Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, Mistral, and Model Garden's managed open models on Google Cloud Vertex AI with Application Default Credentials, project, location and per-model location settings, errors, and limits.
 ---
 
-The Vertex AI provider sends requests to Google Cloud Vertex AI for six model families. Each family uses the API Google documents for it:
+The Vertex AI provider sends requests to Google Cloud Vertex AI for seven model families. Each family uses the API Google documents for it:
 
 | Family | Model names | Upstream API |
 | --- | --- | --- |
@@ -13,18 +13,19 @@ The Vertex AI provider sends requests to Google Cloud Vertex AI for six model fa
 | [OpenAI](#openai) | `vertex/openai/gpt-<…>` | OpenAI Responses on `publishers/openai/v1/responses` |
 | [Meta Muse](#meta-muse) | `vertex/meta/muse-<…>` | OpenAI Responses on `publishers/meta/v1/responses` |
 | [Mistral](#mistral) | `vertex/mistralai/<model-id>` | Mistral's chat format on `publishers/mistralai/models/<model>:streamRawPredict` |
+| [Managed open models](#managed-open-models) | `vertex/<publisher>/<model-id>-maas` | OpenAI Chat Completions on `endpoints/openapi/chat/completions` |
 
-Every path follows `https://<host>/v1/projects/<project>/locations/<location>/`. For example, a Gemini request goes to:
+Every path follows `https://<host>/v1/projects/<project>/locations/<location>/`, except for the two Llama 4 managed open models, whose path starts with `v1beta1` (see [Llama 4 location](#llama-4-location)). For example, a Gemini request goes to:
 
 ```text
 https://aiplatform.googleapis.com/v1/projects/<project>/locations/<location>/publishers/google/models/<model>:streamGenerateContent?alt=sse
 ```
 
 <div class="security-callout">
-<strong>Requests are billed to your Google Cloud project.</strong> Vertex AI has no subscription. Every request is charged at Vertex AI's pay-as-you-go rates to the project the proxy is configured with, using your own Google credentials with the `cloud-platform` scope. This holds for partner models too: Claude, Grok, OpenAI, Muse, and Mistral requests are billed through the same project. A listener that other people can reach can spend that project's money.
+<strong>Requests are billed to your Google Cloud project.</strong> Vertex AI has no subscription. Every request is charged at Vertex AI's pay-as-you-go rates to the project the proxy is configured with, using your own Google credentials with the `cloud-platform` scope. This holds for partner and open models too: Claude, Grok, OpenAI, Muse, Mistral, and managed open model requests are billed through the same project. A listener that other people can reach can spend that project's money.
 </div>
 
-Model Garden's managed open models (`vertex/<publisher>/<model-id>-maas`) and deployed endpoints (`vertex/endpoint/<name>`) are not supported; see [Models](#models).
+Deployed endpoints (`vertex/endpoint/<name>`) are not supported; see [Models](#models).
 
 ## Prerequisites
 
@@ -44,16 +45,23 @@ gcloud projects add-iam-policy-binding PROJECT_ID --member=user:USER_EMAIL --rol
 
 ### Partner models in Model Garden
 
-Gemini needs nothing more. Claude, Grok, OpenAI, Muse, and Mistral models must each be enabled in Model Garden before the project can call them. Open the model's page in Model Garden in the Google Cloud console and enable it there. Google's documentation names these requirements:
+Gemini needs nothing more. Claude, Grok, OpenAI, Muse, and Mistral models, and the managed open models, must each be enabled in Model Garden before the project can call them. Open the model's page in Model Garden in the Google Cloud console and enable it there. Google's documentation names these requirements:
 
 - Enabling a model needs the role `roles/consumerprocurement.entitlementManager`. Calling it needs the permission `aiplatform.endpoints.predict`, which `roles/aiplatform.user` includes.
 - Organization policies must allow the Consumer Procurement service (`cloudcommerceconsumerprocurement.googleapis.com`) and the model.
 - The OpenAI models are in Private Preview. They also need Google's preview onboarding and allowlisting for the project.
+- For the managed open models, Google's open-model pages name the same two roles and list the Consumer Procurement API among the APIs to enable, besides the Vertex AI API.
 
 Grant the enabling role the same way as the request role:
 
 ```sh
 gcloud projects add-iam-policy-binding PROJECT_ID --member=user:USER_EMAIL --role=roles/consumerprocurement.entitlementManager
+```
+
+For a managed open model, also enable the Consumer Procurement API once per project:
+
+```sh
+gcloud services enable cloudcommerceconsumerprocurement.googleapis.com --project=PROJECT_ID
 ```
 
 The proxy does not enable models and cannot tell whether one is enabled. A request for a model that is not enabled gets Google's error with its status; [Errors](#errors) lists what to check for 403 and 404.
@@ -114,7 +122,7 @@ The command requests one access token and prints:
 
 It reads only the `type` and `quota_project_id` fields of the credentials file and never prints a token, key, or secret. Without a credentials file it contacts the metadata server and can wait up to 30 seconds for an answer.
 
-The command does not check that a partner model is enabled in Model Garden; only a request to the model shows that.
+The command does not check that a partner model or a managed open model is enabled in Model Garden; only a request to the model shows that.
 
 | Exit status | Meaning |
 | --- | --- |
@@ -157,7 +165,7 @@ A project ID may contain letters, digits, `.`, `_`, `:`, and `-`, starting with 
 Invalid Vertex setting CCP_VERTEX_LOCATION: must be a Vertex AI location such as global, us-central1 or europe-west4: lowercase letters, digits and '-'
 ```
 
-The base URL receives the access token, so it must use `https` (plain `http` only for a loopback host) and must not contain a user name or password. It replaces `https://<host>` and keeps its own path prefix; `/v1/projects/...` is appended after it, and its query and fragment are dropped. A base URL replaces the host for every model, whatever location the model's request uses.
+The base URL receives the access token, so it must use `https` (plain `http` only for a loopback host) and must not contain a user name or password. It replaces `https://<host>` and keeps its own path prefix; `/v1/projects/...` (`/v1beta1/projects/...` for Llama 4) is appended after it, and its query and fragment are dropped. A base URL replaces the host for every model, whatever location the model's request uses.
 
 The server reads these settings on the first Vertex AI request and keeps them until it exits, so restart the proxy after changing the environment or `config.json`. When the settings are invalid, for example because no project is set or an override is malformed, nothing is kept, and the next request reads `config.json` again.
 
@@ -194,11 +202,11 @@ In `config.json`, the overrides are an object:
 For each request the location comes from the first rule that applies:
 
 1. An override that names the model, such as `anthropic/claude-opus-4-6`.
-2. A fixed location: Meta Muse models always use `global`.
+2. A fixed location: Meta Muse models always use `global`, and the two Llama 4 managed open models always use `us-east5`.
 3. An override that names the publisher, such as `anthropic`.
 4. The configured location (`CCP_VERTEX_LOCATION`, `GOOGLE_CLOUD_LOCATION`, `vertex.location`). For Mistral it must be `us-central1` or `europe-west4`; any other value is a 400 (see [Mistral](#mistral)).
 
-A publisher override therefore does not move a Muse model; only an override naming the model does.
+A publisher override therefore does not move a Muse or Llama 4 model; only an override naming the model does. Both share the publisher `meta`, so a `meta` override moves neither.
 
 `vertex auth status` prints the overrides and exits with status 2 when they are malformed. A request checks them too, on the first Vertex AI request, before credentials are looked up. A key that is not `<publisher>` or `<publisher>/<model-id>`, a key listed twice, the key `endpoint`, a location that fails the location check, an entry without a location, or a `vertex.locationOverrides` value that is not an object is an error. Every Vertex AI request then fails with HTTP 500, for every family, Gemini included:
 
@@ -273,6 +281,12 @@ Mistral:
 curl -sS http://127.0.0.1:18765/v1/messages -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' -d '{"model":"vertex/mistralai/mistral-medium-3","max_tokens":64,"messages":[{"role":"user","content":"Reply with the single word: ok"}]}'
 ```
 
+A managed open model, GLM 5.2:
+
+```sh
+curl -sS http://127.0.0.1:18765/v1/messages -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' -d '{"model":"vertex/zai-org/glm-5.2-maas","max_tokens":64,"messages":[{"role":"user","content":"Reply with the single word: ok"}]}'
+```
+
 ## Models
 
 `claude-code-proxy models` lists every registered name on its `vertex:` line:
@@ -285,8 +299,9 @@ curl -sS http://127.0.0.1:18765/v1/messages -H 'content-type: application/json' 
 | OpenAI | `vertex/openai/gpt-6-astra`, `vertex/openai/gpt-6.1-sol`, `vertex/openai/gpt-6.1-terra`, `vertex/openai/gpt-6-luna` |
 | Meta Muse | `vertex/meta/muse-spark-1.3`, `vertex/meta/muse-wonder-1.0`, `vertex/meta/muse-ember-1.0` |
 | Mistral | `vertex/mistralai/mistral-medium-3`, `vertex/mistralai/mistral-small-2503`, `vertex/mistralai/codestral-2` |
+| Managed open models | `vertex/openai/gpt-oss-120b-maas`, `vertex/zai-org/glm-5.2-maas`, `vertex/google/gemma-4-26b-a4b-it-maas`, `vertex/meta/llama-4-maverick-17b-128e-instruct-maas`, `vertex/meta/llama-4-scout-17b-16e-instruct-maas`, `vertex/deepseek-ai/deepseek-v4.1-flash-maas` |
 
-Only Gemini IDs are accepted bare. A bare `claude-*`, `gpt-*`, `grok-*`, or `muse-*` ID keeps its own provider and never reaches Vertex AI: `claude-opus-5-5` is an Anthropic-style alias that follows the alias provider setting (`aliasProvider`, Codex by default), `gpt-6.1-sol` is Codex, `grok-4.7` is Grok, and `muse-spark-1.3` is Muse. The `vertex/<publisher>/` prefix is what selects Vertex AI. A trailing `[1m]` is removed before routing, as for every model.
+Only Gemini IDs are accepted bare. A bare `claude-*`, `gpt-*`, `grok-*`, or `muse-*` ID keeps its own provider and never reaches Vertex AI: `claude-opus-5-5` is an Anthropic-style alias that follows the alias provider setting (`aliasProvider`, Codex by default), `gpt-6.1-sol` is Codex, `grok-4.7` is Grok, and `muse-spark-1.3` is Muse. The `vertex/<publisher>/` prefix is what selects Vertex AI. The managed open models are listed and accepted only in that form: a bare `glm-5.2-maas` or `gpt-oss-120b-maas` never reaches Vertex AI. A trailing `[1m]` is removed before routing, as for every model.
 
 An ID that is not registered still reaches Vertex AI when it matches its family's form, so a new model works before the proxy lists it:
 
@@ -298,16 +313,19 @@ An ID that is not registered still reaches Vertex AI when it matches its family'
 | `vertex/openai/gpt-<…>`, unless it ends in `-maas` | OpenAI |
 | `vertex/meta/muse-<…>`, unless it ends in `-maas` | Meta Muse |
 | `vertex/mistralai/<model-id>` | Mistral |
+| `vertex/<publisher>/<model-id>-maas` with any other publisher, `openai` and `meta` included | Managed open model |
 
-A name without a publisher is always Gemini: `vertex/gpt-6.1-sol` is sent to Gemini and fails upstream, while `vertex/openai/gpt-6.1-sol` reaches OpenAI. An unregistered ID gets its family's defaults: Gemini's lowest thinking level `LOW` (see [Thinking](#thinking)) and the family's location rule. A model ID starts with a letter or digit and contains only letters, digits, `.`, `_`, `-`, and `@`, up to 256 bytes.
+A name ending in `-maas` stays in its family under `anthropic`, `xai`, and `mistralai`, and `vertex/google/gemini-<…>-maas` stays Gemini. A publisher contains only lowercase letters, digits, and `-`, starting with a letter or digit, up to 64 bytes.
 
-Managed open models and deployed endpoints are recognised and rejected with HTTP 400 before any setting or credential is read:
+A name without a publisher is always Gemini: `vertex/gpt-6.1-sol` is sent to Gemini and fails upstream, while `vertex/openai/gpt-6.1-sol` reaches OpenAI. An unregistered ID gets its family's defaults: Gemini's lowest thinking level `LOW` (see [Thinking](#thinking)), the family's location rule, and for a managed open model the defaults in [Managed open models](#managed-open-models). A model ID starts with a letter or digit and contains only letters, digits, `.`, `_`, `-`, and `@`, up to 256 bytes.
+
+Deployed endpoints are recognised and rejected with HTTP 400 before any setting or credential is read:
 
 ```text
-this version of claude-code-proxy does not support the Model Garden managed open model (<publisher>/<model-id>-maas) model family on Vertex AI (requested "vertex/openai/gpt-oss-120b-maas"); supported families: Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, Mistral
+this version of claude-code-proxy does not support the deployed endpoint (endpoint/<name>) model family on Vertex AI (requested "vertex/endpoint/my-endpoint"); supported families: Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, Mistral, Model Garden managed open model
 ```
 
-A deployed endpoint gets the same message with `deployed endpoint (endpoint/<name>)` as the family. Any other form, such as `vertex/ai21/<model-id>` or `vertex/meta/llama-<…>`, gets HTTP 400 with a message listing the accepted forms.
+A name under `endpoint/` is a deployed endpoint even when it ends in `-maas`. Any other form, such as `vertex/ai21/<model-id>` or a `vertex/meta/llama-<…>` name without `-maas`, gets HTTP 400 with a message listing the accepted forms, which ends `or vertex/<publisher>/<model-id>-maas for a Model Garden managed open model`.
 
 Whether a model is offered in your location, and whether your project may use it, is decided by Google. A model that is not offered or not enabled answers with Google's error (see [Errors](#errors)).
 
@@ -585,6 +603,85 @@ Google documents function calling for `mistral-medium-3`. The proxy sends tools 
 
 A `finish_reason` completes the message, with or without `data: [DONE]`. After it the proxy reads until Vertex AI closes the stream or 2 seconds pass, and a late `[DONE]` starts the 2 seconds again. Content after `finish_reason` and any event after `[DONE]` are errors. A streaming client gets an `api_error` event with `Vertex AI Mistral stream is invalid`; a non-streaming client gets a 502 with the reason, such as `Vertex AI Mistral event after [DONE]`. A single event is limited to 1 MiB.
 
+## Managed open models
+
+Model Garden's managed open models need no deployment. Their requests are sent as OpenAI Chat Completions, always as a stream:
+
+```text
+https://aiplatform.googleapis.com/v1/projects/<project>/locations/<location>/endpoints/openapi/chat/completions
+```
+
+The body's `model` is the name without `vertex/`, such as `zai-org/glm-5.2-maas`. Each registered model gets the controls its Google page documents:
+
+| Name | API version | Location | Thinking | `tool_choice` |
+| --- | --- | --- | --- | --- |
+| `vertex/openai/gpt-oss-120b-maas` | `v1` | the configured location, or an override | `reasoning_effort` | `auto` and `none` only |
+| `vertex/zai-org/glm-5.2-maas` | `v1` | the configured location, or an override | `chat_template_kwargs.enable_thinking` | every value |
+| `vertex/google/gemma-4-26b-a4b-it-maas` | `v1` | the configured location, or an override | `chat_template_kwargs.enable_thinking` | every value |
+| `vertex/meta/llama-4-maverick-17b-128e-instruct-maas` | `v1beta1` | always `us-east5`, unless an override names the model | not sent | every value |
+| `vertex/meta/llama-4-scout-17b-16e-instruct-maas` | `v1beta1` | always `us-east5`, unless an override names the model | not sent | every value |
+| `vertex/deepseek-ai/deepseek-v4.1-flash-maas` | `v1` | the configured location, or an override | not sent | every value |
+
+An override is one for the publisher or for the model, such as `zai-org` or `zai-org/glm-5.2-maas`. Google's pages show `global` for gpt-oss, GLM, Gemma, and DeepSeek. None of the Google pages read for this provider says whether these models are generally available or in Preview.
+
+Any other `vertex/<publisher>/<model-id>-maas` name is sent as `<publisher>/<model-id>` in `v1`, in the configured location or an override, with no thinking field and `tool_choice` as Claude Code sent it. The gpt-oss controls belong to `gpt-oss-120b-maas` alone: `vertex/openai/gpt-oss-20b-maas` gets no `reasoning_effort`, and a forced tool choice is sent to Vertex AI for it.
+
+### Open-model thinking
+
+Claude Code's `/effort` reaches gpt-oss, and its thinking setting reaches GLM and Gemma:
+
+| Model | Claude Code | Sent |
+| --- | --- | --- |
+| gpt-oss | effort `low` or `medium` | `reasoning_effort` with the same value |
+| gpt-oss | effort `high`, `xhigh`, or `max` | `reasoning_effort: "high"` |
+| gpt-oss | no effort | no `reasoning_effort` |
+| GLM, Gemma | thinking on: any thinking type other than `disabled` | `"chat_template_kwargs": {"enable_thinking": true}` |
+| GLM, Gemma | thinking `disabled`, or no thinking setting | `"chat_template_kwargs": {"enable_thinking": false}` |
+| Llama 4, DeepSeek, unlisted `-maas` names | any | neither field |
+
+The thinking setting has no effect on gpt-oss, and the effort has no effect on the other models. For gpt-oss, an effort value other than the five above is rejected with HTTP 400. According to Google's thinking page, GLM thinks by default and Gemma does not; the proxy always sends the switch, so GLM thinks only when Claude Code turns thinking on.
+
+Reasoning that a stream sends as `reasoning_content` becomes a Claude Code thinking block. Reasoning from earlier turns is not sent back: no thinking or `redacted_thinking` block from the history is sent, because Google documents `reasoning_content` only in responses, and the thinking in a history may come from another provider. Visible text, tool calls, and tool results are sent.
+
+### Forced tool choice on gpt-oss
+
+Google documents that gpt-oss does not support `tool_choice` `required` or a named tool. The proxy refuses Claude Code's `tool_choice` `any` and `tool` for `gpt-oss-120b-maas` with HTTP 400, before any setting or credential is read, rather than sending a choice the model would read differently:
+
+```text
+Vertex AI model openai/gpt-oss-120b-maas does not support a forced tool choice (tool_choice any or tool); use tool_choice auto or none
+```
+
+`auto` and `none` are sent.
+
+### Llama 4 location
+
+Google's Llama page sends Llama 4 requests to `v1beta1` in `us-east5`, while the general open-model guide shows `v1` and `global`. Neither was observed. The proxy follows the Llama page:
+
+```text
+https://us-east5-aiplatform.googleapis.com/v1beta1/projects/<project>/locations/us-east5/endpoints/openapi/chat/completions
+```
+
+The configured location does not move these models, and neither does a `meta` override, because the Meta Muse models share the publisher `meta`. Only an override naming the model does:
+
+```sh
+export CCP_VERTEX_LOCATION_OVERRIDES=meta/llama-4-scout-17b-16e-instruct-maas=global
+```
+
+The API version belongs to the model and stays `v1beta1` in every location.
+
+### Open-model request and response
+
+The request comes from the same Chat Completions translator as OpenCode Go, with these changes:
+
+- `model` is `<publisher>/<model-id>`.
+- `stream` is always `true`, with `stream_options.include_usage`.
+- The translator's own effort mapping is not used; the thinking fields are the ones in [Open-model thinking](#open-model-thinking).
+- Thinking blocks in the history are not sent.
+
+The system prompt, messages, images, function tools, `tool_choice`, and `parallel_tool_calls` are sent as the translator produces them. Anthropic server tools such as `web_search_20250305` are not refused: each is sent as a function tool with its name and an empty parameter schema, and no hosted tool runs on Google's side.
+
+A `finish_reason` completes the message, with or without `data: [DONE]`. After it the proxy reads until Vertex AI closes the stream or 2 seconds pass, and a late `[DONE]` starts the 2 seconds again. Content after `finish_reason` and any event after `[DONE]` are errors. A streaming client gets an `api_error` event with `Vertex AI open model stream is invalid`; a non-streaming client gets a 502 with the reason, `Vertex AI open model stream sent content after finish_reason` or `Vertex AI open model event after [DONE]`. A single event is limited to 1 MiB.
+
 ## OpenAI-compatible APIs
 
 When the OpenAI routes are enabled, every Vertex AI model works with both `POST /v1/chat/completions` and `POST /v1/responses`. Text, images, function tools, tool results, token limits, streaming, and usage use the standard shape for the chosen route. `reasoning_effort` and `reasoning.effort` accept `low`, `medium`, `high`, `xhigh`, and `max` for every family. `parallel_tool_calls` is accepted.
@@ -596,6 +693,7 @@ When the OpenAI routes are enabled, every Vertex AI model works with both `POST 
 | xAI Grok, Meta Muse | Effort is not sent. |
 | OpenAI | Effort is sent as `reasoning.effort`. |
 | Mistral | Effort is not sent. |
+| Managed open models | gpt-oss gets `reasoning_effort` as in [Open-model thinking](#open-model-thinking). GLM and Gemma always get `enable_thinking: false`, because these routes carry an effort but no thinking setting. Llama 4 and DeepSeek get neither. On gpt-oss, `tool_choice` `required` or a named function is the [400 above](#forced-tool-choice-on-gpt-oss). |
 
 ## Errors
 
@@ -605,33 +703,34 @@ The proxy chooses the error type from the HTTP status of Vertex AI. When Vertex 
 | --- | --- |
 | Project missing or a setting invalid, including a malformed location override | 500 `api_error`, `Invalid Vertex configuration: ...` naming the setting |
 | HTTP client could not be set up, which happens on the first Vertex AI request rather than at startup | 500 `api_error`, `Vertex AI transport is unavailable: ...` with the cause |
-| Managed open model, deployed endpoint, or a name in no accepted form | 400 `invalid_request_error`, before any setting or credential is read (see [Models](#models)) |
+| Deployed endpoint, or a name in no accepted form | 400 `invalid_request_error`, before any setting or credential is read (see [Models](#models)) |
+| Forced tool choice (`any` or `tool`) for gpt-oss | 400 `invalid_request_error`, `Vertex AI model openai/gpt-oss-120b-maas does not support a forced tool choice ...`, before any setting or credential is read (see [Forced tool choice on gpt-oss](#forced-tool-choice-on-gpt-oss)) |
 | Hosted web search tool for Grok, OpenAI, or Muse | 400 `invalid_request_error`, `Vertex AI does not serve the hosted web_search tool for <family> models; ...` |
 | Mistral without a Mistral location | 400 `invalid_request_error`, `Vertex AI models of publisher mistralai are not served in location <location>: ...` naming the settings |
 | No credential, or no access token (including no answer within 30 seconds) | 401 `authentication_error`, `Google credentials are not available: ...` or `Google access token could not be obtained: ...`, followed by the `gcloud auth application-default login` hint |
 | Vertex AI 401 | 401 `authentication_error`, `Vertex AI rejected the Google access token: ...` with the same hint |
-| Vertex AI 403 | 403 `permission_error`. The message asks you to check the role `roles/aiplatform.user` on the project, that `aiplatform.googleapis.com` is enabled there, and, for user credentials, that a quota project is set with `gcloud auth application-default set-quota-project <project>`. For Claude, Grok, OpenAI, Muse, and Mistral it adds the Model Garden check below |
-| Vertex AI 404 | 404 `invalid_request_error`, `Model <model> is not available in project <project> / location <location>: ...`, naming the three location settings. For Claude, Grok, OpenAI, Muse, and Mistral it adds the Model Garden check below |
+| Vertex AI 403 | 403 `permission_error`. The message asks you to check the role `roles/aiplatform.user` on the project, that `aiplatform.googleapis.com` is enabled there, and, for user credentials, that a quota project is set with `gcloud auth application-default set-quota-project <project>`. For Claude, Grok, OpenAI, Muse, Mistral, and the managed open models it adds the Model Garden check below |
+| Vertex AI 404 | 404 `invalid_request_error`, `Model <model> is not available in project <project> / location <location>: ...`, naming the three location settings. For Claude, Grok, OpenAI, Muse, Mistral, and the managed open models it adds the Model Garden check below |
 | Vertex AI 429 | 429 `rate_limit_error`. The message names the model and location and suggests retrying later or another location. `retry-after` is set from Google's `RetryInfo`, or from a whole-second `Retry-After` header, when it is between 0 and 86400 seconds |
 | Other Vertex AI 4xx, such as a Claude feature Vertex AI does not accept | Same status, `invalid_request_error`, with the upstream message |
 | Vertex AI 5xx, or no connection | 502 `api_error`; `Vertex AI is unreachable` when no status arrived |
 | No response headers within 300 seconds | 504 `api_error` |
 | Error inside a Gemini 200 stream | A blocked prompt (`blockReason`), a stop other than `STOP` or `MAX_TOKENS` (`finishReason`, with Google's `finishMessage`), a stream that ends without a `finishReason`, an `error` chunk, response content over 16 MiB, or an event or part with none of the documented fields. Streaming requests get an `error` event. Non-streaming requests get the matching status: 429 for rate limits, 401 and 403 for credential errors, the in-stream 4xx code or 400 for invalid requests and blocked prompts, and 502 for the rest |
-| Error inside a Claude, Grok, OpenAI, Muse, or Mistral 200 stream | Streaming requests get an `api_error` event: `Vertex AI Messages stream is invalid` for Claude, `Vertex AI Responses stream is invalid` for Grok, OpenAI, and Muse, `Vertex AI Mistral stream is invalid` for Mistral. Non-streaming requests get a 502 |
+| Error inside a Claude, Grok, OpenAI, Muse, Mistral, or managed open model 200 stream | Streaming requests get an `api_error` event: `Vertex AI Messages stream is invalid` for Claude, `Vertex AI Responses stream is invalid` for Grok, OpenAI, and Muse, `Vertex AI Mistral stream is invalid` for Mistral, `Vertex AI open model stream is invalid` for the managed open models. Non-streaming requests get a 502 |
 
-For a Claude, Grok, OpenAI, Muse, or Mistral model, a 403 or 404 message adds this sentence before `(upstream HTTP <status>)`:
+For a Claude, Grok, OpenAI, Muse, Mistral, or managed open model, a 403 or 404 message adds this sentence before `(upstream HTTP <status>)`:
 
 ```text
 Also check that model {model} is enabled in Model Garden for project {project} in location {location} and, for a preview model, that the project has been granted access; the status alone does not say which of these is the cause
 ```
 
-`{model}` is the model ID sent upstream, such as `xai/grok-4.7` or `claude-opus-5-5`, and the project and location are the ones the request used, an override included.
+`{model}` is the model ID sent upstream, such as `xai/grok-4.7`, `claude-opus-5-5`, or `zai-org/glm-5.2-maas`, and the project and location are the ones the request used, an override included.
 
 What to check for each status:
 
 - **401**: the credential is expired or revoked. Run `gcloud auth application-default login` again, or check the key file named by `GOOGLE_APPLICATION_CREDENTIALS`, then restart the proxy, because it keeps the credentials from the first request that obtained an access token. If no request has obtained one since the proxy started, no restart is needed: the next request looks for the credentials again.
-- **403**: the account lacks `roles/aiplatform.user` on the project, the Vertex AI API is not enabled in it, or user credentials have no quota project. For a partner model, also check that the model is enabled in Model Garden for this project, that organization policies allow it, and, for OpenAI, that the project has Private Preview access.
-- **404**: the model ID is wrong, the model is not offered in that location, or a partner model is not enabled in Model Garden. The location in the message is the one the request used, which may come from a [location override](#location-overrides) rather than from the three settings it names. Try `global`, or a location the model page lists; see the location notes for [Claude](#claude-location), [Grok](#xai-grok), [OpenAI](#openai), [Muse](#meta-muse), and [Mistral](#mistral-location).
+- **403**: the account lacks `roles/aiplatform.user` on the project, the Vertex AI API is not enabled in it, or user credentials have no quota project. For a partner model or a managed open model, also check that the model is enabled in Model Garden for this project, that organization policies allow it, and, for OpenAI, that the project has Private Preview access.
+- **404**: the model ID is wrong, the model is not offered in that location, or a partner model or managed open model is not enabled in Model Garden. The location in the message is the one the request used, which may come from a [location override](#location-overrides) rather than from the three settings it names. Try `global`, or a location the model page lists; see the location notes for [Claude](#claude-location), [Grok](#xai-grok), [OpenAI](#openai), [Muse](#meta-muse), [Mistral](#mistral-location), and [Llama 4](#llama-4-location).
 - **429**: the project's quota or Google's shared capacity for the model in that location is used up. Wait for `retry-after`, or set another location.
 
 The proxy does not retry and does not fall back to another model; Claude Code decides whether to retry. Non-streaming requests are also sent to Vertex AI as streams and assembled by the proxy, except non-streaming Claude requests, which use `:rawPredict`. There is no limit on the time between chunks of a stream, because a model can think for a long time before it sends text. The body of an error response is read for at most 10 seconds and 64 KiB; past that, the proxy answers from the status alone.
@@ -647,7 +746,8 @@ With [traffic capture](/reference/files-and-storage/#traffic-captures) on, Verte
 | Claude non-streaming | `032-upstream-response-body` and `051-downstream-response`, as JSON |
 | Grok, OpenAI, Muse stream | `060-vertex-responses-stream-error`, `061-vertex-responses-stream-summary` |
 | Mistral stream | `061-vertex-mistral-stream-summary` |
-| Non-streaming Gemini, Grok, OpenAI, Muse, Mistral | `061-vertex-buffered-summary` and `051-downstream-response` |
+| Managed open model stream | `061-vertex-open-model-stream-summary` |
+| Non-streaming Gemini, Grok, OpenAI, Muse, Mistral, managed open model | `061-vertex-buffered-summary` and `051-downstream-response` |
 
 The `060-...-stream-error` file is written only when the stream failed. No capture file holds the request's access token, in any field: every string the proxy writes for a Vertex AI request has the token replaced with `[redacted]`. Apart from that replacement, upstream text in these files is kept whole, however long, except upstream error and finish messages, which also go through the cleaning described in [Errors](#errors) and are cut to 500 characters.
 
@@ -678,7 +778,7 @@ No request to Vertex AI was observed while this provider was built. The request 
 | All | User credentials without a quota project are accepted. | HTTP 403. Run `gcloud auth application-default set-quota-project PROJECT_ID`. |
 | Gemini | Claude Code keeps empty thinking blocks that carry only a signature. | No error; the proxy sends the placeholder signature, and answer quality may drop. |
 | Gemini | Error bodies carry `RetryInfo`, and errors inside a stream arrive as a chunk with an `error` key. | 429 responses have no `retry-after`. An unknown chunk shape ends the stream with an error. |
-| All partner families | Error bodies carry their text at `error.message` or a top-level `message`. | Error messages show the raw body instead of the upstream sentence. The status mapping is unchanged. |
+| All partner families, managed open models | Error bodies carry their text at `error.message` or a top-level `message`. | Error messages show the raw body instead of the upstream sentence. The status mapping is unchanged. |
 | Claude | The Claude stream on Vertex AI has the same events as Anthropic's. | Broken display or usage in Claude Code, or `Vertex AI Messages stream is invalid` when `message_stop` never arrives. |
 | Claude | Vertex AI accepts the request fields Claude Code sends when it believes it talks to Anthropic. | Requests that use a certain feature fail with HTTP 400 naming the field. `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` is expected to reduce them. |
 | Claude | Vertex AI accepts every value on the beta list. | HTTP 400 naming a beta. |
@@ -690,19 +790,27 @@ No request to Vertex AI was observed while this provider was built. The request 
 | OpenAI | A project with Private Preview access reaches the registered models. | HTTP 403 or 404. |
 | Mistral | Mistral accepts `parallel_tool_calls` and `max_tokens`, and its stream ends with a `finish_reason`. | HTTP 400 naming the field, or `Vertex AI Mistral stream is invalid`. |
 | Mistral | `mistral-small-2503` and `codestral-2` take tools, as `mistral-medium-3` does. | HTTP 400, or the model never calls a tool. |
+| Managed open models | The models accept `stream_options.include_usage`, which Google's open-model pages do not document. | HTTP 400 naming `stream_options`, or no usage in Claude Code. |
+| Managed open models | A stream sends reasoning as `delta.reasoning_content`. Google shows `reasoning_content` only in a whole response. | No error; no thinking appears, or the reasoning appears in the answer text. |
+| Managed open models | Enabling the model in Model Garden with the roles above is all the access a project needs. Google's pages establish no separate licence acceptance. | HTTP 403 for an enabled model. |
+| Llama 4 | The Llama page's `v1beta1` and `us-east5` are right, rather than the general guide's `v1` and `global`. | HTTP 404. An override naming the model, such as `meta/llama-4-scout-17b-16e-instruct-maas=global`, moves the location; the API version stays `v1beta1`. |
+| DeepSeek | The body's `model` is `deepseek-ai/deepseek-v4.1-flash-maas`. Google's pages name the publisher and the ID but show no request with this string. | HTTP 400 or 404 naming the model. |
+| GLM, Gemma | Both accept `chat_template_kwargs.enable_thinking` with `true` and `false`. Google's thinking page shows GLM with `false` and Gemma with `true`. | HTTP 400 naming `chat_template_kwargs`. |
+| Gemma, Llama 4, DeepSeek | The models take function tools. Google documents tool calling for GLM and gpt-oss, not for these. | HTTP 400 when tools are sent, or the model never calls a tool. |
 
 ## Limitations
 
-- Model Garden's managed open models (`vertex/<publisher>/<model-id>-maas`) and deployed endpoints (`vertex/endpoint/<name>`) are refused with HTTP 400. The proxy does not enable models or create endpoints.
+- Deployed endpoints (`vertex/endpoint/<name>`) are refused with HTTP 400. The proxy does not enable models or create endpoints.
+- gpt-oss refuses a forced tool choice with HTTP 400. The managed open models other than gpt-oss, GLM, and Gemma have no thinking switch, so Claude Code's effort and thinking settings do not reach them.
 - Gemini's built-in tools (Google Search, code execution, URL context) and Anthropic server tools are not available for Gemini. Structured output (`output_config.format`), `cache_control`, and `metadata` are ignored for Gemini.
 - For Gemini, PDF and other document blocks are dropped and image URLs are rejected. Gemini responses that contain images, files, or code-execution parts end with an error.
 - `thinkingBudget` is never sent, so models that take only `thinkingBudget`, such as Gemini 2.5, are not supported.
 - Safety settings are Google's defaults; the proxy sends none.
 - Claude features that Vertex AI does not accept are not checked by the proxy; the upstream error is returned. `anthropic-beta` values outside the Claude Code list are dropped without an error.
-- Grok, OpenAI, Muse, and Mistral do not carry reasoning across turns. Hosted tools are refused. Stored responses (`store: true`, `previous_response_id`) and OpenAI's `/responses/compact` are not used.
-- Grok, OpenAI, Muse, and Mistral streams end with an error on any event the proxy does not recognise, and accept events up to 1 MiB each.
+- Grok, OpenAI, Muse, Mistral, and the managed open models do not carry reasoning across turns. Grok, OpenAI, and Muse refuse hosted tools. Stored responses (`store: true`, `previous_response_id`) and OpenAI's `/responses/compact` are not used.
+- Grok, OpenAI, Muse, Mistral, and managed open model streams end with an error on any event the proxy does not recognise, and accept events up to 1 MiB each.
 - Token counts for `/v1/messages/count_tokens` are local estimates for every family; Vertex AI's token-counting endpoints are not used.
-- A non-streaming Gemini, Grok, OpenAI, Muse, or Mistral request has no deadline before the first terminal event (Gemini's `finishReason`, the Responses completion, or Mistral's `finish_reason` or `[DONE]`): like a stream, it waits as long as the model takes. After that event the read ends when Vertex AI closes the stream or 2 seconds pass. A non-streaming Claude request is read until Vertex AI closes the response, also without a deadline.
+- A non-streaming Gemini, Grok, OpenAI, Muse, Mistral, or managed open model request has no deadline before the first terminal event (Gemini's `finishReason`, the Responses completion, or the Chat Completions `finish_reason` or `[DONE]` of Mistral and the managed open models): like a stream, it waits as long as the model takes. After that event the read ends when Vertex AI closes the stream or 2 seconds pass. A non-streaming Claude request is read until Vertex AI closes the response, also without a deadline.
 - Express mode (API keys), the Interactions API, explicit context caches, and Provisioned Throughput are not supported.
 
 If requests fail, run `claude-code-proxy vertex auth status` first. It shows which credential, project, location, endpoint, and quota project the proxy resolves, and whether a token can be obtained.
