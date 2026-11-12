@@ -836,8 +836,11 @@ mod tests {
         );
     }
 
-    /// `items`, then `after` (an endless repetition of one chunk, or an
-    /// upstream left open when `None`), and the count of items handed out.
+    /// `items`, then `after` (an endless repetition of one chunk, one
+    /// second of paused time apart, or an upstream left open when `None`),
+    /// and the count of items handed out. The pause lets the clock move, so
+    /// a read that wrongly keeps pulling the repetition reaches the test's
+    /// timeout instead of spinning on chunks that are always ready.
     fn synthetic_counted_upstream(
         items: Vec<Result<Bytes, std::io::Error>>,
         after: Option<String>,
@@ -849,7 +852,10 @@ mod tests {
         let counter = Arc::clone(&pulled);
         let tail: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
             match after {
-                Some(part) => Box::pin(stream::repeat_with(move || Ok(Bytes::from(part.clone())))),
+                Some(part) => Box::pin(stream::unfold(part, |part| async move {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Some((Ok(Bytes::from(part.clone())), part))
+                })),
                 None => Box::pin(stream::pending()),
             };
         let upstream = stream::iter(items).chain(tail).inspect(move |_| {

@@ -2693,7 +2693,11 @@ async fn vertex_chat_completions_synthetic_upstream_error_with_the_upstream_left
     // A non-streaming request whose upstream sends an error event and then
     // keeps the connection open. The streaming path fails at that event; the
     // buffered path must too, instead of waiting for a terminal event that
-    // never comes.
+    // never comes. The stand-in holds back a finishing chunk behind a gate
+    // that opens only after the answer has arrived, and never closes the
+    // connection, so an answer at all proves the proxy did not wait for the
+    // upstream to finish or close. The watchdog only catches a hang; it is
+    // not a bound on how fast a slow host must answer.
     let cases = [
         (
             "vertex/zai-org/glm-5.2-maas",
@@ -2707,23 +2711,28 @@ async fn vertex_chat_completions_synthetic_upstream_error_with_the_upstream_left
         ),
     ];
     for (model, extra_env, expected) in cases {
-        let upstream = FakeVertex::start(vec![Answer::sse_held_open(&[
-            json!({"error":{"message":"overloaded"}}),
-        ])])
+        let release = Arc::new(AtomicBool::new(false));
+        let upstream = FakeVertex::start(vec![Answer {
+            hold_open: true,
+            ..Answer::sse_gated(
+                &[
+                    json!({"error":{"message":"overloaded"}}),
+                    json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+                ],
+                1,
+                release.clone(),
+            )
+        }])
         .await;
         let app = app_with_monitor(registry(provider(&upstream, extra_env)), None);
-        let started = Instant::now();
         let (status, _, body) = tokio::time::timeout(
-            Duration::from_millis(1_500),
+            Duration::from_secs(20),
             post(app, "/v1/messages", &message_request(model, false)),
         )
         .await
-        .unwrap_or_else(|_| panic!("{model}: no answer within 1500 ms of an upstream error"));
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(1_500),
-            "{model}: answered after {elapsed:?}"
-        );
+        .unwrap_or_else(|_| panic!("{model}: the answer hung behind an upstream left open"));
+        // The gate was still shut when the answer came back.
+        assert!(!release.swap(true, Ordering::SeqCst), "{model}");
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{model}: {body}");
         let value: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["error"]["type"], "api_error", "{model}: {body}");
