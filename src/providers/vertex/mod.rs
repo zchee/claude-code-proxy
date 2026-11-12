@@ -582,7 +582,8 @@ where
 {
     let mut translator = LiveStreamTranslator::new(config);
     match read_upstream(upstream, &mut translator, sanitize, capture).await? {
-        ReadEnd::Closed => translator.finish()?,
+        // The Gemini translator never settles a body itself.
+        ReadEnd::Closed | ReadEnd::Settled => translator.finish()?,
         ReadEnd::ReadLimit => translator.finish_after_read_limit()?,
     };
     translator.response()

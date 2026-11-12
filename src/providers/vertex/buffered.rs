@@ -2,13 +2,14 @@
 //! stream. Every wire is requested as a stream; this reader applies the
 //! same limits to all of them: at most [`MAX_BUFFERED_RESPONSE_BYTES`], and
 //! at most [`POST_TERMINAL_READ_LIMIT`] after a terminal event when the
-//! upstream stays open.
+//! upstream stays open. A sink that settles the body ends the read at once.
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 
 use crate::providers::grok::translate::stream::SseDecoder;
 use crate::providers::opencode::chat::complete_frames_prefix;
+use crate::providers::opencode::responses::{ObservedChunk, StrictResponsesObserver};
 
 use super::translate::stream::{POST_TERMINAL_READ_LIMIT, Sanitizer, StreamError};
 use super::{BufferedCapture, MAX_BUFFERED_RESPONSE_BYTES};
@@ -28,6 +29,13 @@ pub(super) trait BufferedSink {
     /// [`POST_TERMINAL_READ_LIMIT`] starts at the first one and starts again
     /// whenever the count grows.
     fn terminal_events(&self) -> usize;
+
+    /// Whether the body is settled: what has been read is the whole
+    /// response, and the upstream is not read again. By default a body is
+    /// settled only by the upstream closing it or by the read window.
+    fn is_settled(&self) -> bool {
+        false
+    }
 }
 
 /// Why a non-streaming response could not be produced.
@@ -58,13 +66,17 @@ pub(super) enum ReadEnd {
     /// The upstream stayed open for [`POST_TERMINAL_READ_LIMIT`] after the
     /// last terminal event.
     ReadLimit,
+    /// The sink settled the body ([`BufferedSink::is_settled`]) before the
+    /// upstream closed it. The upstream was not read again and is dropped.
+    Settled,
 }
 
-/// Feeds the upstream body to `sink` until the upstream closes, or until
-/// [`POST_TERMINAL_READ_LIMIT`] has passed since the sink's last terminal
-/// event. Before any terminal event there is no deadline: a model may think
-/// for a long time before it sends anything. Each chunk is recorded in
-/// `capture` before the sink sees it.
+/// Feeds the upstream body to `sink` until the upstream closes, until the
+/// sink settles the body, or until [`POST_TERMINAL_READ_LIMIT`] has passed
+/// since the sink's last terminal event. Before any terminal event there is
+/// no deadline: a model may think for a long time before it sends anything.
+/// Each chunk is recorded in `capture` before the sink sees it. When the
+/// read ends the upstream is dropped.
 ///
 /// # Errors
 ///
@@ -116,6 +128,9 @@ where
             capture.upstream(&chunk, sanitize);
         }
         sink.push(&chunk)?;
+        if sink.is_settled() {
+            return Ok(ReadEnd::Settled);
+        }
     }
 }
 
@@ -134,7 +149,7 @@ pub(super) enum TerminalRule {
 /// Keeps an event-stream body whole for a translator that takes the whole
 /// body at once, and counts its terminal events for [`read_upstream`].
 /// Validation is the translator's: this sink only reads what it needs to
-/// find the terminal events.
+/// find the terminal events, unless it was made with [`Self::observed`].
 pub(super) struct EventStreamSink {
     bytes: Vec<u8>,
     decoder: SseDecoder,
@@ -143,6 +158,10 @@ pub(super) struct EventStreamSink {
     finished: bool,
     /// `[DONE]`, counted for [`TerminalRule::ChatCompletions`] only.
     done: bool,
+    /// Checks a strict Responses body as it arrives.
+    observer: Option<StrictResponsesObserver>,
+    /// The observer settled the body or rejected it.
+    settled: bool,
 }
 
 impl EventStreamSink {
@@ -155,6 +174,21 @@ impl EventStreamSink {
             rule,
             finished: false,
             done: false,
+            observer: None,
+            settled: false,
+        }
+    }
+
+    /// A [`TerminalRule::Responses`] sink that also feeds every chunk to
+    /// `observer`, so the read ends where the streaming path ends: at the
+    /// frame where the translator closes the message by itself or the
+    /// upstream reports a failure, the body is kept up to the end of that
+    /// frame and settled; at a frame the strict policy rejects, the body
+    /// read so far is settled, and translating it gives the same error.
+    pub(super) fn observed(observer: StrictResponsesObserver) -> Self {
+        Self {
+            observer: Some(observer),
+            ..Self::new(TerminalRule::Responses)
         }
     }
 
@@ -162,7 +196,8 @@ impl EventStreamSink {
     /// being received is left out, as the streaming path discards it; the
     /// translators would otherwise reject the body as cut off. After
     /// [`ReadEnd::Closed`] the body is passed whole, so a frame the upstream
-    /// cut off stays an error.
+    /// cut off stays an error. After [`ReadEnd::Settled`] it is the body the
+    /// sink settled.
     pub(super) fn into_body(self, end: ReadEnd) -> Vec<u8> {
         let mut bytes = self.bytes;
         if end == ReadEnd::ReadLimit {
@@ -206,6 +241,19 @@ impl BufferedSink for EventStreamSink {
                     }),
             };
         }
+        if let Some(observer) = self.observer.as_mut() {
+            match observer.push(chunk) {
+                Ok(ObservedChunk::Reading) => {}
+                Ok(ObservedChunk::Settled { at }) => {
+                    let chunk_start = self.bytes.len() - chunk.len();
+                    self.bytes.truncate(chunk_start + at);
+                    self.settled = true;
+                }
+                // The translator reports the same error from the body read
+                // so far, sanitised like every other translator error.
+                Err(_) => self.settled = true,
+            }
+        }
         Ok(())
     }
 
@@ -214,6 +262,10 @@ impl BufferedSink for EventStreamSink {
             TerminalRule::Responses => usize::from(self.finished),
             TerminalRule::ChatCompletions => usize::from(self.finished) + usize::from(self.done),
         }
+    }
+
+    fn is_settled(&self) -> bool {
+        self.settled
     }
 }
 

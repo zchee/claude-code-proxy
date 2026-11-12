@@ -18,7 +18,7 @@ use crate::providers::opencode::chat::{ReceivePolicy, StreamLabels, StreamWiring
 use crate::providers::opencode::responses as translator;
 
 use super::BufferedCapture;
-use super::buffered::{BufferedFailure, EventStreamSink, TerminalRule, read_upstream};
+use super::buffered::{BufferedFailure, EventStreamSink, read_upstream};
 use super::client::{OpenApiPath, VertexError, VertexTarget};
 use super::models::{Family, ResolvedModel, ResponsesRoute};
 use super::translate::stream::Sanitizer;
@@ -196,6 +196,15 @@ where
 /// Reads the whole upstream Responses stream with the shared buffered
 /// limits and translates it into one Anthropic message.
 ///
+/// Every chunk is checked as it arrives, with the strict frame rules. The
+/// read stops at once, without polling the upstream again, where the
+/// streaming path stops: when the translator closes the message by itself
+/// (it repairs a `Read` call whose arguments stalled on whitespace), the
+/// message ends there, whatever the upstream sends afterwards, a broken
+/// connection included; an upstream failure event, a frame that is not
+/// readable or not JSON, an unlisted event type or an event after the
+/// completion is the error at once, even while the upstream stays open.
+///
 /// # Errors
 ///
 /// The read fails ([`BufferedFailure::Read`]), or the body is not a
@@ -211,7 +220,7 @@ pub(super) async fn read_response<S, E>(
 where
     S: Stream<Item = Result<Bytes, E>>,
 {
-    let mut sink = EventStreamSink::new(TerminalRule::Responses);
+    let mut sink = EventStreamSink::observed(translator::StrictResponsesObserver::new(LABELS));
     let end = read_upstream(upstream, &mut sink, sanitize, capture)
         .await
         .map_err(BufferedFailure::Read)?;
@@ -836,5 +845,199 @@ mod tests {
             error.to_string(),
             "Vertex AI Responses stream is invalid: incomplete_stream"
         );
+    }
+
+    fn read_call_added() -> String {
+        frame(json!({
+            "type":"response.output_item.added",
+            "output_index":0,
+            "item":{"type":"function_call","call_id":"call_1","name":"Read"}
+        }))
+    }
+
+    /// A `Read` argument delta that ends in 1,024 spaces, which the
+    /// translator repairs into a finished tool call.
+    fn stalled_read_delta() -> String {
+        frame(json!({
+            "type":"response.function_call_arguments.delta",
+            "output_index":0,
+            "delta":format!("{{\"file_path\":\"/tmp/a\"}}{}", " ".repeat(1024)),
+        }))
+    }
+
+    /// `items`, then `after` (an endless repetition of one chunk, or an
+    /// upstream left open when `None`), and the count of items handed out.
+    fn synthetic_counted_upstream(
+        items: Vec<Result<Bytes, std::io::Error>>,
+        after: Option<String>,
+    ) -> (
+        impl Stream<Item = Result<Bytes, std::io::Error>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&pulled);
+        let tail: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+            match after {
+                Some(part) => Box::pin(stream::repeat_with(move || Ok(Bytes::from(part.clone())))),
+                None => Box::pin(stream::pending()),
+            };
+        let upstream = stream::iter(items).chain(tail).inspect(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        (upstream, pulled)
+    }
+
+    fn assert_repaired_read(message: &Value, case: &str) {
+        assert_eq!(message["stop_reason"], "tool_use", "{case}: {message}");
+        let tool_use = message["content"]
+            .as_array()
+            .and_then(|blocks| blocks.iter().find(|block| block["type"] == "tool_use"))
+            .unwrap_or_else(|| panic!("{case}: {message}"));
+        assert_eq!(tool_use["name"], "Read", "{case}");
+        assert_eq!(tool_use["input"], json!({"file_path": "/tmp/a"}), "{case}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_synthetic_settles_at_a_repaired_read_call_without_reading_on() {
+        let whitespace = frame(json!({
+            "type":"response.function_call_arguments.delta",
+            "output_index":0,
+            "delta":"    ",
+        }));
+        let repaired = format!("{}{}", read_call_added(), stalled_read_delta());
+        for (case, parts, after) in [
+            (
+                "repair in one item, whitespace keeps coming",
+                vec![repaired.clone()],
+                Some(whitespace.clone()),
+            ),
+            (
+                "repair over two items, whitespace keeps coming",
+                vec![read_call_added(), stalled_read_delta()],
+                Some(whitespace.clone()),
+            ),
+            (
+                "repair, then the upstream stays open",
+                vec![repaired.clone()],
+                None,
+            ),
+        ] {
+            let count = parts.len();
+            let (upstream, pulled) = synthetic_counted_upstream(chunks(parts), after);
+            let started = tokio::time::Instant::now();
+            let message = tokio::time::timeout(
+                Duration::from_secs(60),
+                read_response(
+                    upstream,
+                    "msg_synthetic",
+                    "vertex/openai/gpt-6.1-sol",
+                    &sanitizer(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{case}: the read did not settle at the repair"))
+            .unwrap_or_else(|failure| panic!("{case}: {}", failure.kind()));
+            assert_eq!(started.elapsed(), Duration::ZERO, "{case}");
+            assert_repaired_read(&message, case);
+            assert_eq!(
+                pulled.load(std::sync::atomic::Ordering::SeqCst),
+                count,
+                "{case}: the upstream was read after the repair"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_synthetic_a_broken_connection_after_a_repaired_read_call_is_not_read() {
+        let mut parts = chunks(vec![read_call_added(), stalled_read_delta()]);
+        parts.push(Err(std::io::Error::other("synthetic reset")));
+        let message = read_response(
+            stream::iter(parts),
+            "msg_synthetic",
+            "vertex/xai/grok-4.7",
+            &sanitizer(),
+            None,
+        )
+        .await
+        .unwrap_or_else(|failure| panic!("the repaired call is the message: {}", failure.kind()));
+        assert_repaired_read(&message, "repair, then a broken connection");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_synthetic_a_failure_or_rejected_frame_ends_the_read_while_the_upstream_stays_open()
+     {
+        let failed = frame(json!({
+            "type":"response.failed",
+            "response":{"status":"failed","error":{"code":"server_error","message":format!("saw {SYNTHETIC_TOKEN}")}}
+        }));
+        let late =
+            frame(json!({"type":"response.output_text.delta","output_index":0,"delta":"late"}));
+        let mut after_completion = text_wire();
+        after_completion.push(completed());
+        after_completion.push(late);
+        let mut unlisted = text_wire();
+        unlisted.insert(
+            2,
+            frame(json!({"type":"response.audio.delta","delta":"AA=="})),
+        );
+        let mut malformed = text_wire();
+        malformed.push("data: {not json\n\n".to_string());
+        let cases = [
+            ("upstream failure", vec![failed], None),
+            (
+                "unlisted event type",
+                unlisted,
+                Some("Vertex AI Responses stream is invalid: unlisted_event_type"),
+            ),
+            (
+                "event after the completion",
+                after_completion,
+                Some("Vertex AI Responses stream is invalid: event_after_completion"),
+            ),
+            (
+                "malformed event",
+                malformed,
+                Some("Vertex AI Responses stream is invalid: malformed_event"),
+            ),
+        ];
+        for (case, parts, expected) in cases {
+            let count = parts.len();
+            let (upstream, pulled) = synthetic_counted_upstream(chunks(parts), None);
+            let started = tokio::time::Instant::now();
+            let failure = tokio::time::timeout(
+                Duration::from_secs(60),
+                read_response(
+                    upstream,
+                    "msg_synthetic",
+                    "vertex/openai/gpt-6.1-sol",
+                    &sanitizer(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{case}: the read waited for the upstream to close"))
+            .expect_err(case);
+            assert_eq!(started.elapsed(), Duration::ZERO, "{case}");
+            assert_eq!(
+                pulled.load(std::sync::atomic::Ordering::SeqCst),
+                count,
+                "{case}"
+            );
+            let BufferedFailure::Translate(error) = failure else {
+                panic!(
+                    "{case}: expected a translation failure, got {}",
+                    failure.kind()
+                );
+            };
+            let text = error.to_string();
+            match expected {
+                Some(expected) => assert_eq!(text, expected, "{case}"),
+                None => {
+                    assert!(text.contains("[redacted]"), "{case}: {text}");
+                    assert!(!text.contains(SYNTHETIC_TOKEN), "{case}: {text}");
+                }
+            }
+        }
     }
 }
