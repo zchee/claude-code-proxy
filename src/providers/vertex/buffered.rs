@@ -36,6 +36,15 @@ pub(super) trait BufferedSink {
     fn is_settled(&self) -> bool {
         false
     }
+
+    /// How many leading bytes of `chunk` belong to the body, decided
+    /// before the chunk is counted, recorded or pushed. Only those bytes
+    /// are counted against [`MAX_BUFFERED_RESPONSE_BYTES`], recorded in the
+    /// capture and passed to [`Self::push`]; the rest of the chunk is not
+    /// part of the response. By default every byte belongs to it.
+    fn accept(&mut self, chunk: &[u8]) -> usize {
+        chunk.len()
+    }
 }
 
 /// Why a non-streaming response could not be produced.
@@ -75,14 +84,15 @@ pub(super) enum ReadEnd {
 /// sink settles the body, or until [`POST_TERMINAL_READ_LIMIT`] has passed
 /// since the sink's last terminal event. Before any terminal event there is
 /// no deadline: a model may think for a long time before it sends anything.
-/// Each chunk is recorded in `capture` before the sink sees it. When the
-/// read ends the upstream is dropped.
+/// Of each chunk, the bytes the sink accepts ([`BufferedSink::accept`]) are
+/// counted against the cap and recorded in `capture` before the sink sees
+/// them. When the read ends the upstream is dropped.
 ///
 /// # Errors
 ///
 /// A broken connection gives [`StreamError::Transport`]; more than
-/// [`MAX_BUFFERED_RESPONSE_BYTES`] gives [`StreamError::Malformed`]; a
-/// sink error is returned as it is.
+/// [`MAX_BUFFERED_RESPONSE_BYTES`] of accepted bytes gives
+/// [`StreamError::Malformed`]; a sink error is returned as it is.
 pub(super) async fn read_upstream<S, E, K>(
     upstream: S,
     sink: &mut K,
@@ -120,6 +130,8 @@ where
             Some(Err(_)) => return Err(StreamError::Transport),
             None => return Ok(ReadEnd::Closed),
         };
+        let accepted = sink.accept(&chunk);
+        let chunk = chunk.slice(..accepted.min(chunk.len()));
         read = read.saturating_add(chunk.len());
         if read > MAX_BUFFERED_RESPONSE_BYTES {
             return Err(StreamError::Malformed("the response exceeds 16 MiB"));
@@ -162,6 +174,8 @@ pub(super) struct EventStreamSink {
     observer: Option<StrictResponsesObserver>,
     /// The observer settled the body or rejected it.
     settled: bool,
+    /// The observer rejected a frame of the chunk it accepted last.
+    rejected: bool,
 }
 
 impl EventStreamSink {
@@ -176,15 +190,20 @@ impl EventStreamSink {
             done: false,
             observer: None,
             settled: false,
+            rejected: false,
         }
     }
 
     /// A [`TerminalRule::Responses`] sink that also feeds every chunk to
-    /// `observer`, so the read ends where the streaming path ends: at the
-    /// frame where the translator closes the message by itself or the
-    /// upstream reports a failure, the body is kept up to the end of that
-    /// frame and settled; at a frame the strict policy rejects, the body
-    /// read so far is settled, and translating it gives the same error.
+    /// `observer` before anything else reads it, so the read ends where the
+    /// streaming path ends: at the frame where the translator closes the
+    /// message by itself or the upstream reports a failure, only the bytes
+    /// up to the end of that frame are accepted, kept and decoded, and the
+    /// body is settled; whatever follows in the same chunk is neither
+    /// counted against the cap nor checked. At a frame the strict policy
+    /// rejects, the whole chunk is kept without being decoded again and the
+    /// body is settled; translating it gives the observer's error, which
+    /// the bytes after the rejected frame cannot change.
     pub(super) fn observed(observer: StrictResponsesObserver) -> Self {
         Self {
             observer: Some(observer),
@@ -209,8 +228,31 @@ impl EventStreamSink {
 }
 
 impl BufferedSink for EventStreamSink {
+    fn accept(&mut self, chunk: &[u8]) -> usize {
+        let Some(observer) = self.observer.as_mut() else {
+            return chunk.len();
+        };
+        match observer.push(chunk) {
+            Ok(ObservedChunk::Reading) => chunk.len(),
+            Ok(ObservedChunk::Settled { at }) => {
+                self.settled = true;
+                at
+            }
+            // The translator reports the same error from the body read
+            // so far, sanitised like every other translator error.
+            Err(_) => {
+                self.settled = true;
+                self.rejected = true;
+                chunk.len()
+            }
+        }
+    }
+
     fn push(&mut self, chunk: &[u8]) -> Result<(), StreamError> {
         self.bytes.extend_from_slice(chunk);
+        if self.rejected {
+            return Ok(());
+        }
         let events = self
             .decoder
             .push(chunk)
@@ -240,19 +282,6 @@ impl BufferedSink for EventStreamSink {
                         })
                     }),
             };
-        }
-        if let Some(observer) = self.observer.as_mut() {
-            match observer.push(chunk) {
-                Ok(ObservedChunk::Reading) => {}
-                Ok(ObservedChunk::Settled { at }) => {
-                    let chunk_start = self.bytes.len() - chunk.len();
-                    self.bytes.truncate(chunk_start + at);
-                    self.settled = true;
-                }
-                // The translator reports the same error from the body read
-                // so far, sanitised like every other translator error.
-                Err(_) => self.settled = true,
-            }
         }
         Ok(())
     }

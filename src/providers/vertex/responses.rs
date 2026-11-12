@@ -1066,4 +1066,119 @@ mod tests {
             }
         }
     }
+
+    /// What may follow a settling frame in the same upstream item: bytes
+    /// that are not UTF-8, a frame over the decoder's 1 MiB frame limit,
+    /// and comment frames that take the item over the 16 MiB cap.
+    fn synthetic_suffixes() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("bytes that are not UTF-8", b"data: \xff\xfe\n\n".to_vec()),
+            (
+                "a frame over the frame limit",
+                format!("data: {}\n\n", "x".repeat(1024 * 1024 + 1)).into_bytes(),
+            ),
+            (
+                "comment frames past the 16 MiB cap",
+                ":\n\n".repeat(6 * 1024 * 1024).into_bytes(),
+            ),
+        ]
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_synthetic_a_repaired_read_call_ignores_what_follows_in_any_split() {
+        let repaired = format!("{}{}", read_call_added(), stalled_read_delta()).into_bytes();
+        for (suffix_name, suffix) in synthetic_suffixes() {
+            let same_item = [repaired.as_slice(), suffix.as_slice()].concat();
+            for (split, items) in [
+                ("in the same item", vec![same_item]),
+                ("in the next item", vec![repaired.clone(), suffix.clone()]),
+            ] {
+                let case = format!("{suffix_name} {split}");
+                let items = items
+                    .into_iter()
+                    .map(|item| Ok(Bytes::from(item)))
+                    .collect();
+                let (upstream, pulled) = synthetic_counted_upstream(items, None);
+                let started = tokio::time::Instant::now();
+                let message = tokio::time::timeout(
+                    Duration::from_secs(60),
+                    read_response(
+                        upstream,
+                        "msg_synthetic",
+                        "vertex/openai/gpt-6.1-sol",
+                        &sanitizer(),
+                        None,
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{case}: the read did not settle at the repair"))
+                .unwrap_or_else(|failure| panic!("{case}: {}", failure.kind()));
+                assert_eq!(started.elapsed(), Duration::ZERO, "{case}");
+                assert_repaired_read(&message, &case);
+                assert_eq!(
+                    pulled.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "{case}: the upstream was read after the repair"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_synthetic_a_rejected_frame_stays_the_error_whatever_follows_in_its_item() {
+        let mut unlisted = text_wire();
+        unlisted.insert(
+            2,
+            frame(json!({"type":"response.audio.delta","delta":"AA=="})),
+        );
+        let rejected = unlisted.concat().into_bytes();
+        for (suffix_name, suffix) in synthetic_suffixes() {
+            let over_cap = suffix.len() > 16 * 1024 * 1024;
+            let item = [rejected.as_slice(), suffix.as_slice()].concat();
+            let (upstream, pulled) = synthetic_counted_upstream(vec![Ok(Bytes::from(item))], None);
+            let failure = tokio::time::timeout(
+                Duration::from_secs(60),
+                read_response(
+                    upstream,
+                    "msg_synthetic",
+                    "vertex/openai/gpt-6.1-sol",
+                    &sanitizer(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{suffix_name}: the read waited for the upstream"))
+            .expect_err(suffix_name);
+            assert_eq!(
+                pulled.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{suffix_name}"
+            );
+            if over_cap {
+                // A rejected item is kept whole, so the cap counts all of it.
+                assert!(
+                    matches!(
+                        failure,
+                        BufferedFailure::Read(StreamError::Malformed(
+                            "the response exceeds 16 MiB"
+                        ))
+                    ),
+                    "{suffix_name}: {}",
+                    failure.kind()
+                );
+                continue;
+            }
+            let BufferedFailure::Translate(error) = failure else {
+                panic!(
+                    "{suffix_name}: expected a translation failure, got {}",
+                    failure.kind()
+                );
+            };
+            assert_eq!(
+                error.to_string(),
+                "Vertex AI Responses stream is invalid: unlisted_event_type",
+                "{suffix_name}"
+            );
+        }
+    }
 }
