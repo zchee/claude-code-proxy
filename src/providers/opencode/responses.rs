@@ -6,6 +6,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 
 use crate::anthropic::schema::MessagesRequest;
+use crate::anthropic::sse::SseEvent;
 use crate::monitor::{MonitorHandle, usage_from_anthropic_sse};
 use crate::providers::codex::translate::{
     IncompleteResponsePolicy, accumulate::accumulate_response_with_policy,
@@ -15,7 +16,8 @@ use crate::providers::grok::translate::stream::SseDecoder;
 use crate::traffic::{StreamTrafficCapture, TrafficCapture};
 
 use super::chat::{
-    ReceiveContext, StreamLabels, StreamWiring, TerminalPolicy, UpstreamStream, box_upstream,
+    FrameScanner, POST_TERMINAL_MAX_BYTES, ReceiveContext, StreamLabels, StreamWiring,
+    TerminalPolicy, UpstreamStream, box_upstream,
 };
 use super::client::{OpenCodeError, OpenCodeResponse};
 
@@ -96,12 +98,19 @@ pub fn accumulate_response(
 }
 
 /// [`accumulate_response`] with the labels and receive policy of `wiring`.
-/// The whole body is already read, so
-/// [`super::chat::POST_TERMINAL_READ_LIMIT`] is the reader's to apply.
+/// The error goes through [`super::chat::ReceivePolicy::sanitize`].
+///
+/// `upstream` is the whole body, already read, so the caller that read it
+/// owns [`super::chat::POST_TERMINAL_READ_LIMIT`]. When that limit ended the
+/// read, the caller passes [`super::chat::complete_frames_prefix`] of what
+/// it read, dropping a frame the limit cut off; when the upstream closed the
+/// body, the caller passes it whole, and a partial frame at its end is an
+/// error.
+///
 /// Under [`TerminalPolicy::Strict`] every frame is checked as the
-/// streaming path checks it before the body is translated, and any event
-/// after the completion, `ping` included, is an error. The error goes
-/// through [`super::chat::ReceivePolicy::sanitize`].
+/// streaming path checks it before the body is translated: any event after
+/// the completion, `ping` included, is an error, and so is more than
+/// [`POST_TERMINAL_MAX_BYTES`] after the end of the completion's frame.
 ///
 /// # Errors
 ///
@@ -135,34 +144,49 @@ fn check_buffered_frames(upstream: &[u8], labels: &StreamLabels) -> anyhow::Resu
     let invalid =
         |kind: &str| anyhow::anyhow!("{} Responses stream is invalid: {kind}", labels.provider);
     let mut decoder = SseDecoder::default();
-    let events = decoder
-        .push(upstream)
-        .map_err(|_| invalid("malformed_sse"))?;
-    decoder.finish().map_err(|_| invalid("incomplete_stream"))?;
+    let mut frames = FrameScanner::default();
     let mut completed = false;
     let mut done_seen = false;
-    for event in events {
-        let data = event.data.trim();
-        if data == "[DONE]" {
-            if !completed || done_seen {
-                return Err(invalid("premature_done"));
-            }
-            done_seen = true;
+    let mut start = 0;
+    for end in frames
+        .frame_ends(upstream)
+        .into_iter()
+        .chain([upstream.len()])
+    {
+        if end == start {
             continue;
         }
-        if completed {
-            return Err(invalid("event_after_completion"));
+        let events = decoder
+            .push(&upstream[start..end])
+            .map_err(|_| invalid("malformed_sse"))?;
+        start = end;
+        for event in events {
+            let data = event.data.trim();
+            if data == "[DONE]" {
+                if !completed || done_seen {
+                    return Err(invalid("premature_done"));
+                }
+                done_seen = true;
+                continue;
+            }
+            if completed {
+                return Err(invalid("event_after_completion"));
+            }
+            let value: serde_json::Value =
+                serde_json::from_str(data).map_err(|_| invalid("malformed_event"))?;
+            if let Some(kind) = unlisted_frame(&value) {
+                return Err(invalid(kind));
+            }
+            completed = value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|event_type| TERMINAL_EVENT_TYPES.contains(&event_type));
+            if completed && upstream.len() - end > POST_TERMINAL_MAX_BYTES {
+                return Err(invalid("post_terminal_limit"));
+            }
         }
-        let value: serde_json::Value =
-            serde_json::from_str(data).map_err(|_| invalid("malformed_event"))?;
-        if let Some(kind) = unlisted_frame(&value) {
-            return Err(invalid(kind));
-        }
-        completed = value
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|event_type| TERMINAL_EVENT_TYPES.contains(&event_type));
     }
+    decoder.finish().map_err(|_| invalid("incomplete_stream"))?;
     Ok(())
 }
 
@@ -323,8 +347,16 @@ where
             }
             self.bytes = self.bytes.saturating_add(chunk.len() as u64);
             self.chunks = self.chunks.saturating_add(1);
-            if after_terminal && context.exceeds_post_terminal_bytes(chunk.len()) {
-                return Some(self.fail_at("protocol", "post_terminal_limit", context));
+            if context.is_strict() {
+                match self.strict_chunk(&chunk, context) {
+                    Ok(output) if output.is_empty() => continue,
+                    Ok(output) => {
+                        self.record_progress(&output);
+                        self.capture_downstream(&output);
+                        return Some(output);
+                    }
+                    Err((stage, kind)) => return Some(self.fail_at(stage, kind, context)),
+                }
             }
 
             let events = match self.decoder.push(&chunk) {
@@ -357,15 +389,10 @@ where
                 }
                 let event_type = value.get("type").and_then(serde_json::Value::as_str);
                 if self.pending_completion.is_some() {
-                    if event_type == Some("ping") && !context.is_strict() {
+                    if event_type == Some("ping") {
                         continue;
                     }
                     return Some(self.fail_at("protocol", "event_after_completion", context));
-                }
-                if context.is_strict()
-                    && let Some(kind) = unlisted_frame(&value)
-                {
-                    return Some(self.fail_at("protocol", kind, context));
                 }
                 if matches!(
                     event_type,
@@ -387,6 +414,89 @@ where
                 return Some(output);
             }
         }
+    }
+
+    /// Handles one chunk of a strict stream a frame at a time. The bytes after
+    /// the completion's frame are charged to [`POST_TERMINAL_MAX_BYTES`] by
+    /// position, so a tail counts the same in the completion's chunk as in
+    /// later ones.
+    fn strict_chunk(
+        &mut self,
+        chunk: &[u8],
+        context: &mut ReceiveContext,
+    ) -> Result<Vec<u8>, (&'static str, &'static str)> {
+        let mut terminal = self.pending_completion.is_some();
+        if terminal && context.exceeds_post_terminal_bytes(chunk.len()) {
+            return Err(("protocol", "post_terminal_limit"));
+        }
+        let mut output = Vec::new();
+        let mut start = 0;
+        for end in context.frame_ends(chunk).into_iter().chain([chunk.len()]) {
+            if end == start {
+                continue;
+            }
+            let events = self
+                .decoder
+                .push(&chunk[start..end])
+                .map_err(|_| ("decoder", "malformed_sse"))?;
+            start = end;
+            for event in events {
+                self.strict_event(&event, context, &mut output)?;
+            }
+            if !terminal && self.pending_completion.is_some() {
+                terminal = true;
+                if context.exceeds_post_terminal_bytes(chunk.len() - end) {
+                    return Err(("protocol", "post_terminal_limit"));
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    /// One frame of a strict stream: a `type` from neither list is an error,
+    /// and after the completion only one `[DONE]` is accepted.
+    fn strict_event(
+        &mut self,
+        event: &SseEvent,
+        context: &ReceiveContext,
+        output: &mut Vec<u8>,
+    ) -> Result<(), (&'static str, &'static str)> {
+        let data = event.data.trim();
+        if data == "[DONE]" {
+            if self.pending_completion.is_none() || self.done_seen {
+                return Err(("protocol", "premature_done"));
+            }
+            self.done_seen = true;
+            if let Some(capture) = self.stream_capture.as_mut() {
+                capture.upstream_event(event.event.as_deref(), &serde_json::json!("[DONE]"));
+            }
+            return Ok(());
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(data).map_err(|_| ("json", "malformed_event"))?;
+        if let Some(capture) = self.stream_capture.as_mut() {
+            capture.upstream_event(
+                event.event.as_deref(),
+                &context.wiring.receive.upstream_value(&value),
+            );
+        }
+        if self.pending_completion.is_some() {
+            return Err(("protocol", "event_after_completion"));
+        }
+        if let Some(kind) = unlisted_frame(&value) {
+            return Err(("protocol", kind));
+        }
+        let event_type = value.get("type").and_then(serde_json::Value::as_str);
+        if event_type.is_some_and(|event_type| TERMINAL_EVENT_TYPES.contains(&event_type)) {
+            self.pending_completion = Some(value);
+            return Ok(());
+        }
+        let translated = self
+            .translator
+            .accept(&value, self.traffic.as_deref())
+            .map_err(|_| ("translation", "invalid_event"))?;
+        output.extend(translated);
+        Ok(())
     }
 
     /// Translates the held completion once the upstream closed or, for a
@@ -894,5 +1004,56 @@ mod tests {
             .to_string();
         assert!(error.contains("[redacted]"), "{error}");
         assert!(!error.contains("SECRET-123"), "{error}");
+    }
+
+    /// Exactly `16 * 1024 * 1024` bytes of 1024-byte comment frames. They
+    /// carry no event, so only the byte limit can stop them.
+    fn synthetic_comment_tail_of_sixteen_mib() -> String {
+        let frame = format!(": {}\n\n", "x".repeat(1020));
+        assert_eq!(frame.len(), 1024);
+        let tail = frame.repeat(16 * 1024);
+        assert_eq!(tail.len(), 16 * 1024 * 1024);
+        tail
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_charges_the_tail_after_the_completion_by_position() {
+        let at_limit = synthetic_comment_tail_of_sixteen_mib();
+        let over_limit = format!("{at_limit}\n");
+        for (tail, accepted) in [(at_limit.as_str(), true), (over_limit.as_str(), false)] {
+            let wire = format!("{COMPLETION}{tail}");
+            let terminal_end = COMPLETION.len();
+            let inside_tail = terminal_end + 4096 + 7;
+            for parts in [
+                vec![wire.as_str()],
+                vec![&wire[..terminal_end], &wire[terminal_end..]],
+                vec![&wire[..inside_tail], &wire[inside_tail..]],
+            ] {
+                let upstream = futures_util::stream::iter(chunks(&parts));
+                let text = body_text(strict_body(upstream)).await;
+                let case = format!("{} tail bytes in {} items", tail.len(), parts.len());
+                assert_eq!(text.contains("message_stop"), accepted, "{case}");
+                assert_eq!(text.contains(INVALID), !accepted, "{case}");
+            }
+            let buffered =
+                accumulate_response_with(wire.as_bytes(), "msg", "model", &strict_wiring());
+            assert_eq!(
+                buffered.is_ok(),
+                accepted,
+                "{} tail bytes: {buffered:?}",
+                tail.len()
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_waits_exactly_two_seconds_after_the_completion() {
+        let upstream = futures_util::stream::iter(chunks(&[COMPLETION]))
+            .chain(futures_util::stream::pending());
+        let started = tokio::time::Instant::now();
+        let text = body_text(strict_body(upstream)).await;
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(2));
+        assert!(text.contains("message_stop"), "{text}");
+        assert!(!text.contains("api_error"), "{text}");
     }
 }

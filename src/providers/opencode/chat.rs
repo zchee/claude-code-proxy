@@ -178,6 +178,7 @@ pub(super) struct ReceiveContext {
     pub(super) wiring: StreamWiring,
     read_deadline: Option<tokio::time::Instant>,
     post_terminal_bytes: usize,
+    frames: FrameScanner,
 }
 
 impl ReceiveContext {
@@ -186,6 +187,7 @@ impl ReceiveContext {
             wiring,
             read_deadline: None,
             post_terminal_bytes: 0,
+            frames: FrameScanner::default(),
         }
     }
 
@@ -227,6 +229,79 @@ impl ReceiveContext {
         self.post_terminal_bytes = self.post_terminal_bytes.saturating_add(len);
         self.post_terminal_bytes > POST_TERMINAL_MAX_BYTES
     }
+
+    /// The offsets in `chunk` just after each byte that ends an SSE frame,
+    /// carried across the chunks of one stream. A strict stream feeds every
+    /// chunk through here and through its decoder, so the two agree.
+    pub(super) fn frame_ends(&mut self, chunk: &[u8]) -> Vec<usize> {
+        self.frames.frame_ends(chunk)
+    }
+}
+
+/// Finds where SSE frames end the way [`SseDecoder`] does: a line ends at
+/// LF, CR or CRLF, and an empty line ends the frame.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FrameScanner {
+    line_empty: bool,
+    skip_lf: bool,
+}
+
+impl Default for FrameScanner {
+    fn default() -> Self {
+        Self {
+            line_empty: true,
+            skip_lf: false,
+        }
+    }
+}
+
+impl FrameScanner {
+    /// The offset just after each byte of `chunk` that ends a frame: the
+    /// line ending of an empty line. The LF of a CRLF that ends a frame
+    /// comes after that offset, as the decoder ends the line at the CR.
+    pub(super) fn frame_ends(&mut self, chunk: &[u8]) -> Vec<usize> {
+        let mut ends = Vec::new();
+        for (index, &byte) in chunk.iter().enumerate() {
+            if std::mem::take(&mut self.skip_lf) && byte == b'\n' {
+                continue;
+            }
+            match byte {
+                b'\n' | b'\r' => {
+                    if self.line_empty {
+                        ends.push(index + 1);
+                    }
+                    self.line_empty = true;
+                    self.skip_lf = byte == b'\r';
+                }
+                _ => self.line_empty = false,
+            }
+        }
+        ends
+    }
+}
+
+/// The part of `input` up to the end of its last complete SSE frame, the
+/// empty line that ends it included (both bytes of a CRLF). What follows,
+/// a frame or a line that has not ended, is left out; input that ends where
+/// a frame ends comes back whole, and input with no complete frame gives an
+/// empty slice.
+///
+/// A caller that reads a buffered body itself and stops reading at
+/// [`POST_TERMINAL_READ_LIMIT`] passes what it read through this before
+/// [`accumulate_response_with`] or
+/// [`super::responses::accumulate_response_with`], so a frame the limit
+/// cut off is dropped as the streaming path drops it. A body that ended
+/// cleanly is passed whole: a partial frame at its end is an error.
+pub fn complete_frames_prefix(input: &[u8]) -> &[u8] {
+    let Some(&end) = FrameScanner::default().frame_ends(input).last() else {
+        return &input[..0];
+    };
+    let end = if input[end - 1] == b'\r' && input.get(end) == Some(&b'\n') {
+        end + 1
+    } else {
+        end
+    };
+    &input[..end]
 }
 
 /// How [`prepare_request_with`] treats reasoning. [`Default`] is OpenCode
@@ -1398,10 +1473,18 @@ pub fn accumulate_response(input: &[u8], message_id: &str, model: &str) -> anyho
 }
 
 /// [`accumulate_response`] with the labels and receive policy of `wiring`.
-/// The whole body is already read, so [`POST_TERMINAL_READ_LIMIT`] is the
-/// reader's to apply; under [`TerminalPolicy::Strict`] any event after
-/// `[DONE]` in `input` is an error. The error goes through
-/// [`ReceivePolicy::sanitize`].
+/// The error goes through [`ReceivePolicy::sanitize`].
+///
+/// `input` is the whole body, already read, so the caller that read it owns
+/// [`POST_TERMINAL_READ_LIMIT`]. When that limit ended the read, the caller
+/// passes [`complete_frames_prefix`] of what it read, dropping a frame the
+/// limit cut off; when the upstream closed the body, the caller passes it
+/// whole, and a partial frame at its end is an error.
+///
+/// Under [`TerminalPolicy::Strict`] the same rules hold as on the streaming
+/// path: any event after `[DONE]` is an error, and so is more than
+/// [`POST_TERMINAL_MAX_BYTES`] after the end of the frame that carried the
+/// first `finish_reason` or `[DONE]`.
 ///
 /// # Errors
 ///
@@ -1418,11 +1501,40 @@ pub fn accumulate_response_with(
         wiring.labels,
         wiring.receive.terminal,
     );
-    let result = translator
-        .push(input)
-        .and_then(|_| translator.finish())
+    let pushed = if wiring.receive.is_strict() {
+        push_buffered_strict(&mut translator, input)
+    } else {
+        translator.push(input).map(drop)
+    };
+    let result = pushed
+        .and_then(|()| translator.finish())
         .and_then(|_| translator.state.response());
     result.map_err(|error| wiring.receive.upstream_error(error))
+}
+
+/// Pushes a strict buffered body one frame at a time, so the bytes after
+/// the terminal frame are counted from where it ends.
+fn push_buffered_strict(translator: &mut LiveStreamTranslator, input: &[u8]) -> anyhow::Result<()> {
+    let mut frames = FrameScanner::default();
+    let mut terminal = false;
+    let mut start = 0;
+    for end in frames.frame_ends(input).into_iter().chain([input.len()]) {
+        if end == start {
+            continue;
+        }
+        translator.push(&input[start..end])?;
+        start = end;
+        if !terminal && translator.is_terminal() {
+            terminal = true;
+            if input.len() - end > POST_TERMINAL_MAX_BYTES {
+                anyhow::bail!(
+                    "{} stream sent more than {POST_TERMINAL_MAX_BYTES} bytes after its terminal event",
+                    translator.state.provider
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn stream_error(message: &str) -> Vec<u8> {
@@ -1607,18 +1719,17 @@ where
             self.bytes = self.bytes.saturating_add(chunk.len() as u64);
             self.chunks = self.chunks.saturating_add(1);
             self.capture_upstream(&chunk, context);
-            if after_terminal && context.exceeds_post_terminal_bytes(chunk.len()) {
-                return Some(self.fail_at("protocol", "post_terminal_limit", context));
-            }
-
-            let done_before = self.translator.has_seen_done();
-            let output = match self.translator.push(&chunk) {
-                Ok(output) => output,
-                Err(_) => return Some(self.fail_at("translation", "invalid_event", context)),
+            let output = if context.is_strict() {
+                match self.push_strict(&chunk, context) {
+                    Ok(output) => output,
+                    Err((stage, kind)) => return Some(self.fail_at(stage, kind, context)),
+                }
+            } else {
+                match self.translator.push(&chunk) {
+                    Ok(output) => output,
+                    Err(_) => return Some(self.fail_at("translation", "invalid_event", context)),
+                }
             };
-            if !done_before && self.translator.has_seen_done() {
-                context.restart_read_window();
-            }
             if !output.is_empty() {
                 self.report_progress(&output);
                 self.capture_downstream(&output);
@@ -1635,6 +1746,44 @@ where
                 return Some(output);
             }
         }
+    }
+
+    /// Pushes a chunk of a strict stream one frame at a time. The bytes after
+    /// the frame that made the stream terminal are charged to
+    /// [`POST_TERMINAL_MAX_BYTES`] by position, so a tail counts the same in
+    /// the terminal frame's chunk as in later ones.
+    fn push_strict(
+        &mut self,
+        chunk: &[u8],
+        context: &mut ReceiveContext,
+    ) -> Result<Vec<u8>, (&'static str, &'static str)> {
+        let mut terminal = self.translator.is_terminal();
+        if terminal && context.exceeds_post_terminal_bytes(chunk.len()) {
+            return Err(("protocol", "post_terminal_limit"));
+        }
+        let mut output = Vec::new();
+        let mut start = 0;
+        for end in context.frame_ends(chunk).into_iter().chain([chunk.len()]) {
+            if end == start {
+                continue;
+            }
+            let done_before = self.translator.has_seen_done();
+            match self.translator.push(&chunk[start..end]) {
+                Ok(translated) => output.extend(translated),
+                Err(_) => return Err(("translation", "invalid_event")),
+            }
+            start = end;
+            if !done_before && self.translator.has_seen_done() {
+                context.restart_read_window();
+            }
+            if !terminal && self.translator.is_terminal() {
+                terminal = true;
+                if context.exceeds_post_terminal_bytes(chunk.len() - end) {
+                    return Err(("protocol", "post_terminal_limit"));
+                }
+            }
+        }
+        Ok(output)
     }
 
     /// Ends a strict stream with the closing events, or with an error event
@@ -2626,5 +2775,169 @@ mod tests {
             text.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn synthetic_post_terminal_limits_are_two_seconds_and_sixteen_mib() {
+        assert_eq!(POST_TERMINAL_READ_LIMIT, std::time::Duration::from_secs(2));
+        assert_eq!(POST_TERMINAL_MAX_BYTES, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn frame_scanner_ends_frames_where_the_decoder_does_in_any_split() {
+        let tests: [(&str, &str, &[usize]); 6] = [
+            ("lf", "data: a\n\n: c\n\n", &[9, 14]),
+            ("cr", "data: a\r\rdata: b\r\r", &[9, 18]),
+            ("crlf", "data: a\r\n\r\ndata: b\r\n\r\n", &[10, 21]),
+            ("leading blank lines", "\n\ndata: a\n\n", &[1, 2, 11]),
+            (
+                "trailing line without blank line",
+                "data: a\n\ndata: b\n",
+                &[9],
+            ),
+            ("no frame end", "data: a", &[]),
+        ];
+        for (name, input, expected) in tests {
+            let input = input.as_bytes();
+            assert_eq!(
+                FrameScanner::default().frame_ends(input),
+                expected,
+                "{name}: whole"
+            );
+            for split in 0..=input.len() {
+                let mut scanner = FrameScanner::default();
+                let mut ends = scanner.frame_ends(&input[..split]);
+                ends.extend(
+                    scanner
+                        .frame_ends(&input[split..])
+                        .into_iter()
+                        .map(|end| end + split),
+                );
+                assert_eq!(ends, expected, "{name}: split at {split}");
+
+                let prefix = complete_frames_prefix(&input[..split]);
+                let mut whole = SseDecoder::default();
+                let events = whole.push(&input[..split]).unwrap();
+                let mut trimmed = SseDecoder::default();
+                let kept = trimmed.push(prefix).unwrap();
+                assert!(
+                    trimmed.finish().is_ok(),
+                    "{name}: prefix of {split} ends mid-frame"
+                );
+                assert_eq!(
+                    kept.len(),
+                    events.len(),
+                    "{name}: prefix of {split} lost an event"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn complete_frames_prefix_keeps_whole_frames_only() {
+        let tests = [
+            ("empty input", "", ""),
+            ("one whole frame", "data: a\n\n", "data: a\n\n"),
+            (
+                "partial line after a frame",
+                "data: a\n\ndata: b",
+                "data: a\n\n",
+            ),
+            (
+                "line without its blank line",
+                "data: a\n\ndata: b\n",
+                "data: a\n\n",
+            ),
+            (
+                "crlf frame keeps both bytes",
+                "data: a\r\n\r\ndata: b",
+                "data: a\r\n\r\n",
+            ),
+            ("cr frame", "data: a\r\rdata", "data: a\r\r"),
+            (
+                "partial comment after a comment frame",
+                ": keep\n\n: par",
+                ": keep\n\n",
+            ),
+            ("no complete frame", "data: a", ""),
+            ("frame then blank line", "data: a\n\n\n", "data: a\n\n\n"),
+        ];
+        for (name, input, expected) in tests {
+            assert_eq!(
+                complete_frames_prefix(input.as_bytes()),
+                expected.as_bytes(),
+                "{name}"
+            );
+        }
+    }
+
+    /// Exactly `16 * 1024 * 1024` bytes of 1024-byte comment frames. They
+    /// carry no event, so only the byte limit can stop them.
+    fn synthetic_comment_tail_of_sixteen_mib() -> String {
+        let frame = format!(": {}\n\n", "x".repeat(1020));
+        assert_eq!(frame.len(), 1024);
+        let tail = frame.repeat(16 * 1024);
+        assert_eq!(tail.len(), 16 * 1024 * 1024);
+        tail
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_charges_the_tail_after_finish_reason_by_position() {
+        let at_limit = synthetic_comment_tail_of_sixteen_mib();
+        let over_limit = format!("{at_limit}\n");
+        for (tail, accepted) in [(at_limit.as_str(), true), (over_limit.as_str(), false)] {
+            let wire = format!("{TEXT_THEN_STOP}{tail}");
+            let terminal_end = TEXT_THEN_STOP.len();
+            let inside_tail = terminal_end + 4096 + 7;
+            for parts in [
+                vec![wire.as_str()],
+                vec![&wire[..terminal_end], &wire[terminal_end..]],
+                vec![&wire[..inside_tail], &wire[inside_tail..]],
+            ] {
+                let upstream = futures_util::stream::iter(chunks(&parts));
+                let text = body_text(strict_body(upstream)).await;
+                let case = format!("{} tail bytes in {} items", tail.len(), parts.len());
+                assert_eq!(
+                    text.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+                    accepted,
+                    "{case}"
+                );
+                assert_eq!(
+                    text.contains("Synthetic Gateway stream is invalid"),
+                    !accepted,
+                    "{case}"
+                );
+            }
+            let buffered =
+                accumulate_response_with(wire.as_bytes(), "msg", "model", &strict_wiring());
+            assert_eq!(
+                buffered.is_ok(),
+                accepted,
+                "{} tail bytes: {buffered:?}",
+                tail.len()
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_waits_exactly_two_seconds_after_the_terminal_event() {
+        for wire in [
+            TEXT_THEN_STOP.to_string(),
+            format!("{TEXT_THEN_STOP}data: [DONE]\n\n"),
+        ] {
+            let upstream =
+                futures_util::stream::iter(chunks(&[&wire])).chain(futures_util::stream::pending());
+            let started = tokio::time::Instant::now();
+            let text = body_text(strict_body(upstream)).await;
+            assert_eq!(
+                started.elapsed(),
+                std::time::Duration::from_secs(2),
+                "{wire}"
+            );
+            assert!(
+                text.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+                "{wire}: {text}"
+            );
+        }
     }
 }
