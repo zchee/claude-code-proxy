@@ -1335,6 +1335,19 @@ mod tests {
     /// A provider that knows the endpoints of `file` (a `config.json`) and
     /// sends to `base_url`.
     fn synthetic_endpoint_provider(base_url: &str, file: &str) -> VertexProvider {
+        synthetic_endpoint_provider_with_client(
+            base_url,
+            file,
+            client::client_builder().no_proxy().build().unwrap(),
+        )
+    }
+
+    /// [`synthetic_endpoint_provider`], sending through `client`.
+    fn synthetic_endpoint_provider_with_client(
+        base_url: &str,
+        file: &str,
+        client: reqwest::Client,
+    ) -> VertexProvider {
         let config_dir = tempfile::TempDir::new().unwrap();
         std::fs::write(config_dir.path().join("config.json"), file).unwrap();
         let endpoints = crate::config::resolve_vertex_endpoints(config_dir.path());
@@ -1352,7 +1365,7 @@ mod tests {
             format!("Bearer {SYNTHETIC_TOKEN}").parse().unwrap(),
         );
         VertexProvider::with_client_and_endpoints(
-            VertexClient::with_client(client::client_builder().no_proxy().build().unwrap()),
+            VertexClient::with_client(client),
             VertexCredentials::fixed(headers),
             config,
             endpoints,
@@ -1562,6 +1575,187 @@ mod tests {
             }
         }
     }
+
+    /// A local stand-in for `endpoints.get` and the dedicated host, with the
+    /// path of every GET it received.
+    struct SyntheticLookups {
+        base: String,
+        gets: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl SyntheticLookups {
+        fn gets(&self) -> Vec<String> {
+            self.gets.lock().expect("GET record").clone()
+        }
+    }
+
+    /// Starts a [`SyntheticLookups`]. A GET answers `metadata` as it is,
+    /// except that a `metadata` without `dedicatedEndpointDns` gets one
+    /// pointing back at the server; every POST answers `sse`.
+    async fn synthetic_lookup_server(metadata: Value, sse: String) -> SyntheticLookups {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut metadata = metadata;
+        if metadata.get("dedicatedEndpointDns").is_none() {
+            metadata["dedicatedEndpointDns"] = json!(base);
+        }
+        let gets = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&gets);
+        let app = axum::Router::new().route(
+            "/{*path}",
+            axum::routing::get(move |uri: http::Uri| {
+                let metadata = metadata.clone();
+                let recorded = Arc::clone(&recorded);
+                async move {
+                    recorded
+                        .lock()
+                        .expect("GET record")
+                        .push(uri.path().to_string());
+                    axum::Json(metadata)
+                }
+            })
+            .post(move || {
+                let sse = sse.clone();
+                async move { ([(http::header::CONTENT_TYPE, "text/event-stream")], sse) }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        SyntheticLookups { base, gets }
+    }
+
+    const SYNTHETIC_ENDPOINT_CONFIG: &str = r#"{"vertex":{"endpoints":{"my-llm":{"endpoint":"1234567890123456789","location":"us-central1","model":"gemma-2-9b-it"}}}}"#;
+
+    const SYNTHETIC_LOOKUP_PATH: &str =
+        "/v1/projects/synthetic-project/locations/us-central1/endpoints/1234567890123456789";
+
+    /// A non-streaming request for `model`.
+    fn synthetic_endpoint_request(model: &str) -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": model,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn deployed_endpoint_lookup_capture_synthetic_redacts_a_token_echoed_in_the_read_fields()
+    {
+        let dedicated = "1234567890123456789.us-central1-987654321.prediction.vertexai.goog";
+        // URL parsing lowercases a host, so a token in a host name reaches
+        // the request URL lowercased.
+        let lowercase = SYNTHETIC_TOKEN.to_ascii_lowercase();
+        let echoed_host = format!("{lowercase}.{dedicated}");
+        // The accepted host is under prediction.vertexai.goog; it resolves to
+        // a loopback port nothing listens on, so the request fails without
+        // leaving the machine.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let unusable = |reason: &str| {
+            format!(
+                "Vertex AI endpoint my-llm is a dedicated endpoint, but endpoints.get returned \
+                 {reason} (endpoint 1234567890123456789 in project synthetic-project, location \
+                 us-central1 (vertex.endpoints.my-llm in config.json)). The proxy sends the \
+                 access token only to https://<endpoint-id>.<region>-<uid>.prediction.vertexai.goog \
+                 and never to the shared host, which a dedicated endpoint does not answer on; set \
+                 \"host\" in vertex.endpoints.my-llm to the endpoint's dedicated URL (upstream \
+                 HTTP 200)"
+            )
+        };
+        let mut keyed = serde_json::Map::new();
+        keyed.insert(SYNTHETIC_TOKEN.to_string(), json!(dedicated));
+        let cases = [
+            (
+                "the token as labels of an accepted host",
+                json!(format!("https://{SYNTHETIC_TOKEN}.{dedicated}")),
+                "Vertex AI is unreachable".to_string(),
+            ),
+            (
+                "the token as the user info of a refused value",
+                json!(format!("https://{SYNTHETIC_TOKEN}@{dedicated}")),
+                unusable("a dedicatedEndpointDns that must not contain a user name or password"),
+            ),
+            (
+                "the token inside a nested value",
+                json!({"value": {"hosts": [format!("https://{SYNTHETIC_TOKEN}.{dedicated}")]}}),
+                unusable("no dedicatedEndpointDns"),
+            ),
+            (
+                "the token as an object key",
+                Value::Object(keyed),
+                unusable("no dedicatedEndpointDns"),
+            ),
+        ];
+        for (case, dns, expected) in cases {
+            let metadata = json!({
+                "dedicatedEndpointEnabled": true,
+                "dedicatedEndpointDns": dns,
+            });
+            let server = synthetic_lookup_server(metadata, String::new()).await;
+            let client = client::client_builder()
+                .no_proxy()
+                .resolve(&echoed_host, closed)
+                .build()
+                .unwrap();
+            let provider = synthetic_endpoint_provider_with_client(
+                &server.base,
+                SYNTHETIC_ENDPOINT_CONFIG,
+                client,
+            );
+            let root = tempfile::tempdir().expect("temporary capture directory");
+            let mut ctx = synthetic_context();
+            ctx.traffic = Some(Arc::new(crate::traffic::test_capture(
+                root.path().to_path_buf(),
+            )));
+            let response = tokio::time::timeout(
+                Duration::from_secs(60),
+                provider.handle_messages(synthetic_endpoint_request("vertex/endpoint/my-llm"), ctx),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{case}: no answer"));
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{case}: {value}");
+            assert_eq!(value["error"]["type"], "api_error", "{case}: {value}");
+            assert_eq!(value["error"]["message"], expected, "{case}");
+            assert_eq!(server.gets(), [SYNTHETIC_LOOKUP_PATH], "{case}");
+
+            let files = synthetic_files_under(root.path());
+            for (path, text) in &files {
+                for secret in [SYNTHETIC_TOKEN, lowercase.as_str()] {
+                    assert!(
+                        !text.contains(secret),
+                        "{case}: {} kept the token: {text}",
+                        path.display()
+                    );
+                }
+            }
+            let file = |name: &str| {
+                files
+                    .iter()
+                    .find(|(path, _)| path.to_string_lossy().ends_with(name))
+                    .map(|(_, text)| text.as_str())
+                    .unwrap_or_else(|| panic!("{case}: no {name} in {files:?}"))
+            };
+            let fields = file("018-upstream-endpoint-lookup-fields.json");
+            assert!(fields.contains("[redacted]"), "{case}: {fields}");
+            if expected == "Vertex AI is unreachable" {
+                let metadata = file("021-upstream-request-metadata.json");
+                assert!(
+                    metadata.contains(
+                        "https://[redacted].1234567890123456789.us-central1-987654321.prediction.vertexai.goog/v1/projects/synthetic-project/locations/us-central1/endpoints/1234567890123456789/chat/completions"
+                    ),
+                    "{case}: {metadata}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn check_settings_synthetic_rejects_a_malformed_override_by_its_setting_name() {
         let config_dir = tempfile::TempDir::new().unwrap();

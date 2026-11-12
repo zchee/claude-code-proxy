@@ -3997,6 +3997,53 @@ async fn vertex_endpoint_synthetic_cold_start_429_is_a_503_and_other_429s_are_ra
 }
 
 #[tokio::test]
+async fn vertex_endpoint_synthetic_an_ordinary_429_is_a_rate_limit_with_its_retry_after() {
+    let quota = google_error(429, "RESOURCE_EXHAUSTED", "Quota exceeded.");
+    let answer = || {
+        let mut answer = Answer::error(429, quota.clone());
+        answer.headers.push(("retry-after", "17".to_string()));
+        answer
+    };
+    let upstream = FakeVertex::start(vec![answer(), answer()]).await;
+    let registry = registry(endpoint_provider(
+        &upstream,
+        json!({"my-llm": endpoint_entry(json!({"host": upstream.base}))}),
+    ));
+    for stream in [false, true] {
+        let (status, headers, body) = send(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages",
+            &message_request(ENDPOINT_MODEL, stream),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "stream={stream}: {body}"
+        );
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["error"]["type"], "rate_limit_error", "{body}");
+        assert_eq!(
+            error_message(&body),
+            "RESOURCE_EXHAUSTED: Quota exceeded.. Vertex AI endpoint 1234567890123456789 in \
+             project ccp-project, location us-central1 (vertex.endpoints.my-llm in config.json) \
+             is rate limited or its serving container is overloaded; retry later (upstream HTTP \
+             429)",
+            "stream={stream}"
+        );
+        assert_eq!(
+            headers
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("17"),
+            "stream={stream}: {body}"
+        );
+    }
+    assert_eq!(upstream.requests().len(), 2);
+}
+
+#[tokio::test]
 async fn vertex_endpoint_synthetic_tools_off_refuses_tools_and_tools_on_sends_them() {
     let upstream = FakeVertex::start(vec![open_model_sse(&open_model_text("Hello"))]).await;
     let registry = registry(endpoint_provider(

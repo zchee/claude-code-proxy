@@ -46,7 +46,7 @@ use super::auth::VertexCredentials;
 use super::buffered::{BufferedFailure, EventStreamSink, read_upstream};
 use super::client::{
     EVENT_STREAM, UpstreamCall, UpstreamErrorDetail, VertexClient, VertexError, VertexResponse,
-    VertexTarget,
+    VertexTarget, redact_for_capture,
 };
 use super::models::{ApiVersion, MODEL_PREFIX};
 use super::translate::stream::Sanitizer;
@@ -289,8 +289,8 @@ async fn dedicated_host(
         return Ok(host);
     }
     let (target, url) = lookup_url(vertex, call)?;
-    let metadata = client
-        .get_json(
+    let (metadata, token) = client
+        .get_json_and_token(
             url,
             credentials,
             traffic,
@@ -301,13 +301,18 @@ async fn dedicated_host(
     if let Some(capture) = traffic {
         // Only the two fields the proxy reads: the rest of the metadata
         // describes the user's deployment and is not needed to debug a
-        // request.
+        // request. They are written before they are checked, so a value
+        // that is refused is recorded too, and the answer may echo the
+        // token anywhere in them, keys included.
         capture.write_json(
             &format!("{LOOKUP_CAPTURE_STEM}-fields"),
-            &json!({
-                "dedicatedEndpointEnabled": metadata.get("dedicatedEndpointEnabled"),
-                "dedicatedEndpointDns": metadata.get("dedicatedEndpointDns"),
-            }),
+            &redact_for_capture(
+                &json!({
+                    "dedicatedEndpointEnabled": metadata.get("dedicatedEndpointEnabled"),
+                    "dedicatedEndpointDns": metadata.get("dedicatedEndpointDns"),
+                }),
+                token.as_deref(),
+            ),
         );
     }
     let host = host_from_metadata(&metadata, call)?;

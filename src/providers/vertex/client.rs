@@ -16,9 +16,10 @@ use serde::Serialize;
 
 use super::auth::{LOGIN_COMMAND, VertexAuthError, VertexCredentials, access_token};
 use super::models::{ApiVersion, ResolvedModel};
-use super::sanitize::sanitize_vertex_text;
+use super::sanitize::{redact_secrets, sanitize_vertex_text};
 use crate::config::{ResolvedVertexConfig, vertex_host};
 use crate::provider::{ProviderError, ProviderErrorKind};
+use crate::providers::opencode::chat::redact_every_string;
 use crate::traffic::TrafficCapture;
 
 /// Path prefix of the Vertex AI REST API version the proxy speaks unless a
@@ -850,14 +851,17 @@ impl VertexClient {
         if let Some(capture) = traffic {
             capture.write_json(
                 "021-upstream-request-metadata",
-                &serde_json::json!({
-                    "method": "POST",
-                    "url": url.as_str(),
-                    "provider": "vertex",
-                    "transport": "http",
-                    "headers": request_headers_for_capture(&auth_headers, accept, &extra_headers),
-                    "body_bytes": bytes.len(),
-                }),
+                &redact_for_capture(
+                    &serde_json::json!({
+                        "method": "POST",
+                        "url": url.as_str(),
+                        "provider": "vertex",
+                        "transport": "http",
+                        "headers": request_headers_for_capture(&auth_headers, accept, &extra_headers),
+                        "body_bytes": bytes.len(),
+                    }),
+                    token.as_deref(),
+                ),
             );
         }
 
@@ -885,10 +889,13 @@ impl VertexClient {
         if let Some(capture) = traffic {
             capture.write_json(
                 "030-upstream-response-headers",
-                &serde_json::json!({
-                    "status": status.as_u16(),
-                    "headers": safe_response_headers(response.headers()),
-                }),
+                &redact_for_capture(
+                    &serde_json::json!({
+                        "status": status.as_u16(),
+                        "headers": safe_response_headers(response.headers()),
+                    }),
+                    token.as_deref(),
+                ),
             );
         }
         if status.is_success() {
@@ -922,19 +929,43 @@ impl VertexClient {
         capture_stem: &str,
         map_error: impl FnOnce(StatusCode, UpstreamErrorDetail) -> VertexError,
     ) -> Result<serde_json::Value, VertexError> {
+        self.get_json_and_token(url, credentials, traffic, capture_stem, map_error)
+            .await
+            .map(|(body, _)| body)
+    }
+
+    /// [`Self::get_json`], also returning the access token the GET carried,
+    /// so a caller that captures parts of the body can redact that token
+    /// ([`redact_for_capture`]). Every file this call writes already has it
+    /// redacted.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::get_json`].
+    pub async fn get_json_and_token(
+        &self,
+        url: reqwest::Url,
+        credentials: &VertexCredentials,
+        traffic: Option<&TrafficCapture>,
+        capture_stem: &str,
+        map_error: impl FnOnce(StatusCode, UpstreamErrorDetail) -> VertexError,
+    ) -> Result<(serde_json::Value, Option<String>), VertexError> {
         let accept = "application/json";
         let auth_headers = credentials.headers().await?;
         let token = access_token(&auth_headers).map(str::to_string);
         if let Some(capture) = traffic {
             capture.write_json(
                 &format!("{capture_stem}-request-metadata"),
-                &serde_json::json!({
-                    "method": "GET",
-                    "url": url.as_str(),
-                    "provider": "vertex",
-                    "transport": "http",
-                    "headers": request_headers_for_capture(&auth_headers, accept, &http::HeaderMap::new()),
-                }),
+                &redact_for_capture(
+                    &serde_json::json!({
+                        "method": "GET",
+                        "url": url.as_str(),
+                        "provider": "vertex",
+                        "transport": "http",
+                        "headers": request_headers_for_capture(&auth_headers, accept, &http::HeaderMap::new()),
+                    }),
+                    token.as_deref(),
+                ),
             );
         }
         let request = self
@@ -957,10 +988,13 @@ impl VertexClient {
         if let Some(capture) = traffic {
             capture.write_json(
                 &format!("{capture_stem}-response-headers"),
-                &serde_json::json!({
-                    "status": status.as_u16(),
-                    "headers": safe_response_headers(response.headers()),
-                }),
+                &redact_for_capture(
+                    &serde_json::json!({
+                        "status": status.as_u16(),
+                        "headers": safe_response_headers(response.headers()),
+                    }),
+                    token.as_deref(),
+                ),
             );
         }
         if !status.is_success() {
@@ -985,7 +1019,8 @@ impl VertexClient {
         if cut {
             return Err(unreadable());
         }
-        serde_json::from_slice(&body).map_err(|_| unreadable())
+        let body = serde_json::from_slice(&body).map_err(|_| unreadable())?;
+        Ok((body, token))
     }
 
     /// Reads at most [`MAX_ERROR_BODY_BYTES`] for at most the error-body
@@ -1063,6 +1098,21 @@ fn request_headers_for_capture(
     headers.insert("content-type".to_string(), "application/json".into());
     headers.insert("user-agent".to_string(), USER_AGENT.into());
     serde_json::Value::Object(headers)
+}
+
+/// `value` as a capture records it: the access token `token`, verbatim or
+/// percent-encoded once, becomes `[redacted]` in every string and object key
+/// at any depth ([`redact_secrets`]). Its ASCII-lowercase form is replaced
+/// too, because URL parsing lowercases a host: a token an upstream answer
+/// put into a host name reaches a captured URL lowercased. Without a token,
+/// `value` is returned as it is.
+pub fn redact_for_capture(value: &serde_json::Value, token: Option<&str>) -> serde_json::Value {
+    let Some(token) = token else {
+        return value.clone();
+    };
+    let lowercase = token.to_ascii_lowercase();
+    let secrets = [token, lowercase.as_str()];
+    redact_every_string(value, &|text: &str| redact_secrets(text, &secrets))
 }
 
 fn safe_response_headers(headers: &reqwest::header::HeaderMap) -> serde_json::Value {
