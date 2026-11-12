@@ -1156,7 +1156,7 @@ fn models_lists_vertex_after_opencode_with_its_served_models()
         .split(',')
         .map(str::trim)
         .collect();
-    assert_eq!(models.len(), 47, "{vertex}");
+    assert_eq!(models.len(), 53, "{vertex}");
     for model in [
         "gemini-4-argon",
         "gemini-4-carbon",

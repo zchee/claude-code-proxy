@@ -1,8 +1,10 @@
 //! Google Cloud Vertex AI provider: Anthropic Messages requests with
 //! Application Default Credentials, for Gemini models (sent as
 //! `streamGenerateContent`), for the xAI Grok, OpenAI and Meta Muse partner
-//! models (sent as OpenAI Responses requests) and for Mistral (sent in
-//! Mistral's chat format on `streamRawPredict`).
+//! models (sent as OpenAI Responses requests), for Mistral (sent in
+//! Mistral's chat format on `streamRawPredict`) and for Model Garden's
+//! managed open models (sent as OpenAI Chat Completions requests to
+//! `endpoints/openapi/chat/completions`).
 //!
 //! The upstream is always asked for a stream. A non-streaming client gets a
 //! message built from the same translation, so both modes decide the stop
@@ -18,6 +20,7 @@ pub mod cli;
 pub mod client;
 mod mistral;
 pub mod models;
+mod openapi_chat;
 mod responses;
 pub mod sanitize;
 pub mod translate;
@@ -102,6 +105,9 @@ enum Reception {
     /// A Mistral Chat-Completions-shaped stream. `model` is the name the
     /// client asked for.
     Mistral { message_id: String, model: String },
+    /// A managed open model's Chat Completions stream. `model` is the name
+    /// the client asked for.
+    OpenModel { message_id: String, model: String },
 }
 
 /// The `vertex` provider.
@@ -235,6 +241,28 @@ impl VertexProvider {
                     redact: redactor(&upstream),
                     upstream,
                     reception: Reception::Mistral {
+                        message_id: new_message_id(),
+                        model: requested,
+                    },
+                    model_id: model.upstream_model,
+                })
+            }
+            WireFormat::OpenApiChat => {
+                let translated =
+                    openapi_chat::prepare_request(body, &model).map_err(invalid_request)?;
+                let upstream = self
+                    .send_partner(
+                        &model,
+                        |target| openapi_chat::url(target, &model),
+                        &translated,
+                        ctx,
+                    )
+                    .await?;
+                Ok(Started {
+                    sanitize: sanitizer(&upstream),
+                    redact: redactor(&upstream),
+                    upstream,
+                    reception: Reception::OpenModel {
                         message_id: new_message_id(),
                         model: requested,
                     },
@@ -480,6 +508,10 @@ fn stream_response_body(
             mistral::stream_body_redacted(upstream, message_id, model, ctx, sanitize, redact),
             outcome,
         ),
+        Reception::OpenModel { message_id, model } => report_error_events(
+            openapi_chat::stream_body_redacted(upstream, message_id, model, ctx, sanitize, redact),
+            outcome,
+        ),
     }
 }
 
@@ -541,6 +573,10 @@ async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
         }
         Reception::Mistral { message_id, model } => {
             mistral::read_response(upstream, &message_id, &model, &sanitize, capture.as_mut()).await
+        }
+        Reception::OpenModel { message_id, model } => {
+            openapi_chat::read_response(upstream, &message_id, &model, &sanitize, capture.as_mut())
+                .await
         }
     };
     match result {
@@ -677,13 +713,15 @@ impl BufferedCapture {
 
     /// The capture for `reception`. A partner model's events put upstream
     /// prose under a `message` key at any depth (`response.error.message`
-    /// of a failed Responses event, a Mistral error's top-level `message`),
-    /// so every such string is cleaned, as the shared translators clean the
-    /// events they capture.
+    /// of a failed Responses event, a Chat Completions error's top-level
+    /// `message`), so every such string is cleaned, as the shared
+    /// translators clean the events they capture.
     fn for_reception(reception: &Reception) -> Self {
         match reception {
             Reception::Gemini(_) => Self::new(),
-            Reception::Responses { .. } | Reception::Mistral { .. } => Self {
+            Reception::Responses { .. }
+            | Reception::Mistral { .. }
+            | Reception::OpenModel { .. } => Self {
                 clean: sanitize_upstream_messages,
                 ..Self::new()
             },
@@ -875,7 +913,7 @@ mod tests {
         assert!(provider.ready.get().is_none());
         assert_eq!(provider.name(), "vertex");
         let models = provider.supported_models();
-        assert_eq!(models.len(), 47, "{models:?}");
+        assert_eq!(models.len(), 53, "{models:?}");
         assert!(
             models
                 .iter()
@@ -1156,7 +1194,7 @@ mod tests {
             monitor: None,
         };
         let body: MessagesRequest = serde_json::from_value(json!({
-            "model": "vertex/openai/gpt-oss-120b-maas",
+            "model": "vertex/endpoint/synthetic",
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .expect("valid request");
@@ -1184,15 +1222,10 @@ mod tests {
             traffic: None,
             monitor: None,
         };
-        for (model, family) in [
-            (
-                "vertex/openai/gpt-oss-120b-maas",
-                "Model Garden managed open model (<publisher>/<model-id>-maas)",
-            ),
-            (
-                "vertex/endpoint/synthetic",
-                "deployed endpoint (endpoint/<name>)",
-            ),
+        let family = "deployed endpoint (endpoint/<name>)";
+        for model in [
+            "vertex/endpoint/synthetic",
+            "vertex/endpoint/synthetic-maas",
         ] {
             for stream in [false, true] {
                 let body: MessagesRequest = serde_json::from_value(json!({
@@ -1213,7 +1246,7 @@ mod tests {
                 assert_eq!(
                     message,
                     format!(
-                        "this version of claude-code-proxy does not support the {family} model family on Vertex AI (requested {model:?}); supported families: Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, Mistral"
+                        "this version of claude-code-proxy does not support the {family} model family on Vertex AI (requested {model:?}); supported families: Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, Mistral, Model Garden managed open model"
                     ),
                     "{model}"
                 );
@@ -1968,6 +2001,164 @@ mod tests {
                         && text.contains("[redacted]")),
                 "{case}: {files:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn open_models_synthetic_count_tokens_locally_without_settings() {
+        let provider = VertexProvider::new();
+        for model in [
+            "vertex/openai/gpt-oss-120b-maas",
+            "vertex/zai-org/glm-5.2-maas",
+            "vertex/meta/llama-4-scout-17b-16e-instruct-maas",
+            "vertex/qwen/qwen-synthetic-maas",
+        ] {
+            let body: MessagesRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello world"}]
+            }))
+            .expect("valid request");
+            let response = provider
+                .handle_count_tokens(body, synthetic_context())
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{model}");
+        }
+        assert!(provider.ready.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn open_models_synthetic_forced_tool_choice_on_gpt_oss_is_a_400_before_any_setting() {
+        let provider = VertexProvider::new();
+        for tool_choice in [
+            json!({"type": "any"}),
+            json!({"type": "tool", "name": "lookup"}),
+        ] {
+            for stream in [false, true] {
+                let body: MessagesRequest = serde_json::from_value(json!({
+                    "model": "vertex/openai/gpt-oss-120b-maas",
+                    "stream": stream,
+                    "max_tokens": 16,
+                    "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+                    "tool_choice": tool_choice,
+                    "messages": [{"role": "user", "content": "look it up"}]
+                }))
+                .expect("valid request");
+                let response = provider.handle_messages(body, synthetic_context()).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{tool_choice}");
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["error"]["type"], "invalid_request_error", "{value}");
+                assert_eq!(
+                    value["error"]["message"],
+                    "Vertex AI model openai/gpt-oss-120b-maas does not support a forced tool \
+                     choice (tool_choice any or tool); use tool_choice auto or none",
+                    "{tool_choice}"
+                );
+            }
+        }
+        // Refused before any setting, credential or client is built.
+        assert!(provider.ready.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn open_model_capture_synthetic_keeps_the_token_out_of_every_file() {
+        // Words, not a secret: no rule of the prose sanitiser may shorten
+        // them in a capture.
+        let long = "long synthetic answer text ".repeat(150);
+        let echoed = format!("echo {SYNTHETIC_TOKEN} {long}");
+        let named = |event: &Value| format!("event: {SYNTHETIC_TOKEN}\ndata: {event}\n\n");
+        let text = format!(
+            "{}{}{}event: {SYNTHETIC_TOKEN}\ndata: [DONE]\n\n",
+            named(&json!({
+                "object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":echoed}}],
+                SYNTHETIC_TOKEN: 1
+            })),
+            synthetic_sse(&[
+                json!({"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":echoed}}]}),
+                json!({"object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+            ]),
+            synthetic_sse(&[json!({
+                "object":"chat.completion.chunk","choices":[],
+                "usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}
+            })]),
+        );
+        let error = synthetic_sse(&[json!({
+            "object":"error","type":"invalid_request_error","message":format!("saw {SYNTHETIC_TOKEN}")
+        })]);
+        for (case, answer, carries_text) in [("text", text, true), ("error", error, false)] {
+            for stream in [true, false] {
+                let case = format!("{case}, stream {stream}");
+                let base = synthetic_sse_server(answer.clone()).await;
+                let provider = synthetic_local_provider(&base, "global");
+                let root = tempfile::tempdir().expect("temporary capture directory");
+                let mut ctx = synthetic_context();
+                ctx.traffic = Some(Arc::new(crate::traffic::test_capture(
+                    root.path().to_path_buf(),
+                )));
+                let body: MessagesRequest = serde_json::from_value(json!({
+                    "model": "vertex/zai-org/glm-5.2-maas",
+                    "max_tokens": 64,
+                    "stream": stream,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap();
+                let response = provider.handle_messages(body, ctx).await;
+                let status = response.status();
+                // Read the whole body, so a stream finishes its capture.
+                let answered = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let answered = String::from_utf8_lossy(&answered);
+                // The model's own text reaches the client as written; an
+                // error the proxy writes never carries the token.
+                if !carries_text {
+                    assert!(!answered.contains(SYNTHETIC_TOKEN), "{case}: {answered}");
+                }
+                let expected = if stream || carries_text {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                assert_eq!(status, expected, "{case}: {answered}");
+
+                let files = synthetic_files_under(root.path());
+                let summary = if stream {
+                    "061-vertex-open-model-stream-summary.json".to_string()
+                } else {
+                    format!("{BUFFERED_SUMMARY_NAME}.json")
+                };
+                assert!(
+                    files
+                        .iter()
+                        .any(|(path, _)| path.to_string_lossy().ends_with(&summary)),
+                    "{case}: no {summary} in {files:?}"
+                );
+                assert!(
+                    files
+                        .iter()
+                        .any(|(path, _)| path.to_string_lossy().contains("-040-upstream-event")),
+                    "{case}: {files:?}"
+                );
+                for (path, text) in &files {
+                    assert!(
+                        !text.contains(SYNTHETIC_TOKEN),
+                        "{case}: {} kept the token: {text}",
+                        path.display()
+                    );
+                }
+                if carries_text {
+                    // The model's text and reasoning are captured whole, with
+                    // the token taken out.
+                    let kept = format!("echo [redacted] {long}");
+                    assert!(
+                        files.iter().any(|(_, text)| text.contains(&kept)),
+                        "{case}: no file kept the text whole"
+                    );
+                }
+            }
         }
     }
 }

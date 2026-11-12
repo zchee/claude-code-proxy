@@ -1433,8 +1433,8 @@ mod tests {
     #[test]
     fn openapi_url_synthetic_follows_the_model_api_version() {
         // The Llama model page sends Chat Completions to `v1beta1` in
-        // `us-east5`; no registered model uses that version yet, so the
-        // model here is synthetic.
+        // `us-east5`; a Grok model in that version is synthetic and shows
+        // that the version follows the model, whatever its family.
         let beta = ResolvedModel {
             api_version: ApiVersion::V1Beta1,
             ..model("vertex/xai/grok-4.7")

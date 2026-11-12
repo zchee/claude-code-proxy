@@ -4,7 +4,7 @@
 //! documented response shapes: `streamGenerateContent` for Gemini, the
 //! Anthropic Messages events for Claude, OpenAI Responses events for xAI
 //! Grok, OpenAI and Meta Muse, and `chat.completion.chunk` objects for
-//! Mistral.
+//! Mistral and Model Garden's managed open models.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -1111,7 +1111,7 @@ async fn vertex_synthetic_unregistered_ids_are_sent_and_other_publishers_are_ref
     );
 
     for model in [
-        "vertex/openai/gpt-oss-120b-maas",
+        "vertex/ai21/jamba-1.5-large",
         "vertex/gemini-3.5-flash:predict",
     ] {
         let (status, _, body) = post(
@@ -2295,7 +2295,7 @@ async fn vertex_mistral_synthetic_content_after_the_finish_reason_is_an_error() 
 // Every family together.
 
 /// Every name the provider advertises, as Google's model pages spell them.
-const VERTEX_NAMES: [&str; 47] = [
+const VERTEX_NAMES: [&str; 53] = [
     "gemini-3-flash-preview",
     "gemini-3.1-flash-lite",
     "gemini-3.1-pro-preview",
@@ -2343,6 +2343,12 @@ const VERTEX_NAMES: [&str; 47] = [
     "vertex/mistralai/mistral-medium-3",
     "vertex/mistralai/mistral-small-2503",
     "vertex/mistralai/codestral-2",
+    "vertex/openai/gpt-oss-120b-maas",
+    "vertex/zai-org/glm-5.2-maas",
+    "vertex/google/gemma-4-26b-a4b-it-maas",
+    "vertex/meta/llama-4-maverick-17b-128e-instruct-maas",
+    "vertex/meta/llama-4-scout-17b-16e-instruct-maas",
+    "vertex/deepseek-ai/deepseek-v4.1-flash-maas",
 ];
 
 #[tokio::test]

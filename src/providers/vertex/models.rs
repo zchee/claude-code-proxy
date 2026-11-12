@@ -15,10 +15,6 @@ const ENDPOINT_PREFIX: &str = "endpoint/";
 /// Suffix of the Model Garden managed open models (`…-maas`).
 const OPEN_MODEL_SUFFIX: &str = "-maas";
 
-/// Name of the managed open models in messages. They have no family yet.
-pub const OPEN_MODEL_FAMILY_LABEL: &str =
-    "Model Garden managed open model (<publisher>/<model-id>-maas)";
-
 /// Name of the deployed endpoints in messages. They have no family yet.
 pub const DEPLOYED_ENDPOINT_FAMILY_LABEL: &str = "deployed endpoint (endpoint/<name>)";
 
@@ -99,17 +95,22 @@ pub enum Family {
     MetaMuse,
     /// Mistral, through Mistral's chat format on `rawPredict`.
     Mistral,
+    /// The Model Garden managed open models (`<publisher>/<model-id>-maas`),
+    /// through the OpenAI-compatible Chat Completions API under
+    /// `endpoints/openapi`.
+    OpenModel,
 }
 
 impl Family {
     /// Every family.
-    pub const ALL: [Family; 6] = [
+    pub const ALL: [Family; 7] = [
         Family::Gemini,
         Family::Claude,
         Family::Grok,
         Family::OpenAi,
         Family::MetaMuse,
         Family::Mistral,
+        Family::OpenModel,
     ];
 
     /// The family's name in messages.
@@ -121,6 +122,7 @@ impl Family {
             Family::OpenAi => "OpenAI",
             Family::MetaMuse => "Meta Muse",
             Family::Mistral => "Mistral",
+            Family::OpenModel => "Model Garden managed open model",
         }
     }
 
@@ -136,6 +138,7 @@ impl Family {
                 route: ResponsesRoute::Publisher,
             },
             Family::Mistral => WireFormat::MistralChat,
+            Family::OpenModel => WireFormat::OpenApiChat,
         }
     }
 
@@ -152,6 +155,7 @@ impl Family {
                 | Family::OpenAi
                 | Family::MetaMuse
                 | Family::Mistral
+                | Family::OpenModel
         )
     }
 
@@ -162,18 +166,18 @@ impl Family {
             Family::Mistral => LocationRule::Required {
                 allowed: MISTRAL_LOCATIONS,
             },
-            Family::Gemini | Family::Claude | Family::Grok | Family::OpenAi => {
+            Family::Gemini | Family::Claude | Family::Grok | Family::OpenAi | Family::OpenModel => {
                 LocationRule::Inherit
             }
         }
     }
 
-    /// The upstream model string for model ID `id` of `publisher`: Grok
-    /// wants the publisher in front (`xai/grok-4.7`), every other family the
-    /// bare ID.
+    /// The upstream model string for model ID `id` of `publisher`: Grok and
+    /// the managed open models want the publisher in front (`xai/grok-4.7`,
+    /// `zai-org/glm-5.2-maas`), every other family the bare ID.
     fn upstream_model(self, publisher: &str, id: &str) -> String {
         match self {
-            Family::Grok => format!("{publisher}/{id}"),
+            Family::Grok | Family::OpenModel => format!("{publisher}/{id}"),
             Family::Gemini
             | Family::Claude
             | Family::OpenAi
@@ -190,6 +194,10 @@ impl Family {
             Family::Gemini => MODELS
                 .iter()
                 .flat_map(|model| [model.id.to_string(), format!("{MODEL_PREFIX}{}", model.id)])
+                .collect(),
+            Family::OpenModel => OPEN_MODELS
+                .iter()
+                .map(|model| format!("{MODEL_PREFIX}{}/{}", model.publisher, model.id))
                 .collect(),
             family => PARTNER_MODELS
                 .iter()
@@ -216,6 +224,9 @@ pub enum WireFormat {
     /// Mistral's chat format on
     /// `publishers/mistralai/models/{model}:rawPredict` / `:streamRawPredict`.
     MistralChat,
+    /// OpenAI Chat Completions on `endpoints/openapi/chat/completions`, with
+    /// `<publisher>/<model-id>` in the body's `model`.
+    OpenApiChat,
 }
 
 /// Where a Responses request is sent.
@@ -255,8 +266,8 @@ pub enum LocationRule {
     /// A publisher override, else the configured location.
     Inherit,
     /// Always this location, whatever the publisher override or the
-    /// configured location say: the only one Google documents for the
-    /// model.
+    /// configured location say: the one Google's page for the model
+    /// documents.
     Fixed(&'static str),
     /// A publisher override, else the configured location when it is one
     /// of `allowed`; otherwise the request fails, because the configured
@@ -329,6 +340,125 @@ pub const PARTNER_MODELS: &[PartnerModel] = &[
     partner(Family::Mistral, "mistralai", "codestral-2"),
 ];
 
+/// How a managed open model is told whether to think.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingControl {
+    /// No switch is documented for the model; nothing is sent.
+    NoSwitch,
+    /// `reasoning_effort` with `low`, `medium` or `high` (gpt-oss).
+    ReasoningEffort,
+    /// `chat_template_kwargs.enable_thinking` (GLM, Gemma).
+    EnableThinking,
+}
+
+/// The `tool_choice` values a managed open model accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolChoiceRule {
+    /// Every value the Chat Completions translator produces.
+    Any,
+    /// `auto` and `none` only: neither `required` nor a named function
+    /// (gpt-oss).
+    AutoOrNone,
+}
+
+/// The request controls of a managed open model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenModelControls {
+    /// How thinking is switched.
+    pub thinking: ThinkingControl,
+    /// Which `tool_choice` values are sent.
+    pub tool_choice: ToolChoiceRule,
+}
+
+impl OpenModelControls {
+    /// The controls of a managed open model that is not in [`OPEN_MODELS`]:
+    /// no thinking switch, and `tool_choice` as the client asked, for the
+    /// upstream to accept or refuse.
+    pub const UNLISTED: Self = Self {
+        thinking: ThinkingControl::NoSwitch,
+        tool_choice: ToolChoiceRule::Any,
+    };
+}
+
+/// A Model Garden managed open model registered with this proxy as
+/// `vertex/<publisher>/<id>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenModel {
+    /// The Vertex AI publisher.
+    pub publisher: &'static str,
+    /// The model ID, as written after the publisher in the model name.
+    pub id: &'static str,
+    /// The API version in the request path.
+    pub api_version: ApiVersion,
+    /// How its location is chosen.
+    pub location: LocationRule,
+    /// Its thinking switch and `tool_choice` rule.
+    pub controls: OpenModelControls,
+}
+
+/// A row in API version `v1` that inherits the location.
+const fn open_model(
+    publisher: &'static str,
+    id: &'static str,
+    thinking: ThinkingControl,
+    tool_choice: ToolChoiceRule,
+) -> OpenModel {
+    OpenModel {
+        publisher,
+        id,
+        api_version: ApiVersion::V1,
+        location: LocationRule::Inherit,
+        controls: OpenModelControls {
+            thinking,
+            tool_choice,
+        },
+    }
+}
+
+/// A Llama 4 row: the Llama model page sends its requests to `v1beta1` in
+/// `us-east5`, unlike the `v1` and `global` of the general open-model
+/// guide, and documents no thinking switch.
+const fn llama(id: &'static str) -> OpenModel {
+    OpenModel {
+        api_version: ApiVersion::V1Beta1,
+        location: LocationRule::Fixed("us-east5"),
+        ..open_model("meta", id, ThinkingControl::NoSwitch, ToolChoiceRule::Any)
+    }
+}
+
+/// The managed open models of Vertex AI's open-model catalog that this
+/// proxy registers. Other `<publisher>/<model-id>-maas` names still resolve
+/// through the fallback patterns of [`resolve`], with
+/// [`OpenModelControls::UNLISTED`].
+pub const OPEN_MODELS: &[OpenModel] = &[
+    open_model(
+        "openai",
+        "gpt-oss-120b-maas",
+        ThinkingControl::ReasoningEffort,
+        ToolChoiceRule::AutoOrNone,
+    ),
+    open_model(
+        "zai-org",
+        "glm-5.2-maas",
+        ThinkingControl::EnableThinking,
+        ToolChoiceRule::Any,
+    ),
+    open_model(
+        "google",
+        "gemma-4-26b-a4b-it-maas",
+        ThinkingControl::EnableThinking,
+        ToolChoiceRule::Any,
+    ),
+    llama("llama-4-maverick-17b-128e-instruct-maas"),
+    llama("llama-4-scout-17b-16e-instruct-maas"),
+    open_model(
+        "deepseek-ai",
+        "deepseek-v4.1-flash-maas",
+        ThinkingControl::NoSwitch,
+        ToolChoiceRule::Any,
+    ),
+];
+
 /// The outcome of [`resolve`]: what to send upstream for a requested model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedModel {
@@ -354,7 +484,8 @@ pub struct ResolvedModel {
     /// is accepted by every Gemini model that takes `thinkingLevel` while
     /// `MINIMAL` is not.
     pub supports_minimal: bool,
-    /// Whether the ID is in [`MODELS`] or [`PARTNER_MODELS`].
+    /// Whether the ID is in [`MODELS`], [`PARTNER_MODELS`] or
+    /// [`OPEN_MODELS`].
     pub registered: bool,
 }
 
@@ -363,6 +494,16 @@ impl ResolvedModel {
     /// `<publisher>/<model-id>`.
     pub fn override_key(&self) -> String {
         format!("{}/{}", self.publisher, self.model_id)
+    }
+
+    /// The request controls of a managed open model: its row's in
+    /// [`OPEN_MODELS`], else [`OpenModelControls::UNLISTED`]. Only the
+    /// open-model handler reads them.
+    pub fn open_model_controls(&self) -> OpenModelControls {
+        OPEN_MODELS
+            .iter()
+            .find(|row| row.publisher == self.publisher && row.id == self.model_id)
+            .map_or(OpenModelControls::UNLISTED, |row| row.controls)
     }
 
     /// The location for this model's requests.
@@ -429,9 +570,10 @@ pub enum ModelError {
     /// The name does not match any accepted form.
     #[error(
         "unsupported Vertex AI model {requested:?}; use a Gemini model ID (for example \
-         gemini-3.5-flash), vertex/<gemini-model-id> or vertex/google/<gemini-model-id>, or \
+         gemini-3.5-flash), vertex/<gemini-model-id> or vertex/google/<gemini-model-id>, \
          vertex/<publisher>/<model-id> with publisher anthropic, xai, mistralai, openai (gpt-* \
-         models) or meta (muse-* models)"
+         models) or meta (muse-* models), or vertex/<publisher>/<model-id>-maas for a Model \
+         Garden managed open model"
     )]
     Unsupported {
         /// The model name as requested.
@@ -457,8 +599,8 @@ pub enum ModelError {
     FamilyNotSupported {
         /// The model name as requested.
         requested: String,
-        /// The family's name, from [`Family::label`] or one of the labels of
-        /// the forms that have no family yet.
+        /// The family's name, from [`Family::label`] or the label of the
+        /// form that has no family yet ([`DEPLOYED_ENDPOINT_FAMILY_LABEL`]).
         family: &'static str,
     },
 }
@@ -478,11 +620,12 @@ fn served_family_labels() -> String {
 ///
 /// 1. a name without `/` is a Gemini model ID;
 /// 2. `endpoint/<name>` is a deployed endpoint, not supported yet;
-/// 3. `<publisher>/<model-id>` in [`PARTNER_MODELS`] takes that row;
+/// 3. `<publisher>/<model-id>` in [`PARTNER_MODELS`] or [`OPEN_MODELS`]
+///    takes that row;
 /// 4. otherwise by pattern: `google/gemini-*` is Gemini, `anthropic/*`
 ///    Claude, `xai/*` Grok, `mistralai/*` Mistral, `openai/gpt-*` OpenAI and
-///    `meta/muse-*` Muse unless they end in `-maas`, and any
-///    `<publisher>/<model-id>-maas` a managed open model, not supported yet.
+///    `meta/muse-*` Muse unless they end in `-maas`, and any other
+///    `<publisher>/<model-id>-maas` a managed open model.
 ///
 /// An ID found only by pattern is accepted with its family's defaults so
 /// new models work before they are registered.
@@ -491,8 +634,8 @@ fn served_family_labels() -> String {
 ///
 /// Returns [`ModelError::Unsupported`] for any other form,
 /// [`ModelError::InvalidId`] when the ID could not be placed safely in the
-/// request URL, and [`ModelError::FamilyNotSupported`] for open models and
-/// deployed endpoints.
+/// request URL, and [`ModelError::FamilyNotSupported`] for deployed
+/// endpoints.
 pub fn resolve(raw: &str) -> Result<ResolvedModel, ModelError> {
     let name = raw.strip_prefix(MODEL_PREFIX).unwrap_or(raw);
     let unsupported = || ModelError::Unsupported {
@@ -501,15 +644,14 @@ pub fn resolve(raw: &str) -> Result<ResolvedModel, ModelError> {
     let invalid = || ModelError::InvalidId {
         requested: raw.to_string(),
     };
-    let not_supported = |family| ModelError::FamilyNotSupported {
-        requested: raw.to_string(),
-        family,
-    };
     let Some((publisher, id)) = name.split_once('/') else {
         return gemini(name).ok_or_else(invalid);
     };
     if name.starts_with(ENDPOINT_PREFIX) {
-        return Err(not_supported(DEPLOYED_ENDPOINT_FAMILY_LABEL));
+        return Err(ModelError::FamilyNotSupported {
+            requested: raw.to_string(),
+            family: DEPLOYED_ENDPOINT_FAMILY_LABEL,
+        });
     }
     if let Some(row) = PARTNER_MODELS
         .iter()
@@ -521,6 +663,22 @@ pub fn resolve(raw: &str) -> Result<ResolvedModel, ModelError> {
             publisher: row.publisher.to_string(),
             model_id: row.id.to_string(),
             upstream_model: row.family.upstream_model(row.publisher, row.id),
+            api_version: row.api_version,
+            location: row.location,
+            supports_minimal: false,
+            registered: true,
+        });
+    }
+    if let Some(row) = OPEN_MODELS
+        .iter()
+        .find(|row| row.publisher == publisher && row.id == id)
+    {
+        return Ok(ResolvedModel {
+            family: Family::OpenModel,
+            wire: WireFormat::OpenApiChat,
+            publisher: row.publisher.to_string(),
+            model_id: row.id.to_string(),
+            upstream_model: Family::OpenModel.upstream_model(row.publisher, row.id),
             api_version: row.api_version,
             location: row.location,
             supports_minimal: false,
@@ -540,13 +698,7 @@ pub fn resolve(raw: &str) -> Result<ResolvedModel, ModelError> {
         "mistralai" => Family::Mistral,
         "openai" if id.starts_with("gpt-") && !open_model => Family::OpenAi,
         "meta" if id.starts_with("muse-") && !open_model => Family::MetaMuse,
-        _ if open_model && is_valid_publisher(publisher) => {
-            return Err(if is_valid_model_id(id) {
-                not_supported(OPEN_MODEL_FAMILY_LABEL)
-            } else {
-                invalid()
-            });
-        }
+        _ if open_model && is_valid_publisher(publisher) => Family::OpenModel,
         _ => return Err(unsupported()),
     };
     if !is_valid_model_id(id) {
@@ -696,25 +848,13 @@ mod tests {
                 "{raw}"
             );
         }
-        for (raw, family) in [
-            (
-                "vertex/endpoint/my-endpoint",
-                DEPLOYED_ENDPOINT_FAMILY_LABEL,
-            ),
-            (
-                "vertex/google/gemma-4-26b-a4b-it-maas",
-                OPEN_MODEL_FAMILY_LABEL,
-            ),
-        ] {
-            assert_eq!(
-                resolve(raw),
-                Err(ModelError::FamilyNotSupported {
-                    requested: raw.to_string(),
-                    family,
-                }),
-                "{raw}"
-            );
-        }
+        assert_eq!(
+            resolve("vertex/endpoint/my-endpoint"),
+            Err(ModelError::FamilyNotSupported {
+                requested: "vertex/endpoint/my-endpoint".to_string(),
+                family: DEPLOYED_ENDPOINT_FAMILY_LABEL,
+            })
+        );
         let message = resolve("vertex/ai21/jamba-1.5-large")
             .unwrap_err()
             .to_string();
@@ -747,7 +887,7 @@ mod tests {
     #[test]
     fn advertised_models_are_the_nine_ids_bare_and_prefixed() {
         let advertised = advertised_models();
-        assert_eq!(advertised.len(), 47);
+        assert_eq!(advertised.len(), 53);
         for (id, _) in EXPECTED {
             assert!(advertised.contains(&id.to_string()), "{id}");
             assert!(advertised.contains(&format!("vertex/{id}")), "{id}");
@@ -1115,24 +1255,17 @@ mod tests {
     }
 
     #[test]
-    fn open_models_and_deployed_endpoints_synthetic_are_refused_by_this_version() {
+    fn deployed_endpoints_synthetic_are_refused_by_this_version() {
         for (raw, family) in [
-            ("vertex/openai/gpt-oss-120b-maas", OPEN_MODEL_FAMILY_LABEL),
-            (
-                "vertex/meta/llama-4-maverick-17b-128e-instruct-maas",
-                OPEN_MODEL_FAMILY_LABEL,
-            ),
-            ("vertex/meta/muse-synthetic-maas", OPEN_MODEL_FAMILY_LABEL),
-            ("vertex/zai-org/glm-5.2-maas", OPEN_MODEL_FAMILY_LABEL),
-            (
-                "vertex/deepseek-ai/deepseek-v4.1-flash-maas",
-                OPEN_MODEL_FAMILY_LABEL,
-            ),
             (
                 "vertex/endpoint/synthetic-endpoint",
                 DEPLOYED_ENDPOINT_FAMILY_LABEL,
             ),
             ("vertex/endpoint/a/b", DEPLOYED_ENDPOINT_FAMILY_LABEL),
+            (
+                "vertex/endpoint/synthetic-maas",
+                DEPLOYED_ENDPOINT_FAMILY_LABEL,
+            ),
         ] {
             let error = resolve(raw).unwrap_err();
             assert_eq!(
@@ -1150,7 +1283,8 @@ mod tests {
             );
             assert!(
                 message.ends_with(
-                    "supported families: Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, Mistral"
+                    "supported families: Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, \
+                     Mistral, Model Garden managed open model"
                 ),
                 "{message}"
             );
@@ -1392,6 +1526,12 @@ mod tests {
                     "vertex/mistralai/mistral-medium-3",
                     "vertex/mistralai/mistral-small-2503",
                     "vertex/mistralai/codestral-2",
+                    "vertex/openai/gpt-oss-120b-maas",
+                    "vertex/zai-org/glm-5.2-maas",
+                    "vertex/google/gemma-4-26b-a4b-it-maas",
+                    "vertex/meta/llama-4-maverick-17b-128e-instruct-maas",
+                    "vertex/meta/llama-4-scout-17b-16e-instruct-maas",
+                    "vertex/deepseek-ai/deepseek-v4.1-flash-maas",
                 ]
                 .map(str::to_string),
             )
@@ -1418,7 +1558,8 @@ mod tests {
                 Family::Grok,
                 Family::OpenAi,
                 Family::MetaMuse,
-                Family::Mistral
+                Family::Mistral,
+                Family::OpenModel
             ]
         );
         let mut claude = Family::Claude.model_names();
@@ -1471,9 +1612,269 @@ mod tests {
             .into_iter()
             .map(|family| family.model_names().len())
             .sum();
-        assert_eq!(every, 18 + EXPECTED_PARTNERS.len());
+        assert_eq!(
+            every,
+            18 + EXPECTED_PARTNERS.len() + EXPECTED_OPEN_MODELS.len()
+        );
         for (raw, family, ..) in EXPECTED_PARTNERS {
             assert!(family.model_names().contains(&raw.to_string()), "{raw}");
         }
+    }
+
+    const OPEN_EFFORT: OpenModelControls = OpenModelControls {
+        thinking: ThinkingControl::ReasoningEffort,
+        tool_choice: ToolChoiceRule::AutoOrNone,
+    };
+    const OPEN_ENABLE_THINKING: OpenModelControls = OpenModelControls {
+        thinking: ThinkingControl::EnableThinking,
+        tool_choice: ToolChoiceRule::Any,
+    };
+    const OPEN_NO_SWITCH: OpenModelControls = OpenModelControls {
+        thinking: ThinkingControl::NoSwitch,
+        tool_choice: ToolChoiceRule::Any,
+    };
+
+    /// The managed open models of Google's open-model catalog: the name the
+    /// proxy accepts, the `model` value Google's examples send, the API
+    /// version, the location rule and the request controls. gpt-oss takes
+    /// `reasoning_effort` and neither `tool_choice: "required"` nor a named
+    /// tool; GLM and Gemma switch thinking with
+    /// `chat_template_kwargs.enable_thinking`; the Llama 4 page sends its
+    /// requests to `v1beta1` in `us-east5`; the DeepSeek page shows no body
+    /// example, so its `model` value follows the catalog's publisher and
+    /// resource ID.
+    const EXPECTED_OPEN_MODELS: &[(&str, &str, &str, LocationRule, OpenModelControls)] = &[
+        (
+            "vertex/openai/gpt-oss-120b-maas",
+            "openai/gpt-oss-120b-maas",
+            "v1",
+            LocationRule::Inherit,
+            OPEN_EFFORT,
+        ),
+        (
+            "vertex/zai-org/glm-5.2-maas",
+            "zai-org/glm-5.2-maas",
+            "v1",
+            LocationRule::Inherit,
+            OPEN_ENABLE_THINKING,
+        ),
+        (
+            "vertex/google/gemma-4-26b-a4b-it-maas",
+            "google/gemma-4-26b-a4b-it-maas",
+            "v1",
+            LocationRule::Inherit,
+            OPEN_ENABLE_THINKING,
+        ),
+        (
+            "vertex/meta/llama-4-maverick-17b-128e-instruct-maas",
+            "meta/llama-4-maverick-17b-128e-instruct-maas",
+            "v1beta1",
+            LocationRule::Fixed("us-east5"),
+            OPEN_NO_SWITCH,
+        ),
+        (
+            "vertex/meta/llama-4-scout-17b-16e-instruct-maas",
+            "meta/llama-4-scout-17b-16e-instruct-maas",
+            "v1beta1",
+            LocationRule::Fixed("us-east5"),
+            OPEN_NO_SWITCH,
+        ),
+        (
+            "vertex/deepseek-ai/deepseek-v4.1-flash-maas",
+            "deepseek-ai/deepseek-v4.1-flash-maas",
+            "v1",
+            LocationRule::Inherit,
+            OPEN_NO_SWITCH,
+        ),
+    ];
+
+    #[test]
+    fn open_model_rows_resolve_to_the_documented_upstream_version_location_and_controls() {
+        assert_eq!(OPEN_MODELS.len(), EXPECTED_OPEN_MODELS.len());
+        for (raw, upstream, version, location, controls) in EXPECTED_OPEN_MODELS {
+            let resolved = resolve(raw).unwrap_or_else(|error| panic!("{raw}: {error}"));
+            let (publisher, model_id) = raw
+                .strip_prefix("vertex/")
+                .and_then(|name| name.split_once('/'))
+                .unwrap();
+            assert_eq!(resolved.family, Family::OpenModel, "{raw}");
+            assert_eq!(resolved.wire, WireFormat::OpenApiChat, "{raw}");
+            assert_eq!(resolved.publisher, publisher, "{raw}");
+            assert_eq!(resolved.model_id, model_id, "{raw}");
+            assert_eq!(resolved.upstream_model, *upstream, "{raw}");
+            assert_eq!(resolved.api_version.as_str(), *version, "{raw}");
+            assert_eq!(resolved.location, *location, "{raw}");
+            assert_eq!(resolved.open_model_controls(), *controls, "{raw}");
+            assert_eq!(
+                resolved.override_key(),
+                raw.strip_prefix("vertex/").unwrap()
+            );
+            assert!(resolved.registered, "{raw}");
+            assert!(!resolved.supports_minimal, "{raw}");
+        }
+    }
+
+    #[test]
+    fn open_model_rows_have_valid_unique_ids_that_no_partner_row_shadows() {
+        for (index, row) in OPEN_MODELS.iter().enumerate() {
+            assert!(is_valid_publisher(row.publisher), "{}", row.publisher);
+            assert!(is_valid_model_id(row.id), "{}", row.id);
+            assert!(row.id.ends_with("-maas"), "{}", row.id);
+            assert!(
+                !OPEN_MODELS[..index]
+                    .iter()
+                    .any(|seen| seen.publisher == row.publisher && seen.id == row.id),
+                "{}/{} is listed twice",
+                row.publisher,
+                row.id
+            );
+            // `resolve` reads the partner rows first, so a partner row with
+            // the same name would hide this one.
+            assert!(
+                !PARTNER_MODELS
+                    .iter()
+                    .any(|partner| partner.publisher == row.publisher && partner.id == row.id),
+                "{}/{} is also a partner row",
+                row.publisher,
+                row.id
+            );
+        }
+    }
+
+    #[test]
+    fn unlisted_open_models_synthetic_take_the_family_defaults() {
+        for (raw, upstream) in [
+            (
+                "vertex/qwen/qwen-synthetic-9-maas",
+                "qwen/qwen-synthetic-9-maas",
+            ),
+            ("vertex/openai/gpt-oss-20b-maas", "openai/gpt-oss-20b-maas"),
+            (
+                "vertex/meta/llama-synthetic-5-maas",
+                "meta/llama-synthetic-5-maas",
+            ),
+            (
+                "vertex/meta/muse-synthetic-maas",
+                "meta/muse-synthetic-maas",
+            ),
+            (
+                "vertex/google/gemma-synthetic-maas",
+                "google/gemma-synthetic-maas",
+            ),
+            ("zai-org/glm-synthetic-maas", "zai-org/glm-synthetic-maas"),
+        ] {
+            let resolved = resolve(raw).unwrap_or_else(|error| panic!("{raw}: {error}"));
+            assert_eq!(resolved.family, Family::OpenModel, "{raw}");
+            assert_eq!(resolved.wire, WireFormat::OpenApiChat, "{raw}");
+            assert_eq!(resolved.upstream_model, upstream, "{raw}");
+            assert_eq!(resolved.api_version, ApiVersion::V1, "{raw}");
+            assert_eq!(resolved.location, LocationRule::Inherit, "{raw}");
+            assert_eq!(
+                resolved.open_model_controls(),
+                OpenModelControls::UNLISTED,
+                "{raw}"
+            );
+            assert!(!resolved.registered, "{raw}");
+        }
+        assert_eq!(OpenModelControls::UNLISTED, OPEN_NO_SWITCH);
+        // An open-model ID that cannot go into the request is invalid.
+        for raw in ["vertex/qwen/qwen 3-maas", "vertex/qwen/-maas"] {
+            assert_eq!(
+                resolve(raw),
+                Err(ModelError::InvalidId {
+                    requested: raw.to_string()
+                }),
+                "{raw}"
+            );
+        }
+        // Other families never get open-model controls from a lookup.
+        for raw in ["gemini-3.5-flash", "vertex/meta/muse-spark-1.3"] {
+            assert_eq!(
+                resolve(raw).unwrap().open_model_controls(),
+                OpenModelControls::UNLISTED,
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn llama_synthetic_stays_in_us_east5_unless_an_override_names_the_model() {
+        let maverick = "vertex/meta/llama-4-maverick-17b-128e-instruct-maas";
+        let scout = "vertex/meta/llama-4-scout-17b-16e-instruct-maas";
+        let none = VertexLocationOverrides::default();
+        for configured in ["global", "us", "us-central1"] {
+            for raw in [maverick, scout] {
+                assert_eq!(location_of(raw, &none, configured), "us-east5", "{raw}");
+            }
+            // The other open models take the configured location.
+            assert_eq!(
+                location_of("vertex/zai-org/glm-5.2-maas", &none, configured),
+                configured
+            );
+        }
+        // A `meta` key moves neither Llama nor Muse; a model key moves the
+        // model it names only.
+        let publisher = overrides("meta=us");
+        assert_eq!(location_of(maverick, &publisher, "global"), "us-east5");
+        assert_eq!(
+            location_of("vertex/meta/muse-spark-1.3", &publisher, "global"),
+            "global"
+        );
+        let model = overrides("meta/llama-4-maverick-17b-128e-instruct-maas=us-central1,meta=us");
+        assert_eq!(location_of(maverick, &model, "global"), "us-central1");
+        assert_eq!(location_of(scout, &model, "global"), "us-east5");
+        // An unlisted Llama follows the general guide: the publisher key,
+        // then the configured location.
+        assert_eq!(
+            location_of("vertex/meta/llama-synthetic-5-maas", &publisher, "global"),
+            "us"
+        );
+        let open = overrides("zai-org=europe-west4,openai/gpt-oss-120b-maas=us-central1");
+        assert_eq!(
+            location_of("vertex/zai-org/glm-5.2-maas", &open, "global"),
+            "europe-west4"
+        );
+        assert_eq!(
+            location_of("vertex/openai/gpt-oss-120b-maas", &open, "global"),
+            "us-central1"
+        );
+    }
+
+    #[test]
+    fn open_model_names_are_listed_by_the_family_and_the_400_names_the_maas_form() {
+        assert_eq!(
+            Family::OpenModel.model_names(),
+            vec![
+                "vertex/openai/gpt-oss-120b-maas",
+                "vertex/zai-org/glm-5.2-maas",
+                "vertex/google/gemma-4-26b-a4b-it-maas",
+                "vertex/meta/llama-4-maverick-17b-128e-instruct-maas",
+                "vertex/meta/llama-4-scout-17b-16e-instruct-maas",
+                "vertex/deepseek-ai/deepseek-v4.1-flash-maas",
+            ]
+        );
+        // Muse and Llama share `meta`, and gpt-* and gpt-oss share `openai`,
+        // but each family lists only its own names.
+        assert!(
+            !Family::MetaMuse
+                .model_names()
+                .iter()
+                .any(|name| name.contains("llama"))
+        );
+        assert!(
+            !Family::OpenAi
+                .model_names()
+                .iter()
+                .any(|name| name.ends_with("-maas"))
+        );
+        let message = resolve("vertex/ai21/jamba-1.5-large")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains(
+                "or vertex/<publisher>/<model-id>-maas for a Model Garden managed open model"
+            ),
+            "{message}"
+        );
     }
 }
