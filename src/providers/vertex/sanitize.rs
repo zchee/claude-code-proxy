@@ -55,8 +55,12 @@ static RESOURCE_NAME: LazyLock<Regex> = LazyLock::new(|| {
 ///
 /// 1. only the first [`MAX_SCANNED_BYTES`] are kept, cut on a character
 ///    boundary; when the cut falls inside a run of token or base64
-///    characters (letters, digits, `+/_-=%.~`), that partial run is dropped
-///    too, so a shortened secret or data run cannot survive as a prefix;
+///    characters (letters, digits, `+/_-=%.~`) or inside an occurrence of
+///    a listed secret, that run or occurrence is dropped whole, so a
+///    shortened secret or data run cannot survive as a prefix. Secrets are
+///    looked for in the full text at this point, so a secret that begins
+///    before the bound and ends after it leaves no part of itself, even
+///    when it contains characters that end a run;
 /// 2. every occurrence of each secret (pass the access token) becomes
 ///    `[redacted]`, and so does anything shaped like a Google access token
 ///    (`ya29.` and token characters), listed or not;
@@ -83,7 +87,7 @@ static RESOURCE_NAME: LazyLock<Regex> = LazyLock::new(|| {
 /// line breaks or `...` inserted inside a secret, a token or a run, which
 /// break the match.
 pub fn sanitize_vertex_text(text: &str, secrets: &[&str]) -> String {
-    let bounded = bounded_prefix(text);
+    let bounded = bounded_prefix(text, secrets);
     let without_secrets = redact_secrets_in_any_encoding(bounded, secrets);
     let without_tokens = ACCESS_TOKEN.replace_all(&without_secrets, REDACTED);
     let without_data = BASE64_RUN.replace_all(&without_tokens, |captures: &Captures| {
@@ -103,23 +107,62 @@ fn is_run_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || "+/_-=%.~".contains(c)
 }
 
-/// The first [`MAX_SCANNED_BYTES`] of `text`, cut on a character boundary.
-/// When the cut splits a run of [`is_run_char`] characters, the part of the
-/// run before the cut is dropped as well.
-fn bounded_prefix(text: &str) -> &str {
+/// The first [`MAX_SCANNED_BYTES`] of `text`, ended at the last character
+/// boundary that is not inside a run of [`is_run_char`] characters and not
+/// inside an occurrence of a non-empty secret, verbatim or with bytes
+/// percent-encoded once. Occurrences are found in the whole text, so one
+/// that begins before the bound and ends after it is dropped whole, and so
+/// is any run or other occurrence that the new end would split in turn.
+fn bounded_prefix<'a>(text: &'a str, secrets: &[&str]) -> &'a str {
     if text.len() <= MAX_SCANNED_BYTES {
         return text;
     }
+    let secrets: Vec<&[u8]> = secrets
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .map(|secret| secret.as_bytes())
+        .collect();
+    // Every byte of a secret takes one byte of text, or three when it is
+    // percent-encoded, so no match is longer than this.
+    let reach = 3 * secrets.iter().map(|secret| secret.len()).max().unwrap_or(0);
     let mut end = MAX_SCANNED_BYTES;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    let (head, rest) = text.split_at(end);
-    if rest.starts_with(is_run_char) {
-        head.trim_end_matches(is_run_char)
-    } else {
-        head
+    loop {
+        if text[end..].starts_with(is_run_char) {
+            end = text[..end].trim_end_matches(is_run_char).len();
+        }
+        let secret_free = secret_free_end(text, end, &secrets, reach);
+        if secret_free == end {
+            return &text[..end];
+        }
+        end = secret_free;
     }
+}
+
+/// The last character boundary at or before `end` that no match of a
+/// secret in the whole of `text` begins before and ends after. Positions
+/// are checked from `end` backwards; when a match crosses the current end,
+/// the end moves to where that match begins, so a match that overlaps it
+/// from further back is dropped as well. The check stops `reach` bytes
+/// (the longest possible match) before the current end, as no match that
+/// begins earlier can cross it.
+fn secret_free_end(text: &str, end: usize, secrets: &[&[u8]], reach: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut cut = end;
+    let mut at = end;
+    while at > 0 && at - 1 + reach > cut {
+        at -= 1;
+        let crosses = text.is_char_boundary(at)
+            && secrets
+                .iter()
+                .any(|secret| match_end(bytes, at, secret).is_some_and(|stop| stop > cut));
+        if crosses {
+            cut = at;
+        }
+    }
+    cut
 }
 
 /// Replaces every occurrence of each non-empty secret with `[redacted]`.
@@ -525,6 +568,99 @@ mod tests {
         assert_eq!(
             sanitize_vertex_text(&text, &[]),
             format!("[redacted len=65000] {}", " ".repeat(479))
+        );
+    }
+
+    #[test]
+    fn sanitize_synthetic_secret_across_the_scan_bound_leaves_no_part() {
+        // `!` ends a run, so the run rule alone would keep `abc!`. The
+        // secret starts at byte 65531 and the bound is at 65536.
+        let secret = "abc!defgh";
+        let text = format!("{} {secret} tail", "A".repeat(65530));
+        assert_eq!(
+            sanitize_vertex_text(&text, &[secret]),
+            "[redacted len=65530] "
+        );
+        // The same secret with its `d` percent-encoded: the `%` is the last
+        // byte before the bound and `64` the first two after it.
+        let text = format!("{} abc!%64efgh tail", "A".repeat(65530));
+        assert_eq!(
+            sanitize_vertex_text(&text, &[secret]),
+            "[redacted len=65530] "
+        );
+    }
+
+    #[test]
+    fn sanitize_synthetic_secret_ending_or_starting_at_the_scan_bound() {
+        let secret = "abc!defgh";
+        // Bytes 65527..65536: the secret ends exactly at the bound, so it is
+        // whole in the scanned text and redacted as usual.
+        let text = format!("{} {secret} tail", "A".repeat(65526));
+        assert_eq!(
+            sanitize_vertex_text(&text, &[secret]),
+            "[redacted len=65526] [redacted]"
+        );
+        // The secret starts exactly at the bound and is not scanned at all.
+        let text = format!("{} {secret} tail", "A".repeat(65535));
+        assert_eq!(
+            sanitize_vertex_text(&text, &[secret]),
+            "[redacted len=65535] "
+        );
+    }
+
+    #[test]
+    fn sanitize_synthetic_secret_across_the_scan_bound_next_to_multibyte_text() {
+        // The bound falls inside the two bytes of `ü` (65535..65537), so the
+        // cut moves back to 65535, still inside the secret.
+        let secret = "abc!\u{fc}efgh";
+        let text = format!("{} {secret} tail", "A".repeat(65530));
+        assert_eq!(
+            sanitize_vertex_text(&text, &[secret]),
+            "[redacted len=65530] "
+        );
+        // A two-byte `é` right before a secret that crosses the bound is
+        // kept whole.
+        let secret = "abc!defgh";
+        let text = format!("{} \u{e9}{secret} tail", "A".repeat(65529));
+        assert_eq!(
+            sanitize_vertex_text(&text, &[secret]),
+            "[redacted len=65529] \u{e9}"
+        );
+    }
+
+    #[test]
+    fn sanitize_synthetic_secret_in_text_shorter_than_the_scan_bound() {
+        let secret = "abc!defgh";
+        assert_eq!(
+            sanitize_vertex_text("Got abc!defgh and abc!%64efgh here", &[secret]),
+            "Got [redacted] and [redacted] here"
+        );
+        // Exactly as long as the bound: nothing is cut.
+        let text = format!("{} {secret}", "A".repeat(65526));
+        assert_eq!(text.len(), MAX_SCANNED_BYTES);
+        assert_eq!(
+            sanitize_vertex_text(&text, &[secret]),
+            "[redacted len=65526] [redacted]"
+        );
+    }
+
+    #[test]
+    fn sanitize_synthetic_cut_moved_by_one_rule_is_checked_by_the_other() {
+        // Overlapping matches of one secret: the match at 65532 crosses the
+        // bound, and the match at 65530 crosses where that one begins.
+        let secret = "x!x!x";
+        let text = format!("{} x!x!x!x tail", "A".repeat(65529));
+        assert_eq!(
+            sanitize_vertex_text(&text, &[secret]),
+            "[redacted len=65529] "
+        );
+        // The run rule drops the `y` run across the bound, which ends the
+        // text inside the secret `k!yy`; the secret is then dropped too.
+        let secret = "k!yy";
+        let text = format!("{} k!{} tail", "A".repeat(65519), "y".repeat(100));
+        assert_eq!(
+            sanitize_vertex_text(&text, &[secret]),
+            "[redacted len=65519] "
         );
     }
 }
