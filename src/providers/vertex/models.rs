@@ -3,7 +3,8 @@
 //! the API version and the rule that picks the location.
 
 use crate::config::{
-    VERTEX_LOCATION_OVERRIDES_ENV, VERTEX_LOCATION_OVERRIDES_KEY, VertexLocationOverrides,
+    VERTEX_LOCATION_OVERRIDES_ENV, VERTEX_LOCATION_OVERRIDES_KEY, VertexEndpoints,
+    VertexLocationOverrides, is_vertex_endpoint_name,
 };
 
 /// Prefix that routes any model name to this provider.
@@ -12,10 +13,14 @@ pub const MODEL_PREFIX: &str = "vertex/";
 /// Prefix, after `vertex/`, of a deployed endpoint (`vertex/endpoint/<name>`).
 const ENDPOINT_PREFIX: &str = "endpoint/";
 
+/// The publisher a resolved deployed endpoint carries. It is never sent:
+/// the endpoint's own settings say where its requests go.
+pub const DEPLOYED_ENDPOINT_PUBLISHER: &str = "endpoint";
+
 /// Suffix of the Model Garden managed open models (`…-maas`).
 const OPEN_MODEL_SUFFIX: &str = "-maas";
 
-/// Name of the deployed endpoints in messages. They have no family yet.
+/// Name of the deployed endpoints in messages.
 pub const DEPLOYED_ENDPOINT_FAMILY_LABEL: &str = "deployed endpoint (endpoint/<name>)";
 
 /// The locations Google documents for every Mistral model.
@@ -99,11 +104,15 @@ pub enum Family {
     /// through the OpenAI-compatible Chat Completions API under
     /// `endpoints/openapi`.
     OpenModel,
+    /// A model the user deployed to a Vertex AI endpoint, named in
+    /// `vertex.endpoints` (`vertex/endpoint/<name>`), through the
+    /// endpoint's OpenAI-compatible Chat Completions API.
+    DeployedEndpoint,
 }
 
 impl Family {
     /// Every family.
-    pub const ALL: [Family; 7] = [
+    pub const ALL: [Family; 8] = [
         Family::Gemini,
         Family::Claude,
         Family::Grok,
@@ -111,6 +120,7 @@ impl Family {
         Family::MetaMuse,
         Family::Mistral,
         Family::OpenModel,
+        Family::DeployedEndpoint,
     ];
 
     /// The family's name in messages.
@@ -123,6 +133,7 @@ impl Family {
             Family::MetaMuse => "Meta Muse",
             Family::Mistral => "Mistral",
             Family::OpenModel => "Model Garden managed open model",
+            Family::DeployedEndpoint => DEPLOYED_ENDPOINT_FAMILY_LABEL,
         }
     }
 
@@ -139,6 +150,7 @@ impl Family {
             },
             Family::Mistral => WireFormat::MistralChat,
             Family::OpenModel => WireFormat::OpenApiChat,
+            Family::DeployedEndpoint => WireFormat::EndpointChat,
         }
     }
 
@@ -156,19 +168,25 @@ impl Family {
                 | Family::MetaMuse
                 | Family::Mistral
                 | Family::OpenModel
+                | Family::DeployedEndpoint
         )
     }
 
     /// The location rule of a model of the family that is not in the table.
+    /// A deployed endpoint's location comes from its own settings instead,
+    /// so the rule is never read for one.
     pub const fn default_location(self) -> LocationRule {
         match self {
             Family::MetaMuse => LocationRule::Fixed("global"),
             Family::Mistral => LocationRule::Required {
                 allowed: MISTRAL_LOCATIONS,
             },
-            Family::Gemini | Family::Claude | Family::Grok | Family::OpenAi | Family::OpenModel => {
-                LocationRule::Inherit
-            }
+            Family::Gemini
+            | Family::Claude
+            | Family::Grok
+            | Family::OpenAi
+            | Family::OpenModel
+            | Family::DeployedEndpoint => LocationRule::Inherit,
         }
     }
 
@@ -182,15 +200,19 @@ impl Family {
             | Family::Claude
             | Family::OpenAi
             | Family::MetaMuse
-            | Family::Mistral => id.to_string(),
+            | Family::Mistral
+            | Family::DeployedEndpoint => id.to_string(),
         }
     }
 
     /// The names of the family's registered models as they would be listed:
     /// each Gemini ID bare and with `vertex/`, and every other model as
-    /// `vertex/<publisher>/<model-id>`. Not sorted.
+    /// `vertex/<publisher>/<model-id>`. Not sorted. Deployed endpoints have
+    /// no registered names; [`advertised_models_with`] lists the configured
+    /// ones.
     pub fn model_names(self) -> Vec<String> {
         match self {
+            Family::DeployedEndpoint => Vec::new(),
             Family::Gemini => MODELS
                 .iter()
                 .flat_map(|model| [model.id.to_string(), format!("{MODEL_PREFIX}{}", model.id)])
@@ -227,6 +249,10 @@ pub enum WireFormat {
     /// OpenAI Chat Completions on `endpoints/openapi/chat/completions`, with
     /// `<publisher>/<model-id>` in the body's `model`.
     OpenApiChat,
+    /// OpenAI Chat Completions on a deployed endpoint's
+    /// `endpoints/{endpoint}/chat/completions`, at its dedicated host, with
+    /// the configured `model` in the body.
+    EndpointChat,
 }
 
 /// Where a Responses request is sent.
@@ -572,8 +598,9 @@ pub enum ModelError {
         "unsupported Vertex AI model {requested:?}; use a Gemini model ID (for example \
          gemini-3.5-flash), vertex/<gemini-model-id> or vertex/google/<gemini-model-id>, \
          vertex/<publisher>/<model-id> with publisher anthropic, xai, mistralai, openai (gpt-* \
-         models) or meta (muse-* models), or vertex/<publisher>/<model-id>-maas for a Model \
-         Garden managed open model"
+         models) or meta (muse-* models), vertex/<publisher>/<model-id>-maas for a Model \
+         Garden managed open model, or vertex/endpoint/<name> for an endpoint named in \
+         vertex.endpoints in config.json"
     )]
     Unsupported {
         /// The model name as requested.
@@ -589,6 +616,16 @@ pub enum ModelError {
         /// The model name as requested.
         requested: String,
     },
+    /// `vertex/endpoint/<name>` with a name that no `vertex.endpoints`
+    /// entry can have.
+    #[error(
+        "invalid Vertex AI endpoint name in {requested:?}; the name after vertex/endpoint/ is \
+         a key of vertex.endpoints in config.json: letters, digits, '_' and '-'"
+    )]
+    InvalidEndpointName {
+        /// The model name as requested.
+        requested: String,
+    },
     /// The name is valid, but this version of the proxy does not send
     /// requests for its family yet.
     #[error(
@@ -599,8 +636,7 @@ pub enum ModelError {
     FamilyNotSupported {
         /// The model name as requested.
         requested: String,
-        /// The family's name, from [`Family::label`] or the label of the
-        /// form that has no family yet ([`DEPLOYED_ENDPOINT_FAMILY_LABEL`]).
+        /// The family's name, from [`Family::label`].
         family: &'static str,
     },
 }
@@ -619,7 +655,10 @@ fn served_family_labels() -> String {
 /// `vertex/` is removed first, then the first rule that matches decides:
 ///
 /// 1. a name without `/` is a Gemini model ID;
-/// 2. `endpoint/<name>` is a deployed endpoint, not supported yet;
+/// 2. `endpoint/<name>` is a deployed endpoint: the model carries the name
+///    as its model ID and upstream model, and the provider finds the
+///    endpoint's settings, including the `model` it is sent with, by that
+///    name;
 /// 3. `<publisher>/<model-id>` in [`PARTNER_MODELS`] or [`OPEN_MODELS`]
 ///    takes that row;
 /// 4. otherwise by pattern: `google/gemini-*` is Gemini, `anthropic/*`
@@ -634,8 +673,8 @@ fn served_family_labels() -> String {
 ///
 /// Returns [`ModelError::Unsupported`] for any other form,
 /// [`ModelError::InvalidId`] when the ID could not be placed safely in the
-/// request URL, and [`ModelError::FamilyNotSupported`] for deployed
-/// endpoints.
+/// request URL, and [`ModelError::InvalidEndpointName`] for an endpoint
+/// name that no configured endpoint can have.
 pub fn resolve(raw: &str) -> Result<ResolvedModel, ModelError> {
     let name = raw.strip_prefix(MODEL_PREFIX).unwrap_or(raw);
     let unsupported = || ModelError::Unsupported {
@@ -647,10 +686,23 @@ pub fn resolve(raw: &str) -> Result<ResolvedModel, ModelError> {
     let Some((publisher, id)) = name.split_once('/') else {
         return gemini(name).ok_or_else(invalid);
     };
-    if name.starts_with(ENDPOINT_PREFIX) {
-        return Err(ModelError::FamilyNotSupported {
-            requested: raw.to_string(),
-            family: DEPLOYED_ENDPOINT_FAMILY_LABEL,
+    if let Some(endpoint) = name.strip_prefix(ENDPOINT_PREFIX) {
+        if !is_vertex_endpoint_name(endpoint) {
+            return Err(ModelError::InvalidEndpointName {
+                requested: raw.to_string(),
+            });
+        }
+        let family = Family::DeployedEndpoint;
+        return Ok(ResolvedModel {
+            family,
+            wire: family.wire(),
+            publisher: DEPLOYED_ENDPOINT_PUBLISHER.to_string(),
+            model_id: endpoint.to_string(),
+            upstream_model: family.upstream_model(DEPLOYED_ENDPOINT_PUBLISHER, endpoint),
+            api_version: ApiVersion::V1,
+            location: family.default_location(),
+            supports_minimal: false,
+            registered: false,
         });
     }
     if let Some(row) = PARTNER_MODELS
@@ -749,6 +801,20 @@ pub fn advertised_models() -> Vec<String> {
     result
 }
 
+/// [`advertised_models`] and `vertex/endpoint/<name>` for every endpoint of
+/// `endpoints` whose settings are valid, sorted.
+pub fn advertised_models_with(endpoints: &VertexEndpoints) -> Vec<String> {
+    let mut result = advertised_models();
+    result.extend(
+        endpoints
+            .usable_names()
+            .map(|name| format!("{MODEL_PREFIX}{ENDPOINT_PREFIX}{name}")),
+    );
+    result.sort_unstable();
+    result.dedup();
+    result
+}
+
 fn is_valid_publisher(publisher: &str) -> bool {
     let mut bytes = publisher.bytes();
     let Some(first) = bytes.next() else {
@@ -835,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn other_publishers_and_endpoints_are_rejected() {
+    fn other_publishers_are_rejected() {
         for raw in [
             "vertex/ai21/jamba-1.5-large",
             "vertex/google/gemini-3.5-flash/extra",
@@ -848,13 +914,6 @@ mod tests {
                 "{raw}"
             );
         }
-        assert_eq!(
-            resolve("vertex/endpoint/my-endpoint"),
-            Err(ModelError::FamilyNotSupported {
-                requested: "vertex/endpoint/my-endpoint".to_string(),
-                family: DEPLOYED_ENDPOINT_FAMILY_LABEL,
-            })
-        );
         let message = resolve("vertex/ai21/jamba-1.5-large")
             .unwrap_err()
             .to_string();
@@ -1255,46 +1314,91 @@ mod tests {
     }
 
     #[test]
-    fn deployed_endpoints_synthetic_are_refused_by_this_version() {
-        for (raw, family) in [
-            (
-                "vertex/endpoint/synthetic-endpoint",
-                DEPLOYED_ENDPOINT_FAMILY_LABEL,
-            ),
-            ("vertex/endpoint/a/b", DEPLOYED_ENDPOINT_FAMILY_LABEL),
-            (
-                "vertex/endpoint/synthetic-maas",
-                DEPLOYED_ENDPOINT_FAMILY_LABEL,
-            ),
+    fn deployed_endpoints_synthetic_resolve_by_their_configured_name() {
+        for (raw, name) in [
+            ("vertex/endpoint/synthetic-endpoint", "synthetic-endpoint"),
+            ("vertex/endpoint/my_llm-2", "my_llm-2"),
+            // A name that looks like a managed open model is still an
+            // endpoint name.
+            ("vertex/endpoint/synthetic-maas", "synthetic-maas"),
+            ("endpoint/synthetic", "synthetic"),
+        ] {
+            assert_eq!(
+                resolve(raw),
+                Ok(ResolvedModel {
+                    family: Family::DeployedEndpoint,
+                    wire: WireFormat::EndpointChat,
+                    publisher: "endpoint".to_string(),
+                    model_id: name.to_string(),
+                    upstream_model: name.to_string(),
+                    api_version: ApiVersion::V1,
+                    location: LocationRule::Inherit,
+                    supports_minimal: false,
+                    registered: false,
+                }),
+                "{raw}"
+            );
+        }
+        for raw in [
+            "vertex/endpoint/a/b",
+            "vertex/endpoint/",
+            "vertex/endpoint/my llm",
+            "vertex/endpoint/my.llm",
+            "vertex/endpoint/..",
         ] {
             let error = resolve(raw).unwrap_err();
             assert_eq!(
                 error,
-                ModelError::FamilyNotSupported {
-                    requested: raw.to_string(),
-                    family,
+                ModelError::InvalidEndpointName {
+                    requested: raw.to_string()
                 },
                 "{raw}"
             );
-            let message = error.to_string();
-            assert!(
-                message.starts_with("this version of claude-code-proxy does not support the "),
-                "{message}"
-            );
-            assert!(
-                message.ends_with(
-                    "supported families: Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, \
-                     Mistral, Model Garden managed open model"
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "invalid Vertex AI endpoint name in {raw:?}; the name after vertex/endpoint/ \
+                     is a key of vertex.endpoints in config.json: letters, digits, '_' and '-'"
                 ),
-                "{message}"
+                "{raw}"
             );
         }
+        let long = format!("vertex/endpoint/{}", "a".repeat(65));
+        assert!(matches!(
+            resolve(&long),
+            Err(ModelError::InvalidEndpointName { .. })
+        ));
         // An open-model ID that cannot go into the request is still invalid.
         assert_eq!(
             resolve("vertex/zai-org/glm 5-maas"),
             Err(ModelError::InvalidId {
                 requested: "vertex/zai-org/glm 5-maas".to_string()
             })
+        );
+    }
+
+    #[test]
+    fn advertised_models_with_synthetic_endpoints_add_only_the_usable_names() {
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"vertex":{"endpoints":{
+                "my-llm":{"endpoint":"1234567890123456789","location":"us-central1","model":"gemma-2-9b-it"},
+                "broken":{"endpoint":"1","location":"global","model":"m"}
+            }}}"#,
+        )
+        .unwrap();
+        let endpoints = crate::config::resolve_vertex_endpoints(config.path());
+        let listed = advertised_models_with(&endpoints);
+        assert_eq!(listed.len(), 54, "{listed:?}");
+        assert!(listed.contains(&"vertex/endpoint/my-llm".to_string()));
+        assert!(!listed.iter().any(|name| name.contains("broken")));
+        let mut sorted = listed.clone();
+        sorted.sort_unstable();
+        assert_eq!(listed, sorted);
+        assert_eq!(
+            advertised_models_with(&VertexEndpoints::default()),
+            advertised_models()
         );
     }
 
@@ -1559,7 +1663,8 @@ mod tests {
                 Family::OpenAi,
                 Family::MetaMuse,
                 Family::Mistral,
-                Family::OpenModel
+                Family::OpenModel,
+                Family::DeployedEndpoint
             ]
         );
         let mut claude = Family::Claude.model_names();

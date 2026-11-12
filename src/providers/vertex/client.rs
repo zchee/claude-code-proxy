@@ -37,6 +37,10 @@ pub const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(10);
 /// alone then decides the error.
 pub const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
+/// Largest body read from a metadata call such as `endpoints.get`. An
+/// endpoint's metadata is a few kilobytes; a longer body is refused.
+pub const MAX_METADATA_BODY_BYTES: usize = 1024 * 1024;
+
 /// Largest retry delay passed on as `retry-after`: one day, in seconds.
 const MAX_RETRY_AFTER_SECS: u64 = 86_400;
 
@@ -332,7 +336,7 @@ impl UpstreamErrorDetail {
 
     /// `STATUS: message`, the message alone, or `None` when the body had
     /// neither.
-    fn text(&self) -> Option<String> {
+    pub(super) fn text(&self) -> Option<String> {
         match (&self.status, &self.message) {
             (Some(status), Some(message)) => Some(format!("{status}: {message}")),
             (None, Some(message)) => Some(message.clone()),
@@ -803,6 +807,27 @@ impl VertexClient {
         credentials: &VertexCredentials,
         traffic: Option<&TrafficCapture>,
     ) -> Result<VertexResponse, VertexError> {
+        self.post_mapped(call, body, credentials, traffic, |status, detail| {
+            VertexError::from_upstream(status, detail, target, model)
+        })
+        .await
+    }
+
+    /// [`Self::post`], with a non-success answer turned into an error by
+    /// `map_error` from the upstream status and the sanitised error body.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::post_sse`], except that `map_error` decides the error
+    /// for a non-success status.
+    pub async fn post_mapped<B: Serialize + ?Sized>(
+        &self,
+        call: UpstreamCall,
+        body: &B,
+        credentials: &VertexCredentials,
+        traffic: Option<&TrafficCapture>,
+        map_error: impl FnOnce(StatusCode, UpstreamErrorDetail) -> VertexError,
+    ) -> Result<VertexResponse, VertexError> {
         let UpstreamCall {
             url,
             accept,
@@ -874,7 +899,93 @@ impl VertexClient {
         }
         let secrets: Vec<&str> = token.as_deref().into_iter().collect();
         let detail = self.error_detail(response, &secrets).await;
-        Err(VertexError::from_upstream(status, detail, target, model))
+        Err(map_error(status, detail))
+    }
+
+    /// GETs `url` with the credentials and reads the JSON body: at most
+    /// [`MAX_METADATA_BODY_BYTES`], within the error-body timeout once the
+    /// headers have arrived. A capture records the request metadata, with
+    /// every credential header redacted, and the response status and safe
+    /// headers, under names that start with `capture_stem`; the body is not
+    /// recorded.
+    ///
+    /// # Errors
+    ///
+    /// No credentials: 401. No connection: 502. No response headers within
+    /// [`RESPONSE_HEADER_TIMEOUT`]: 504. A non-success status: `map_error`.
+    /// A body that is too long, late, cut off or not JSON: 502.
+    pub async fn get_json(
+        &self,
+        url: reqwest::Url,
+        credentials: &VertexCredentials,
+        traffic: Option<&TrafficCapture>,
+        capture_stem: &str,
+        map_error: impl FnOnce(StatusCode, UpstreamErrorDetail) -> VertexError,
+    ) -> Result<serde_json::Value, VertexError> {
+        let accept = "application/json";
+        let auth_headers = credentials.headers().await?;
+        let token = access_token(&auth_headers).map(str::to_string);
+        if let Some(capture) = traffic {
+            capture.write_json(
+                &format!("{capture_stem}-request-metadata"),
+                &serde_json::json!({
+                    "method": "GET",
+                    "url": url.as_str(),
+                    "provider": "vertex",
+                    "transport": "http",
+                    "headers": request_headers_for_capture(&auth_headers, accept, &http::HeaderMap::new()),
+                }),
+            );
+        }
+        let request = self
+            .client
+            .get(url)
+            .headers(auth_headers)
+            .header(http::header::ACCEPT, accept)
+            .header(http::header::USER_AGENT, USER_AGENT);
+        let response =
+            match tokio::time::timeout(self.response_header_timeout, request.send()).await {
+                Err(_) => {
+                    return Err(VertexError::response_header_timeout(
+                        self.response_header_timeout,
+                    ));
+                }
+                Ok(Err(_)) => return Err(VertexError::unreachable()),
+                Ok(Ok(response)) => response,
+            };
+        let status = response.status();
+        if let Some(capture) = traffic {
+            capture.write_json(
+                &format!("{capture_stem}-response-headers"),
+                &serde_json::json!({
+                    "status": status.as_u16(),
+                    "headers": safe_response_headers(response.headers()),
+                }),
+            );
+        }
+        if !status.is_success() {
+            let secrets: Vec<&str> = token.as_deref().into_iter().collect();
+            let detail = self.error_detail(response, &secrets).await;
+            return Err(map_error(status, detail));
+        }
+        let unreadable = || {
+            VertexError::new(
+                ProviderErrorKind::Api,
+                StatusCode::BAD_GATEWAY,
+                Some(status),
+                "Vertex AI returned a metadata body that could not be read as JSON",
+            )
+        };
+        let (body, cut) = tokio::time::timeout(
+            self.error_body_timeout,
+            read_bounded(response, MAX_METADATA_BODY_BYTES),
+        )
+        .await
+        .map_err(|_| unreadable())?;
+        if cut {
+            return Err(unreadable());
+        }
+        serde_json::from_slice(&body).map_err(|_| unreadable())
     }
 
     /// Reads at most [`MAX_ERROR_BODY_BYTES`] for at most the error-body

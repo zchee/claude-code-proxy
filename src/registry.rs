@@ -102,9 +102,13 @@ impl Registry {
             "opencode".into(),
             crate::providers::opencode::advertised_models(),
         );
+        // The deployed endpoints of config.json are read once, here: a
+        // listing needs their names before any request is sent.
         models.insert(
             "vertex".into(),
-            crate::providers::vertex::models::advertised_models(),
+            crate::providers::vertex::models::advertised_models_with(
+                &crate::config::vertex_endpoints(),
+            ),
         );
 
         let mut handlers = BTreeMap::new();
@@ -579,7 +583,13 @@ mod tests {
     fn vertex_models_route_to_vertex_without_stealing_existing_provider_ids() {
         let registry = Registry::new(AliasProvider::Codex);
         let advertised = registry.supported_models_for("vertex");
-        assert_eq!(advertised.len(), 53, "{advertised:?}");
+        // The registry also lists the endpoints of this machine's
+        // config.json, which the test does not control.
+        let registered = advertised
+            .iter()
+            .filter(|model| !model.starts_with("vertex/endpoint/"))
+            .count();
+        assert_eq!(registered, 53, "{advertised:?}");
         for model in &advertised {
             assert_eq!(
                 registry.provider_for_model(model, None).unwrap().name(),

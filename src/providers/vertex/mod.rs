@@ -4,7 +4,9 @@
 //! models (sent as OpenAI Responses requests), for Mistral (sent in
 //! Mistral's chat format on `streamRawPredict`) and for Model Garden's
 //! managed open models (sent as OpenAI Chat Completions requests to
-//! `endpoints/openapi/chat/completions`).
+//! `endpoints/openapi/chat/completions`), and for models the user deployed
+//! to a Vertex AI endpoint (sent as OpenAI Chat Completions requests to the
+//! endpoint's dedicated host; see [`endpoints`]).
 //!
 //! The upstream is always asked for a stream. A non-streaming client gets a
 //! message built from the same translation, so both modes decide the stop
@@ -18,6 +20,7 @@ mod buffered;
 pub mod claude;
 pub mod cli;
 pub mod client;
+mod endpoints;
 mod mistral;
 pub mod models;
 mod openapi_chat;
@@ -42,7 +45,7 @@ use crate::anthropic::{
     error::json_error,
     schema::{CountTokensResponse, MessagesRequest},
 };
-use crate::config::ResolvedVertexConfig;
+use crate::config::{ResolvedVertexConfig, VertexEndpoints};
 use crate::provider::{
     CliHandlers, Generation, GenerationBody, Provider, ProviderError, ProviderErrorKind,
     RequestContext,
@@ -57,6 +60,7 @@ use self::auth::{VertexAuthError, VertexCredentials};
 use self::buffered::{BufferedFailure, BufferedSink, ReadEnd, read_upstream};
 use self::cli::VERTEX_CLI;
 use self::client::{VertexClient, VertexError, VertexResponse, VertexTarget};
+use self::endpoints::{DedicatedHosts, EndpointCall};
 use self::models::{ModelError, ResolvedModel, WireFormat};
 use self::sanitize::{redact_secrets, sanitize_vertex_text};
 use self::translate::request::prepare_request;
@@ -77,6 +81,10 @@ const BUFFERED_SUMMARY_NAME: &str = "061-vertex-buffered-summary";
 /// What every request needs once the settings and HTTP client exist.
 struct Ready {
     config: ResolvedVertexConfig,
+    /// The deployed endpoints of `config.json`, read with the settings.
+    endpoints: VertexEndpoints,
+    /// The dedicated hosts the endpoints reported, kept once read.
+    dedicated_hosts: DedicatedHosts,
     client: VertexClient,
     /// Set by the first request that obtains an access token with them, and
     /// kept from then on. Until then each request looks for Application
@@ -108,6 +116,9 @@ enum Reception {
     /// A managed open model's Chat Completions stream. `model` is the name
     /// the client asked for.
     OpenModel { message_id: String, model: String },
+    /// A deployed endpoint's Chat Completions stream. `model` is the name
+    /// the client asked for.
+    Endpoint { message_id: String, model: String },
 }
 
 /// The `vertex` provider.
@@ -128,15 +139,28 @@ impl VertexProvider {
     }
 
     /// A provider with fixed settings, credentials and client, for tests
-    /// against a local upstream (point the settings' base URL at it).
+    /// against a local upstream (point the settings' base URL at it). It
+    /// knows no deployed endpoint.
     pub fn with_client(
         client: VertexClient,
         credentials: VertexCredentials,
         config: ResolvedVertexConfig,
     ) -> Self {
+        Self::with_client_and_endpoints(client, credentials, config, VertexEndpoints::default())
+    }
+
+    /// [`Self::with_client`] with the deployed endpoints `endpoints`.
+    pub fn with_client_and_endpoints(
+        client: VertexClient,
+        credentials: VertexCredentials,
+        config: ResolvedVertexConfig,
+        endpoints: VertexEndpoints,
+    ) -> Self {
         Self {
             ready: OnceLock::from(Arc::new(Ready {
                 config,
+                endpoints,
+                dedicated_hosts: DedicatedHosts::default(),
                 client,
                 credentials: OnceLock::from(credentials),
             })),
@@ -151,6 +175,7 @@ impl VertexProvider {
         }
         let config = crate::config::vertex_config();
         check_settings(&config)?;
+        let endpoints = crate::config::vertex_endpoints();
         let client = VertexClient::new().map_err(|error| {
             ProviderError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -160,6 +185,8 @@ impl VertexProvider {
         })?;
         let built = Arc::new(Ready {
             config,
+            endpoints,
+            dedicated_hosts: DedicatedHosts::default(),
             client,
             credentials: OnceLock::new(),
         });
@@ -269,10 +296,65 @@ impl VertexProvider {
                     model_id: model.upstream_model,
                 })
             }
+            WireFormat::EndpointChat => self.start_endpoint(body, ctx, requested, &model).await,
             // Claude requests are passed through by `claude` before this
             // point and never translated here.
             WireFormat::AnthropicMessages => Err(family_not_supported(&requested, &model)),
         }
+    }
+
+    /// Sends a deployed endpoint's request. The endpoint's settings are
+    /// needed to build the request (its `model`, whether it takes tools),
+    /// so they are read first; a name that is not configured is a 400
+    /// before any credential lookup or upstream call.
+    async fn start_endpoint(
+        &self,
+        body: &MessagesRequest,
+        ctx: &RequestContext,
+        requested: String,
+        model: &ResolvedModel,
+    ) -> Result<Started, ProviderError> {
+        let ready = self.ready()?;
+        let config = endpoints::find(&ready.endpoints, &model.model_id)
+            .map_err(VertexError::into_provider_error)?;
+        let project = match &config.project {
+            Some(project) => project.as_str(),
+            None => ready
+                .config
+                .project()
+                .map_err(|error| VertexError::configuration(error).into_provider_error())?,
+        };
+        let call = EndpointCall {
+            name: &model.model_id,
+            config,
+            project,
+        };
+        let translated = endpoints::prepare_request(body, &call).map_err(invalid_request)?;
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.upstream_started(&ctx.req_id);
+        }
+        let credentials = Self::credentials(ready).await?;
+        let upstream = endpoints::send(
+            &ready.client,
+            &ready.config,
+            &ready.dedicated_hosts,
+            &call,
+            &translated,
+            credentials,
+            ctx.traffic.as_deref(),
+        )
+        .await
+        .map_err(VertexError::into_provider_error)?;
+        Ok(Started {
+            sanitize: sanitizer(&upstream),
+            redact: redactor(&upstream),
+            upstream,
+            reception: Reception::Endpoint {
+                message_id: new_message_id(),
+                model: requested,
+            },
+            model_id: config.model.clone(),
+        })
     }
 
     /// Translates a Gemini request and sends it as `streamGenerateContent`.
@@ -394,8 +476,15 @@ impl Provider for VertexProvider {
         "vertex"
     }
 
+    /// The registered models, and the configured endpoints once the
+    /// settings have been read: [`VertexProvider::new`] reads nothing
+    /// before the first request. The registry lists the configured
+    /// endpoints from the start with [`models::advertised_models_with`].
     fn supported_models(&self) -> Vec<String> {
-        models::advertised_models()
+        match self.ready.get() {
+            Some(ready) => models::advertised_models_with(&ready.endpoints),
+            None => models::advertised_models(),
+        }
     }
 
     fn cli(&self) -> &'static dyn CliHandlers {
@@ -512,6 +601,10 @@ fn stream_response_body(
             openapi_chat::stream_body_redacted(upstream, message_id, model, ctx, sanitize, redact),
             outcome,
         ),
+        Reception::Endpoint { message_id, model } => report_error_events(
+            endpoints::stream_body_redacted(upstream, message_id, model, ctx, sanitize, redact),
+            outcome,
+        ),
     }
 }
 
@@ -576,6 +669,10 @@ async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
         }
         Reception::OpenModel { message_id, model } => {
             openapi_chat::read_response(upstream, &message_id, &model, &sanitize, capture.as_mut())
+                .await
+        }
+        Reception::Endpoint { message_id, model } => {
+            endpoints::read_response(upstream, &message_id, &model, &sanitize, capture.as_mut())
                 .await
         }
     };
@@ -721,7 +818,8 @@ impl BufferedCapture {
             Reception::Gemini(_) => Self::new(),
             Reception::Responses { .. }
             | Reception::Mistral { .. }
-            | Reception::OpenModel { .. } => Self {
+            | Reception::OpenModel { .. }
+            | Reception::Endpoint { .. } => Self {
                 clean: sanitize_upstream_messages,
                 ..Self::new()
             },
@@ -1194,7 +1292,7 @@ mod tests {
             monitor: None,
         };
         let body: MessagesRequest = serde_json::from_value(json!({
-            "model": "vertex/endpoint/synthetic",
+            "model": "vertex/ai21/jamba-1.5-large",
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .expect("valid request");
@@ -1212,48 +1310,257 @@ mod tests {
         assert!(provider.ready.get().is_none());
     }
     #[tokio::test]
-    async fn partner_families_synthetic_get_a_400_saying_this_version_does_not_support_them() {
+    async fn deployed_endpoints_synthetic_count_tokens_locally_without_settings() {
         let provider = VertexProvider::new();
-        let context = RequestContext {
-            req_id: "req_synthetic".to_string(),
-            session_id: None,
-            session_seq: None,
-            provider: "vertex".to_string(),
-            traffic: None,
-            monitor: None,
-        };
-        let family = "deployed endpoint (endpoint/<name>)";
-        for model in [
-            "vertex/endpoint/synthetic",
-            "vertex/endpoint/synthetic-maas",
+        for (model, status) in [
+            ("vertex/endpoint/my-llm", StatusCode::OK),
+            (
+                "vertex/endpoint/not configured anywhere",
+                StatusCode::BAD_REQUEST,
+            ),
         ] {
+            let body: MessagesRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello world"}]
+            }))
+            .expect("valid request");
+            let response = provider
+                .handle_count_tokens(body, synthetic_context())
+                .await;
+            assert_eq!(response.status(), status, "{model}");
+        }
+        assert!(provider.ready.get().is_none());
+    }
+
+    /// A provider that knows the endpoints of `file` (a `config.json`) and
+    /// sends to `base_url`.
+    fn synthetic_endpoint_provider(base_url: &str, file: &str) -> VertexProvider {
+        let config_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(config_dir.path().join("config.json"), file).unwrap();
+        let endpoints = crate::config::resolve_vertex_endpoints(config_dir.path());
+        let env = std::collections::HashMap::from([
+            (
+                "CCP_VERTEX_PROJECT".to_string(),
+                "synthetic-project".to_string(),
+            ),
+            ("CCP_VERTEX_BASE_URL".to_string(), base_url.to_string()),
+        ]);
+        let config = crate::config::resolve_vertex_config(&env, config_dir.path());
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            format!("Bearer {SYNTHETIC_TOKEN}").parse().unwrap(),
+        );
+        VertexProvider::with_client_and_endpoints(
+            VertexClient::with_client(client::client_builder().no_proxy().build().unwrap()),
+            VertexCredentials::fixed(headers),
+            config,
+            endpoints,
+        )
+    }
+
+    #[tokio::test]
+    async fn deployed_endpoints_synthetic_refusals_come_before_any_upstream_call() {
+        // An unroutable base URL and host: a request that reached either
+        // would fail to connect (502) instead of getting these answers.
+        let provider = synthetic_endpoint_provider(
+            "http://127.0.0.1:9",
+            r#"{"vertex":{"endpoints":{
+                "no-tools":{"endpoint":"1234567890123456789","location":"us-central1",
+                            "model":"gemma-2-9b-it","host":"http://127.0.0.1:9","tools":false},
+                "broken":{"endpoint":"1","location":"global","model":"m"}
+            }}}"#,
+        );
+        let tool = json!([{"name": "lookup", "input_schema": {"type": "object"}}]);
+        let cases = [
+            (
+                "vertex/endpoint/other",
+                None,
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Vertex AI endpoint \"other\" is not configured: add \"other\": {\"endpoint\": \
+                 \"<endpoint-id>\", \"location\": \"<region>\", \"model\": \"<model the \
+                 container serves>\"} to vertex.endpoints in config.json and restart the proxy; \
+                 configured endpoints: no-tools",
+            ),
+            (
+                "vertex/endpoint/no-tools",
+                Some(tool.clone()),
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Vertex AI endpoint no-tools is configured with \"tools\": false in \
+                 vertex.endpoints, so a request that carries tools is not sent to it; send the \
+                 request without tools, or set \"tools\": true once the endpoint's serving \
+                 container supports tool calling",
+            ),
+            (
+                "vertex/endpoint/broken",
+                None,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "Invalid Vertex configuration: Invalid Vertex setting vertex.endpoints in \
+                 config.json: endpoint \"broken\": location must be the endpoint's region, such \
+                 as us-central1; an endpoint is never in global",
+            ),
+        ];
+        for (model, tools, status, error_type, expected) in cases {
             for stream in [false, true] {
-                let body: MessagesRequest = serde_json::from_value(json!({
+                let mut value = json!({
                     "model": model,
                     "stream": stream,
                     "max_tokens": 16,
                     "messages": [{"role": "user", "content": "hello"}]
-                }))
-                .expect("valid request");
-                let response = provider.handle_messages(body, context.clone()).await;
-                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{model}");
+                });
+                if let Some(tools) = &tools {
+                    value["tools"] = tools.clone();
+                }
+                let body: MessagesRequest = serde_json::from_value(value).expect("valid request");
+                let response = provider.handle_messages(body, synthetic_context()).await;
+                assert_eq!(response.status(), status, "{model}, stream {stream}");
                 let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                     .await
                     .unwrap();
                 let value: Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(value["error"]["type"], "invalid_request_error", "{value}");
-                let message = value["error"]["message"].as_str().unwrap();
+                assert_eq!(value["error"]["type"], error_type, "{value}");
                 assert_eq!(
-                    message,
-                    format!(
-                        "this version of claude-code-proxy does not support the {family} model family on Vertex AI (requested {model:?}); supported families: Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, Mistral, Model Garden managed open model"
-                    ),
-                    "{model}"
+                    value["error"]["message"], expected,
+                    "{model}, stream {stream}"
                 );
             }
         }
-        // Refused before any setting, credential or client is built.
-        assert!(provider.ready.get().is_none());
+        let names = provider.supported_models();
+        assert!(
+            names.contains(&"vertex/endpoint/no-tools".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.contains("broken")),
+            "{names:?}"
+        );
+    }
+
+    /// A local server that answers a GET with `metadata`, its
+    /// `dedicatedEndpointDns` pointing back at the server, and every POST
+    /// with `sse`.
+    async fn synthetic_endpoint_server(metadata: Value, sse: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base = format!("http://{address}");
+        let mut metadata = metadata;
+        metadata["dedicatedEndpointDns"] = json!(base);
+        let app = axum::Router::new().route(
+            "/{*path}",
+            axum::routing::get(move || {
+                let metadata = metadata.clone();
+                async move { axum::Json(metadata) }
+            })
+            .post(move || {
+                let sse = sse.clone();
+                async move { ([(http::header::CONTENT_TYPE, "text/event-stream")], sse) }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        base
+    }
+
+    #[tokio::test]
+    async fn deployed_endpoint_capture_synthetic_keeps_the_token_out_of_every_file() {
+        // Words, not a secret: no rule of the prose sanitiser may shorten
+        // them in a capture.
+        let long = "long synthetic answer text ".repeat(150);
+        let echoed = format!("echo {SYNTHETIC_TOKEN} {long}");
+        let text = format!(
+            "{}data: [DONE]\n\n",
+            synthetic_sse(&[
+                json!({"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":echoed}}]}),
+                json!({"object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+                json!({"object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}),
+            ])
+        );
+        let error = synthetic_sse(&[json!({"error":{"message":format!("saw {SYNTHETIC_TOKEN}")}})]);
+        let metadata = json!({
+            "name": "projects/synthetic-project/locations/us-central1/endpoints/1234567890123456789",
+            "displayName": SYNTHETIC_TOKEN,
+            "dedicatedEndpointEnabled": true,
+        });
+        for (case, answer, carries_text) in [("text", text, true), ("error", error, false)] {
+            for stream in [true, false] {
+                let case = format!("{case}, stream {stream}");
+                let base = synthetic_endpoint_server(metadata.clone(), answer.clone()).await;
+                let provider = synthetic_endpoint_provider(
+                    &base,
+                    r#"{"vertex":{"endpoints":{"my-llm":{"endpoint":"1234567890123456789","location":"us-central1","model":"gemma-2-9b-it"}}}}"#,
+                );
+                let root = tempfile::tempdir().expect("temporary capture directory");
+                let mut ctx = synthetic_context();
+                ctx.traffic = Some(Arc::new(crate::traffic::test_capture(
+                    root.path().to_path_buf(),
+                )));
+                let body: MessagesRequest = serde_json::from_value(json!({
+                    "model": "vertex/endpoint/my-llm",
+                    "max_tokens": 64,
+                    "stream": stream,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .unwrap();
+                let response = provider.handle_messages(body, ctx).await;
+                let status = response.status();
+                // Read the whole body, so a stream finishes its capture.
+                let answered = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let answered = String::from_utf8_lossy(&answered);
+                if !carries_text {
+                    assert!(!answered.contains(SYNTHETIC_TOKEN), "{case}: {answered}");
+                }
+                let expected = if stream || carries_text {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                assert_eq!(status, expected, "{case}: {answered}");
+
+                let files = synthetic_files_under(root.path());
+                let summary = if stream {
+                    "061-vertex-endpoint-stream-summary.json".to_string()
+                } else {
+                    format!("{BUFFERED_SUMMARY_NAME}.json")
+                };
+                for name in [
+                    summary.as_str(),
+                    "018-upstream-endpoint-lookup-request-metadata.json",
+                    "018-upstream-endpoint-lookup-response-headers.json",
+                    "018-upstream-endpoint-lookup-fields.json",
+                ] {
+                    assert!(
+                        files
+                            .iter()
+                            .any(|(path, _)| path.to_string_lossy().ends_with(name)),
+                        "{case}: no {name} in {files:?}"
+                    );
+                }
+                assert!(
+                    files
+                        .iter()
+                        .any(|(path, _)| path.to_string_lossy().contains("-040-upstream-event")),
+                    "{case}: {files:?}"
+                );
+                for (path, text) in &files {
+                    assert!(
+                        !text.contains(SYNTHETIC_TOKEN),
+                        "{case}: {} kept the token: {text}",
+                        path.display()
+                    );
+                }
+                if carries_text {
+                    let kept = format!("echo [redacted] {long}");
+                    assert!(
+                        files.iter().any(|(_, text)| text.contains(&kept)),
+                        "{case}: no file kept the text whole"
+                    );
+                }
+            }
+        }
     }
     #[test]
     fn check_settings_synthetic_rejects_a_malformed_override_by_its_setting_name() {

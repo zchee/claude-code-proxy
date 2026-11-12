@@ -11,7 +11,8 @@ use super::auth::{
     LOGIN_COMMAND, LOGIN_GUIDANCE, VertexAuthError, VertexCredentials, access_token,
 };
 use crate::config::{
-    ResolvedVertexConfig, VertexLocationOverridesSetting, VertexSetting, vertex_host,
+    ResolvedVertexConfig, VERTEX_ENDPOINTS_KEY, VertexEndpoints, VertexLocationOverridesSetting,
+    VertexSetting, vertex_host,
 };
 use crate::provider::CliHandlers;
 
@@ -269,6 +270,58 @@ pub fn status_report(
     }
 }
 
+/// One line per deployed endpoint of `vertex.endpoints`: its model name,
+/// endpoint ID, project and where that came from, location, `model`, and
+/// where its host comes from. Nothing is sent to the endpoint: a host not
+/// configured is shown as not read yet. An invalid entry shows the error a
+/// request to it would get.
+pub fn endpoint_lines(endpoints: &VertexEndpoints, config: &ResolvedVertexConfig) -> Vec<String> {
+    if endpoints.unreadable {
+        let error = endpoints
+            .first_error()
+            .map_or_else(String::new, |error| error.to_string());
+        return vec![format!("Deployed endpoints: {error}")];
+    }
+    if endpoints.entries.is_empty() {
+        return vec![format!(
+            "Deployed endpoints: none ({VERTEX_ENDPOINTS_KEY} in config.json)"
+        )];
+    }
+    endpoints
+        .entries
+        .iter()
+        .map(|entry| {
+            let endpoint = match &entry.config {
+                Ok(endpoint) => endpoint,
+                Err(error) => return format!("Deployed endpoint: {error}"),
+            };
+            let name = &entry.name;
+            let project = match (&endpoint.project, config.project()) {
+                (Some(project), _) => format!("{project} ({VERTEX_ENDPOINTS_KEY}.{name})"),
+                (None, Ok(project)) => match &config.project_setting {
+                    Some(setting) => format!("{project} ({})", setting.source),
+                    None => project.to_string(),
+                },
+                (None, Err(error)) => format!("unknown ({error})"),
+            };
+            let host = match &endpoint.host {
+                Some(host) => format!("{host} ({VERTEX_ENDPOINTS_KEY}.{name})"),
+                None => "not read yet (endpoints.get reads dedicatedEndpointDns on the first request)"
+                    .to_string(),
+            };
+            let tools = if endpoint.tools {
+                ""
+            } else {
+                ", tools off (a request with tools is refused)"
+            };
+            format!(
+                "Deployed endpoint vertex/endpoint/{name}: endpoint {}, project {project}, location {}, model {}, host {host}{tools}",
+                endpoint.endpoint, endpoint.location, endpoint.model
+            )
+        })
+        .collect()
+}
+
 fn metadata_server_line(well_known: &Path) -> String {
     format!(
         "Credentials: no file at {}; the library falls back to the metadata server, which exists only on Google Cloud",
@@ -410,13 +463,19 @@ impl CliHandlers for VertexCli {
     }
 
     fn status(&self) -> anyhow::Result<()> {
-        let report = status_report(
-            &AdcEnvironment::from_process(),
-            &crate::config::vertex_config(),
-            &check_token(),
-        );
+        let config = crate::config::vertex_config();
+        let endpoints = crate::config::vertex_endpoints();
+        let report = status_report(&AdcEnvironment::from_process(), &config, &check_token());
         println!("{}", report.text);
-        let Some(failure) = report.failure else {
+        for line in endpoint_lines(&endpoints, &config) {
+            println!("{line}");
+        }
+        // A broken endpoint entry fails the command like any other setting,
+        // after a problem the report found itself.
+        let failure = report
+            .failure
+            .or_else(|| endpoints.first_error().map(StatusFailure::Configuration));
+        let Some(failure) = failure else {
             return Ok(());
         };
         let (guidance, error) = failure.into_guidance_and_error();
@@ -1006,5 +1065,82 @@ mod tests {
             // Any message other than "Not authenticated" exits 2.
             assert_eq!(error.to_string(), expected, "{name}");
         }
+    }
+
+    fn synthetic_endpoints(file: &str) -> VertexEndpoints {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "config.json", file);
+        crate::config::resolve_vertex_endpoints(dir.path())
+    }
+
+    #[test]
+    fn endpoint_lines_synthetic_show_each_endpoint_and_where_its_host_comes_from() {
+        let endpoints = synthetic_endpoints(
+            r#"{"vertex":{"endpoints":{
+                "my-llm":{"endpoint":"1234567890123456789","location":"us-central1","model":"gemma-2-9b-it"},
+                "hf":{"endpoint":"9876543210987654321","location":"europe-west4","model":"tgi",
+                      "project":"other-project","tools":false,
+                      "host":"https://9876543210987654321.europe-west4-123456789.prediction.vertexai.goog"}
+            }}}"#,
+        );
+        let mut lines = endpoint_lines(&endpoints, &config(Some("synthetic-project")));
+        lines.sort_unstable();
+        assert_eq!(
+            lines,
+            [
+                "Deployed endpoint vertex/endpoint/hf: endpoint 9876543210987654321, project other-project (vertex.endpoints.hf), location europe-west4, model tgi, host https://9876543210987654321.europe-west4-123456789.prediction.vertexai.goog (vertex.endpoints.hf), tools off (a request with tools is refused)",
+                "Deployed endpoint vertex/endpoint/my-llm: endpoint 1234567890123456789, project synthetic-project (CCP_VERTEX_PROJECT), location us-central1, model gemma-2-9b-it, host not read yet (endpoints.get reads dedicatedEndpointDns on the first request)",
+            ]
+        );
+        // Without a Vertex project, an endpoint without its own says so.
+        let lines = endpoint_lines(
+            &synthetic_endpoints(
+                r#"{"vertex":{"endpoints":{"my-llm":{"endpoint":"1","location":"us-central1","model":"m"}}}}"#,
+            ),
+            &config(None),
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("project unknown (Vertex project is not set"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn endpoint_lines_synthetic_report_none_invalid_and_unreadable_settings() {
+        assert_eq!(
+            endpoint_lines(&synthetic_endpoints("{}"), &config(Some("p"))),
+            ["Deployed endpoints: none (vertex.endpoints in config.json)"]
+        );
+        assert_eq!(
+            endpoint_lines(
+                &synthetic_endpoints(r#"{"vertex":{"endpoints":[]}}"#),
+                &config(Some("p"))
+            ),
+            [
+                "Deployed endpoints: Invalid Vertex setting vertex.endpoints in config.json: must be an object of \"<name>\": {\"endpoint\", \"location\", \"model\"} members"
+            ]
+        );
+        let endpoints = synthetic_endpoints(
+            r#"{"vertex":{"endpoints":{"bad":{"endpoint":"1","location":"global","model":"m",
+                "host":"https://user:synthetic-pass@1.us-central1-9.prediction.vertexai.goog"}}}}"#,
+        );
+        let lines = endpoint_lines(&endpoints, &config(Some("p")));
+        assert_eq!(
+            lines,
+            [
+                "Deployed endpoint: Invalid Vertex setting vertex.endpoints in config.json: endpoint \"bad\": location must be the endpoint's region, such as us-central1; an endpoint is never in global"
+            ]
+        );
+        assert!(!lines.join("\n").contains("synthetic-pass"));
+        // The same error fails the command.
+        assert_eq!(
+            endpoints.first_error().map(|error| error.to_string()),
+            Some(
+                lines[0]
+                    .trim_start_matches("Deployed endpoint: ")
+                    .to_string()
+            )
+        );
     }
 }
