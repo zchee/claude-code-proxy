@@ -43,6 +43,7 @@ use crate::traffic::{StreamTrafficCapture, TrafficCapture};
 use self::auth::{VertexAuthError, VertexCredentials};
 use self::cli::VERTEX_CLI;
 use self::client::{VertexClient, VertexError, VertexResponse, VertexTarget};
+use self::models::{ModelError, ResolvedModel, WireFormat};
 use self::sanitize::sanitize_vertex_text;
 use self::translate::request::prepare_request;
 use self::translate::stream::{
@@ -118,9 +119,7 @@ impl VertexProvider {
             return Ok(ready);
         }
         let config = crate::config::vertex_config();
-        // Checked before any credential lookup, so a missing project is
-        // reported by its setting names.
-        VertexTarget::from_config(&config).map_err(VertexError::into_provider_error)?;
+        check_settings(&config)?;
         let client = VertexClient::new().map_err(|error| {
             ProviderError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -168,8 +167,9 @@ impl VertexProvider {
     ) -> Result<Started, ProviderError> {
         let requested = body.model.clone().unwrap_or_default();
         let model = models::resolve(&requested).map_err(invalid_request)?;
+        require_served(&requested, &model)?;
         if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &model.id);
+            monitor.model_resolved(&ctx.req_id, &model.upstream_model);
         }
         let translated = prepare_request(body, &model).map_err(invalid_request)?;
         let ready = self.ready()?;
@@ -181,7 +181,7 @@ impl VertexProvider {
             .client
             .stream_generate_content(
                 &ready.config,
-                &model.id,
+                &model,
                 &translated,
                 credentials,
                 ctx.traffic.as_deref(),
@@ -198,7 +198,7 @@ impl VertexProvider {
         let config = TranslatorConfig {
             message_id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
             model: requested,
-            signature_model: model.id.clone(),
+            signature_model: model.upstream_model.clone(),
             estimated_input_tokens: count_tokens::count_tokens(body),
             emit_thinking: translated.includes_thoughts(),
         };
@@ -206,7 +206,7 @@ impl VertexProvider {
             upstream,
             config,
             sanitize,
-            model_id: model.id,
+            model_id: model.upstream_model,
         })
     }
 }
@@ -266,8 +266,11 @@ impl Provider for VertexProvider {
             Ok(model) => model,
             Err(error) => return error_response(invalid_request(error)),
         };
+        if let Err(error) = require_served(requested, &model) {
+            return error_response(error);
+        }
         if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &model.id);
+            monitor.model_resolved(&ctx.req_id, &model.upstream_model);
         }
         let tokens = count_tokens::count_tokens(&body);
         if let Some(monitor) = ctx.monitor.as_ref() {
@@ -488,6 +491,33 @@ fn stream_error(error: &StreamError, sanitize: &Sanitizer) -> ProviderError {
         _ => (StatusCode::BAD_GATEWAY, ProviderErrorKind::Api),
     };
     ProviderError::new(status, kind, error.message_with(&**sanitize))
+}
+
+/// Validates every setting a request reads: project, location, base URL
+/// and location overrides. It runs before any credential lookup, so a
+/// missing or malformed setting is reported by its name rather than as a
+/// credential failure.
+fn check_settings(config: &ResolvedVertexConfig) -> Result<(), ProviderError> {
+    VertexTarget::from_config(config).map_err(VertexError::into_provider_error)?;
+    config
+        .location_overrides()
+        .map_err(|error| VertexError::configuration(error).into_provider_error())?;
+    Ok(())
+}
+
+/// Refuses a model this version cannot send: every wire format but
+/// Gemini's, until the handler for that family exists. The 400 comes before
+/// any setting or credential is read.
+fn require_served(requested: &str, model: &ResolvedModel) -> Result<(), ProviderError> {
+    match model.wire {
+        WireFormat::GenerateContent => Ok(()),
+        WireFormat::AnthropicMessages | WireFormat::Responses { .. } | WireFormat::MistralChat => {
+            Err(invalid_request(ModelError::FamilyNotSupported {
+                requested: requested.to_string(),
+                family: model.family.label(),
+            }))
+        }
+    }
 }
 
 fn invalid_request(error: impl std::fmt::Display) -> ProviderError {
@@ -862,5 +892,113 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         // Counting never builds the request state.
         assert!(provider.ready.get().is_none());
+    }
+    #[tokio::test]
+    async fn partner_families_synthetic_get_a_400_saying_this_version_does_not_support_them() {
+        let provider = VertexProvider::new();
+        let context = RequestContext {
+            req_id: "req_synthetic".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "vertex".to_string(),
+            traffic: None,
+            monitor: None,
+        };
+        for (model, family) in [
+            ("vertex/anthropic/claude-opus-5-5", "Anthropic Claude"),
+            ("vertex/anthropic/claude-synthetic-9", "Anthropic Claude"),
+            ("vertex/xai/grok-4.7", "xAI Grok"),
+            ("vertex/openai/gpt-6.1-sol", "OpenAI"),
+            ("vertex/meta/muse-spark-1.3", "Meta Muse"),
+            ("vertex/mistralai/mistral-medium-3", "Mistral"),
+            (
+                "vertex/openai/gpt-oss-120b-maas",
+                "Model Garden managed open model (<publisher>/<model-id>-maas)",
+            ),
+            (
+                "vertex/endpoint/synthetic",
+                "deployed endpoint (endpoint/<name>)",
+            ),
+        ] {
+            for stream in [false, true] {
+                let body: MessagesRequest = serde_json::from_value(json!({
+                    "model": model,
+                    "stream": stream,
+                    "max_tokens": 16,
+                    "messages": [{"role": "user", "content": "hello"}]
+                }))
+                .expect("valid request");
+                let response = provider.handle_messages(body, context.clone()).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{model}");
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["error"]["type"], "invalid_request_error", "{value}");
+                let message = value["error"]["message"].as_str().unwrap();
+                assert_eq!(
+                    message,
+                    format!(
+                        "this version of claude-code-proxy does not support the {family} model family on Vertex AI (requested {model:?}); supported families: Gemini"
+                    ),
+                    "{model}"
+                );
+            }
+        }
+        // Refused before any setting, credential or client is built.
+        assert!(provider.ready.get().is_none());
+    }
+    #[test]
+    fn check_settings_synthetic_rejects_a_malformed_override_by_its_setting_name() {
+        let config_dir = tempfile::TempDir::new().unwrap();
+        let config = |overrides: &str| {
+            let env = std::collections::HashMap::from([
+                (
+                    "CCP_VERTEX_PROJECT".to_string(),
+                    "synthetic-project".to_string(),
+                ),
+                (
+                    "CCP_VERTEX_LOCATION_OVERRIDES".to_string(),
+                    overrides.to_string(),
+                ),
+            ]);
+            crate::config::resolve_vertex_config(&env, config_dir.path())
+        };
+        assert!(check_settings(&config("mistralai=europe-west4")).is_ok());
+        for (overrides, reason) in [
+            (
+                "mistralai=EUROPE",
+                "the location of entry \"mistralai\" must be a Vertex AI location",
+            ),
+            ("mistralai", "entry \"mistralai\" has no location"),
+            ("endpoint=us-central1", "entry 1: a deployed endpoint"),
+        ] {
+            let error = check_settings(&config(overrides)).unwrap_err();
+            assert_eq!(
+                error.status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{overrides}"
+            );
+            assert_eq!(error.error_type(), "api_error", "{overrides}");
+            let prefix = format!(
+                "Invalid Vertex configuration: Invalid Vertex setting CCP_VERTEX_LOCATION_OVERRIDES: {reason}"
+            );
+            assert!(error.message.starts_with(&prefix), "{}", error.message);
+        }
+        // The project is still checked first.
+        let env = std::collections::HashMap::from([(
+            "CCP_VERTEX_LOCATION_OVERRIDES".to_string(),
+            "mistralai=EUROPE".to_string(),
+        )]);
+        let error = check_settings(&crate::config::resolve_vertex_config(
+            &env,
+            config_dir.path(),
+        ))
+        .unwrap_err();
+        assert!(
+            error.message.contains("Vertex project is not set"),
+            "{}",
+            error.message
+        );
     }
 }

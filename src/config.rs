@@ -140,6 +140,10 @@ struct VertexConfig {
     pub location: Option<String>,
     #[serde(rename = "baseUrl")]
     pub base_url: Option<String>,
+    // Read as any JSON value: a typed map would make one wrong value drop
+    // the whole config file, because a file that fails to parse is ignored.
+    #[serde(rename = "locationOverrides")]
+    pub location_overrides: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -358,6 +362,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             _ => {}
         }
     }
+    let location_overrides = vertex.location_overrides_setting.as_ref();
+    if location_overrides
+        .is_some_and(|setting| matches!(setting.source, VertexSettingSource::Env(_)))
+    {
+        out.push(format!("{VERTEX_LOCATION_OVERRIDES_KEY} (env)"));
+    }
     if env
         .get("CCP_CODEX_REASONING_SUMMARY")
         .is_some_and(|raw| !raw.is_empty())
@@ -420,6 +430,25 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
                 out.push(format!("{key} (config)"));
             } else {
                 out.push(format!("{key}: {}", setting.value));
+            }
+        }
+        if let Some(setting) = location_overrides
+            .filter(|setting| matches!(setting.source, VertexSettingSource::ConfigFile(_)))
+        {
+            if setting.readable {
+                let entries: Vec<String> = setting
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        format!("{}={}", entry.key, entry.location.as_deref().unwrap_or("?"))
+                    })
+                    .collect();
+                out.push(format!(
+                    "{VERTEX_LOCATION_OVERRIDES_KEY}: {}",
+                    entries.join(", ")
+                ));
+            } else {
+                out.push(format!("{VERTEX_LOCATION_OVERRIDES_KEY} (config)"));
             }
         }
         if let Some(codex) = file_cfg.codex {
@@ -837,6 +866,61 @@ pub struct VertexSetting {
     pub source: VertexSettingSource,
 }
 
+/// Environment variable holding the location overrides as
+/// `<key>=<location>` entries separated by commas.
+pub const VERTEX_LOCATION_OVERRIDES_ENV: &str = "CCP_VERTEX_LOCATION_OVERRIDES";
+
+/// `config.json` key holding the location overrides as an object of
+/// `"<key>": "<location>"` members.
+pub const VERTEX_LOCATION_OVERRIDES_KEY: &str = "vertex.locationOverrides";
+
+/// One location override as read: the trimmed key and location, not
+/// validated yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexLocationOverrideEntry {
+    /// `<publisher>` or `<publisher>/<model-id>`.
+    pub key: String,
+    /// The location, or `None` when the entry has none: an environment entry
+    /// without `=`, or a `config.json` value that is not a string.
+    pub location: Option<String>,
+}
+
+/// The location overrides as read from the one source that sets them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexLocationOverridesSetting {
+    /// The entries in the order they were read.
+    pub entries: Vec<VertexLocationOverrideEntry>,
+    /// False when `config.json` gives a value that is not an object; there
+    /// are no entries then.
+    pub readable: bool,
+    /// The environment variable or config key the entries came from.
+    pub source: VertexSettingSource,
+}
+
+/// Validated location overrides, each key at most once. A key is a
+/// publisher (`mistralai`) or a publisher and a model ID
+/// (`anthropic/claude-opus-4-6`); which one applies to a model is decided by
+/// the model's location rule.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VertexLocationOverrides {
+    entries: Vec<(String, String)>,
+}
+
+impl VertexLocationOverrides {
+    /// The location set for exactly `key`, if any.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(entry, _)| entry == key)
+            .map(|(_, location)| location.as_str())
+    }
+
+    /// Whether no override is set.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 /// Vertex settings after applying the precedence `CCP_VERTEX_*` over the
 /// standard Google Cloud variables over `config.json`. Values are kept even
 /// when they are invalid so that a status command can show what was read and
@@ -852,6 +936,9 @@ pub struct ResolvedVertexConfig {
     /// Replacement for the host derived from the location, for a relay or a
     /// local test server.
     pub base_url_setting: Option<VertexSetting>,
+    /// Locations for single publishers or models, in place of the location
+    /// above. `None` when no source sets any.
+    pub location_overrides_setting: Option<VertexLocationOverridesSetting>,
 }
 
 impl ResolvedVertexConfig {
@@ -897,6 +984,47 @@ impl ResolvedVertexConfig {
             .map(|setting| validated_vertex_setting(setting, validate_token_endpoint))
             .transpose()
     }
+
+    /// The validated location overrides; empty when no source sets any.
+    ///
+    /// # Errors
+    ///
+    /// Fails, naming the setting the overrides came from, when an entry's
+    /// key is not `<publisher>` or `<publisher>/<model-id>`, when its
+    /// location is missing or fails the same check as the location, or when
+    /// a key is listed twice. A key that fails the check is referred to by
+    /// its position rather than quoted. An override never names a deployed
+    /// endpoint (`endpoint/<name>`): an endpoint has its own location.
+    pub fn location_overrides(&self) -> anyhow::Result<VertexLocationOverrides> {
+        let Some(setting) = &self.location_overrides_setting else {
+            return Ok(VertexLocationOverrides::default());
+        };
+        let invalid =
+            |reason: String| anyhow::anyhow!("Invalid Vertex setting {}: {reason}", setting.source);
+        if !setting.readable {
+            return Err(invalid(
+                "must be an object of \"<key>\": \"<location>\" members, for example {\"mistralai\": \"europe-west4\"}".to_string(),
+            ));
+        }
+        let mut entries: Vec<(String, String)> = Vec::with_capacity(setting.entries.len());
+        for (index, entry) in setting.entries.iter().enumerate() {
+            let key = &entry.key;
+            validate_location_override_key(key)
+                .map_err(|reason| invalid(format!("entry {}: {reason}", index + 1)))?;
+            let Some(location) = &entry.location else {
+                return Err(invalid(format!(
+                    "entry {key:?} has no location; an entry is <key>=<location> in the variable and \"<key>\": \"<location>\" in config.json"
+                )));
+            };
+            validate_vertex_location(location)
+                .map_err(|reason| invalid(format!("the location of entry {key:?} {reason}")))?;
+            if entries.iter().any(|(seen, _)| seen == key) {
+                return Err(invalid(format!("entry {key:?} is listed more than once")));
+            }
+            entries.push((key.clone(), location.clone()));
+        }
+        Ok(VertexLocationOverrides { entries })
+    }
 }
 
 fn validated_vertex_setting(
@@ -937,13 +1065,108 @@ fn validate_vertex_location(value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Longest publisher accepted in a location override key.
+const MAX_OVERRIDE_PUBLISHER_BYTES: usize = 64;
+
+/// Longest model ID accepted in a location override key; the same bound as
+/// a requested model ID.
+const MAX_OVERRIDE_MODEL_ID_BYTES: usize = 256;
+
+fn validate_location_override_key(key: &str) -> Result<(), &'static str> {
+    let (publisher, model) = match key.split_once('/') {
+        Some((publisher, model)) => (publisher, Some(model)),
+        None => (key, None),
+    };
+    let starts_alphanumeric = |value: &str| {
+        value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+    };
+    let publisher_valid = starts_alphanumeric(publisher)
+        && publisher.len() <= MAX_OVERRIDE_PUBLISHER_BYTES
+        && publisher
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    let model_valid = model.is_none_or(|model| {
+        starts_alphanumeric(model)
+            && model.len() <= MAX_OVERRIDE_MODEL_ID_BYTES
+            && model
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-@".contains(&byte))
+    });
+    if !publisher_valid || !model_valid {
+        return Err(
+            "the key must be <publisher> or <publisher>/<model-id>: a publisher is lowercase letters, digits and '-', a model ID is letters, digits, '.', '_', '-' and '@', and each starts with a letter or digit",
+        );
+    }
+    if publisher == "endpoint" {
+        return Err("a deployed endpoint (endpoint/<name>) takes no location override");
+    }
+    Ok(())
+}
+
+/// Reads `CCP_VERTEX_LOCATION_OVERRIDES`: entries separated by `,`, each
+/// `<key>=<location>`. Empty entries, such as one after a trailing comma,
+/// are skipped.
+fn location_override_env_entries(raw: &str) -> Vec<VertexLocationOverrideEntry> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| match entry.split_once('=') {
+            Some((key, location)) => VertexLocationOverrideEntry {
+                key: key.trim().to_string(),
+                location: Some(location.trim().to_string()),
+            },
+            None => VertexLocationOverrideEntry {
+                key: entry.to_string(),
+                location: None,
+            },
+        })
+        .collect()
+}
+
+/// Reads `vertex.locationOverrides`. `null` and an empty object set
+/// nothing; any other value that is not an object is kept as unreadable so
+/// the accessor can report it.
+fn location_override_file_setting(
+    value: &serde_json::Value,
+) -> Option<VertexLocationOverridesSetting> {
+    let source = VertexSettingSource::ConfigFile(VERTEX_LOCATION_OVERRIDES_KEY);
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::Object(members) if members.is_empty() => None,
+        serde_json::Value::Object(members) => Some(VertexLocationOverridesSetting {
+            entries: members
+                .iter()
+                .map(|(key, location)| VertexLocationOverrideEntry {
+                    key: key.trim().to_string(),
+                    location: location
+                        .as_str()
+                        .map(|location| location.trim().to_string()),
+                })
+                .collect(),
+            readable: true,
+            source,
+        }),
+        _ => Some(VertexLocationOverridesSetting {
+            entries: Vec::new(),
+            readable: false,
+            source,
+        }),
+    }
+}
+
 /// Resolves the Vertex settings from `env` and `config_dir/config.json`.
 ///
 /// Each value is taken from the first source that sets it to something other
 /// than blank: `CCP_VERTEX_PROJECT`, `GOOGLE_CLOUD_PROJECT`, `vertex.project`
 /// for the project; `CCP_VERTEX_LOCATION`, `GOOGLE_CLOUD_LOCATION`,
 /// `vertex.location`, then `global` for the location; `CCP_VERTEX_BASE_URL`,
-/// `vertex.baseUrl` for the base URL. Reading the Google Cloud variables lets
+/// `vertex.baseUrl` for the base URL; `CCP_VERTEX_LOCATION_OVERRIDES`,
+/// `vertex.locationOverrides` for the location overrides, where the variable
+/// replaces the file's overrides as a whole rather than being merged with
+/// them. Reading the Google Cloud variables lets
 /// a shell already set up for `gcloud` or the Gemini CLI work unchanged, while
 /// the `CCP_` names can point the proxy elsewhere without touching them.
 pub fn resolve_vertex_config(
@@ -995,10 +1218,26 @@ pub fn resolve_vertex_config(
         file.as_ref().and_then(|config| config.base_url.as_ref()),
     );
 
+    let location_overrides_setting = env
+        .get(VERTEX_LOCATION_OVERRIDES_ENV)
+        .map(|raw| location_override_env_entries(raw))
+        .filter(|entries| !entries.is_empty())
+        .map(|entries| VertexLocationOverridesSetting {
+            entries,
+            readable: true,
+            source: VertexSettingSource::Env(VERTEX_LOCATION_OVERRIDES_ENV),
+        })
+        .or_else(|| {
+            file.as_ref()
+                .and_then(|config| config.location_overrides.as_ref())
+                .and_then(location_override_file_setting)
+        });
+
     ResolvedVertexConfig {
         project_setting,
         location_setting,
         base_url_setting,
+        location_overrides_setting,
     }
 }
 
@@ -1934,6 +2173,7 @@ mod tests {
                     project_setting: None,
                     location_setting: vertex_setting("global", Default).unwrap(),
                     base_url_setting: None,
+                    location_overrides_setting: None,
                 },
             ),
             (
@@ -1948,6 +2188,7 @@ mod tests {
                         "https://file.example",
                         ConfigFile("vertex.baseUrl"),
                     ),
+                    location_overrides_setting: None,
                 },
             ),
             (
@@ -1965,6 +2206,7 @@ mod tests {
                         "https://file.example",
                         ConfigFile("vertex.baseUrl"),
                     ),
+                    location_overrides_setting: None,
                 },
             ),
             (
@@ -1979,6 +2221,7 @@ mod tests {
                         "https://env.example",
                         Env("CCP_VERTEX_BASE_URL"),
                     ),
+                    location_overrides_setting: None,
                 },
             ),
             (
@@ -1993,6 +2236,7 @@ mod tests {
                     )
                     .unwrap(),
                     base_url_setting: None,
+                    location_overrides_setting: None,
                 },
             ),
         ];
@@ -2085,6 +2329,186 @@ mod tests {
             );
             assert_eq!(resolved.base_url().unwrap(), None, "{blank:?}");
             std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    fn override_entries(pairs: &[(&str, Option<&str>)]) -> Vec<VertexLocationOverrideEntry> {
+        pairs
+            .iter()
+            .map(|(key, location)| VertexLocationOverrideEntry {
+                key: key.to_string(),
+                location: location.map(str::to_string),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn vertex_location_overrides_synthetic_come_from_env_over_config_file_with_sources() {
+        use VertexSettingSource::{ConfigFile, Env};
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"vertex":{"project":"file-project","locationOverrides":{"anthropic/claude-opus-4-6":" us-east5 ","mistralai":"europe-west4"}}}"#,
+        )
+        .unwrap();
+        let file_setting = VertexLocationOverridesSetting {
+            entries: override_entries(&[
+                ("anthropic/claude-opus-4-6", Some("us-east5")),
+                ("mistralai", Some("europe-west4")),
+            ]),
+            readable: true,
+            source: ConfigFile("vertex.locationOverrides"),
+        };
+        // Blank or entry-less variables fall through to the file.
+        for raw in [None, Some(""), Some("  "), Some(" , ,")] {
+            let env = match raw {
+                Some(raw) => vertex_env(&[("CCP_VERTEX_LOCATION_OVERRIDES", raw)]),
+                None => HashMap::new(),
+            };
+            let resolved = resolve_vertex_config(&env, config.path());
+            assert_eq!(
+                resolved.location_overrides_setting.as_ref(),
+                Some(&file_setting),
+                "{raw:?}"
+            );
+            assert_eq!(resolved.project().unwrap(), "file-project");
+            let overrides = resolved.location_overrides().unwrap();
+            assert_eq!(overrides.get("anthropic/claude-opus-4-6"), Some("us-east5"));
+            assert_eq!(overrides.get("mistralai"), Some("europe-west4"));
+            assert_eq!(overrides.get("anthropic"), None);
+        }
+
+        // The variable replaces the file's overrides as a whole.
+        let env = vertex_env(&[(
+            "CCP_VERTEX_LOCATION_OVERRIDES",
+            " xai = us ,anthropic/claude-opus-4-5@20251101=us-east5,, zai-org=global,",
+        )]);
+        let resolved = resolve_vertex_config(&env, config.path());
+        assert_eq!(
+            resolved.location_overrides_setting,
+            Some(VertexLocationOverridesSetting {
+                entries: override_entries(&[
+                    ("xai", Some("us")),
+                    ("anthropic/claude-opus-4-5@20251101", Some("us-east5")),
+                    ("zai-org", Some("global")),
+                ]),
+                readable: true,
+                source: Env("CCP_VERTEX_LOCATION_OVERRIDES"),
+            })
+        );
+        let overrides = resolved.location_overrides().unwrap();
+        assert_eq!(overrides.get("xai"), Some("us"));
+        assert_eq!(
+            overrides.get("anthropic/claude-opus-4-5@20251101"),
+            Some("us-east5")
+        );
+        assert_eq!(overrides.get("zai-org"), Some("global"));
+        assert_eq!(overrides.get("mistralai"), None);
+
+        // Nothing set anywhere, and an empty or null object in the file.
+        let empty = tempfile::TempDir::new().unwrap();
+        for file in [
+            None,
+            Some(r#"{"vertex":{"locationOverrides":{}}}"#),
+            Some(r#"{"vertex":{"locationOverrides":null}}"#),
+        ] {
+            if let Some(file) = file {
+                std::fs::write(empty.path().join("config.json"), file).unwrap();
+            }
+            let resolved = resolve_vertex_config(&HashMap::new(), empty.path());
+            assert_eq!(resolved.location_overrides_setting, None, "{file:?}");
+            assert!(
+                resolved.location_overrides().unwrap().is_empty(),
+                "{file:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vertex_location_overrides_synthetic_invalid_entries_name_the_setting() {
+        const KEY_REASON: &str = "the key must be <publisher> or <publisher>/<model-id>: a publisher is lowercase letters, digits and '-', a model ID is letters, digits, '.', '_', '-' and '@', and each starts with a letter or digit";
+        const LOCATION_REASON: &str = "must be a Vertex AI location such as global, us-central1 or europe-west4: lowercase letters, digits and '-'";
+        const NO_LOCATION: &str = "has no location; an entry is <key>=<location> in the variable and \"<key>\": \"<location>\" in config.json";
+        let config = tempfile::TempDir::new().unwrap();
+        let env_prefix = "Invalid Vertex setting CCP_VERTEX_LOCATION_OVERRIDES: ";
+        let env_cases = [
+            ("anthropic", format!("entry \"anthropic\" {NO_LOCATION}")),
+            (
+                "anthropic=",
+                format!("the location of entry \"anthropic\" {LOCATION_REASON}"),
+            ),
+            (
+                "anthropic=US",
+                format!("the location of entry \"anthropic\" {LOCATION_REASON}"),
+            ),
+            (
+                "anthropic=us/../x",
+                format!("the location of entry \"anthropic\" {LOCATION_REASON}"),
+            ),
+            ("Anthropic=us", format!("entry 1: {KEY_REASON}")),
+            ("anthropic=us,=eu", format!("entry 2: {KEY_REASON}")),
+            ("anthropic/claude:x=us", format!("entry 1: {KEY_REASON}")),
+            ("a/b/c=us", format!("entry 1: {KEY_REASON}")),
+            ("anthropic/=us", format!("entry 1: {KEY_REASON}")),
+            ("-meta=us", format!("entry 1: {KEY_REASON}")),
+            (
+                "endpoint=us-central1",
+                "entry 1: a deployed endpoint (endpoint/<name>) takes no location override"
+                    .to_string(),
+            ),
+            (
+                "xai=us,endpoint/synthetic=us-central1",
+                "entry 2: a deployed endpoint (endpoint/<name>) takes no location override"
+                    .to_string(),
+            ),
+            (
+                "anthropic=us,anthropic=eu",
+                "entry \"anthropic\" is listed more than once".to_string(),
+            ),
+        ];
+        for (raw, reason) in env_cases {
+            let env = vertex_env(&[("CCP_VERTEX_LOCATION_OVERRIDES", raw)]);
+            let error = resolve_vertex_config(&env, config.path())
+                .location_overrides()
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, format!("{env_prefix}{reason}"), "{raw:?}");
+        }
+        // A key that fails the check is not quoted back.
+        let env = vertex_env(&[("CCP_VERTEX_LOCATION_OVERRIDES", "Synthetic-Secret-Key=us")]);
+        let error = resolve_vertex_config(&env, config.path())
+            .location_overrides()
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("Synthetic-Secret-Key"), "{error}");
+
+        let file_prefix = "Invalid Vertex setting vertex.locationOverrides in config.json: ";
+        let path = config.path().join("config.json");
+        let file_cases = [
+            (
+                r#"{"vertex":{"project":"file-project","locationOverrides":{"mistralai":5}}}"#,
+                format!("entry \"mistralai\" {NO_LOCATION}"),
+            ),
+            (
+                r#"{"vertex":{"project":"file-project","locationOverrides":{"mistralai":"EUROPE"}}}"#,
+                format!("the location of entry \"mistralai\" {LOCATION_REASON}"),
+            ),
+            (
+                r#"{"vertex":{"project":"file-project","locationOverrides":"mistralai=europe-west4"}}"#,
+                "must be an object of \"<key>\": \"<location>\" members, for example {\"mistralai\": \"europe-west4\"}".to_string(),
+            ),
+            (
+                r#"{"vertex":{"project":"file-project","locationOverrides":["mistralai"]}}"#,
+                "must be an object of \"<key>\": \"<location>\" members, for example {\"mistralai\": \"europe-west4\"}".to_string(),
+            ),
+        ];
+        for (file, reason) in file_cases {
+            std::fs::write(&path, file).unwrap();
+            let resolved = resolve_vertex_config(&HashMap::new(), config.path());
+            // A wrong override does not cost the rest of the file.
+            assert_eq!(resolved.project().unwrap(), "file-project", "{file}");
+            let error = resolved.location_overrides().unwrap_err().to_string();
+            assert_eq!(error, format!("{file_prefix}{reason}"), "{file}");
         }
     }
 

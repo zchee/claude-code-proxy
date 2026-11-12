@@ -168,11 +168,13 @@ The registered IDs are `gemini-4-argon`, `gemini-4-carbon`, `gemini-3.8-flash`, 
 
 `vertex/<model-id>` also reaches a Gemini model that is not registered, so a new model works before the proxy lists it. A bare ID that is not registered does not route to Vertex AI; only the `vertex/` form does. An unregistered ID gets `LOW` as its lowest thinking level, because every Gemini model that takes a thinking level accepts `LOW`. A model ID starts with a letter or digit and contains only letters, digits, `.`, `_`, `-`, and `@`, up to 256 bytes.
 
-Any other publisher, such as `vertex/anthropic/<model-id>`, is rejected with HTTP 400:
+Every other model is rejected with HTTP 400. A Claude, Grok, OpenAI, Muse or Mistral name (`vertex/anthropic/<model-id>`, `vertex/xai/<model-id>`, `vertex/openai/gpt-<…>`, `vertex/meta/muse-<…>`, `vertex/mistralai/<model-id>`), a managed open model (`vertex/<publisher>/<model-id>-maas`) and a deployed endpoint (`vertex/endpoint/<name>`) are recognised, but this version does not send them yet:
 
 ```text
-unsupported Vertex AI model "vertex/anthropic/claude-x"; use a Gemini model ID (for example gemini-3.5-flash), vertex/<gemini-model-id> or vertex/google/<gemini-model-id>
+this version of claude-code-proxy does not support the Anthropic Claude model family on Vertex AI (requested "vertex/anthropic/claude-x"); supported families: Gemini
 ```
+
+Any other form, such as `vertex/ai21/<model-id>`, gets a message listing the accepted forms.
 
 Whether a model is offered in your location, and whether your project may use it, is decided by Google. A model that is not offered answers with 404 (see [Errors](#errors)).
 

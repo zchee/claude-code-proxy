@@ -454,6 +454,7 @@ mod tests {
                 .map(|value| setting(value, VertexSettingSource::Env("CCP_VERTEX_PROJECT"))),
             location_setting: setting("global", VertexSettingSource::Default),
             base_url_setting: None,
+            location_overrides_setting: None,
         }
     }
 
@@ -795,6 +796,7 @@ mod tests {
                 "http://relay.example",
                 VertexSettingSource::ConfigFile("vertex.baseUrl"),
             )),
+            location_overrides_setting: None,
         };
         let report = status_report(&AdcEnvironment::default(), &resolved, &Ok(()));
         assert!(

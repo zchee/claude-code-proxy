@@ -257,7 +257,7 @@ pub fn prepare_request(
     if let Some(text) = flatten_system_text(req.extra.get("system")) {
         system.push(text);
     }
-    let mut builder = ContentsBuilder::new(&model.id);
+    let mut builder = ContentsBuilder::new(&model.upstream_model);
     for message in &req.messages {
         let blocks = normalize_content(&message.content, json!({}));
         match message.role.as_str() {

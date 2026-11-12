@@ -15,13 +15,15 @@ use http::StatusCode;
 use serde::Serialize;
 
 use super::auth::{LOGIN_COMMAND, VertexAuthError, VertexCredentials, access_token};
+use super::models::{ApiVersion, ResolvedModel};
 use super::sanitize::sanitize_vertex_text;
 use crate::config::{ResolvedVertexConfig, vertex_host};
 use crate::provider::{ProviderError, ProviderErrorKind};
 use crate::traffic::TrafficCapture;
 
-/// Path prefix of the Vertex AI REST API version the proxy speaks.
-pub const API_VERSION: &str = "v1";
+/// Path prefix of the Vertex AI REST API version the proxy speaks unless a
+/// model names another (see [`ApiVersion`]).
+pub const API_VERSION: &str = ApiVersion::V1.as_str();
 
 /// How long to wait for the response headers. The same default as the Codex
 /// provider's; a request still queued upstream after this is answered 504.
@@ -274,6 +276,27 @@ impl UpstreamErrorDetail {
         }
     }
 
+    /// Reads a complete error body. [`Self::parse`] finds the message at
+    /// `/error/message`, which is where Google
+    /// (`{"error": {"code", "message", "status"}}`), Anthropic
+    /// (`{"type": "error", "error": {"type", "message"}}`) and OpenAI
+    /// (`{"error": {"message", "type", "code"}}`) put it. When the body gave
+    /// neither a message nor a status, the body itself becomes the message,
+    /// passed through [`sanitize_vertex_text`], which also cuts it to 500
+    /// characters. Only a complete body may be used that way: in one cut
+    /// short, a secret may have lost the end the sanitiser recognises it by.
+    pub fn read(body: &[u8], retry_after_header: Option<&str>, secrets: &[&str]) -> Self {
+        let mut detail = Self::parse(body, retry_after_header, secrets);
+        if detail.message.is_none() && detail.status.is_none() {
+            let text = sanitize_vertex_text(&String::from_utf8_lossy(body), secrets);
+            let text = text.trim();
+            if !text.is_empty() {
+                detail.message = Some(text.to_string());
+            }
+        }
+        detail
+    }
+
     /// `STATUS: message`, the message alone, or `None` when the body had
     /// neither.
     fn text(&self) -> Option<String> {
@@ -342,6 +365,33 @@ impl VertexTarget {
         Self::new(project, location, base_url)
     }
 
+    /// The target for one model's requests: the location comes from
+    /// [`ResolvedModel::location`] with the configured overrides and
+    /// location.
+    ///
+    /// # Errors
+    ///
+    /// A missing or invalid setting, including an invalid override, gives
+    /// [`VertexError::configuration`]. A model served only in some
+    /// locations, with neither an override nor a configured location among
+    /// them, gives [`VertexError::invalid_request`] with a message naming
+    /// the settings and the locations to choose from.
+    pub fn for_model(
+        config: &ResolvedVertexConfig,
+        model: &ResolvedModel,
+    ) -> Result<Self, VertexError> {
+        let project = config.project().map_err(VertexError::configuration)?;
+        let configured = config.location().map_err(VertexError::configuration)?;
+        let overrides = config
+            .location_overrides()
+            .map_err(VertexError::configuration)?;
+        let location = model
+            .location(&overrides, configured)
+            .map_err(|error| VertexError::invalid_request(error.to_string()))?;
+        let base_url = config.base_url().map_err(VertexError::configuration)?;
+        Self::new(project, location, base_url)
+    }
+
     /// A target from values that are already validated; `base_url` replaces
     /// the host derived from `location`. Its query and fragment are dropped.
     ///
@@ -382,6 +432,16 @@ impl VertexTarget {
         model: &str,
         method: &str,
     ) -> Result<reqwest::Url, VertexError> {
+        self.versioned_publisher_model_url(ApiVersion::V1, publisher, model, method)
+    }
+
+    fn versioned_publisher_model_url(
+        &self,
+        version: ApiVersion,
+        publisher: &str,
+        model: &str,
+        method: &str,
+    ) -> Result<reqwest::Url, VertexError> {
         for (name, value) in [
             ("publisher", publisher),
             ("model", model),
@@ -394,12 +454,73 @@ impl VertexTarget {
                 "Vertex model ID must not contain ':': {model}"
             )));
         }
-        self.location_url([
-            "publishers",
-            publisher,
-            "models",
-            &format!("{model}:{method}"),
-        ])
+        self.versioned_location_url(
+            version,
+            [
+                "publishers",
+                publisher,
+                "models",
+                &format!("{model}:{method}"),
+            ],
+        )
+    }
+
+    /// A publisher model's method in the model's API version:
+    /// `{base}/{version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{upstream_model}:{method}`.
+    /// Claude and Mistral use `rawPredict` and `streamRawPredict`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::publisher_model_url`].
+    pub fn model_method_url(
+        &self,
+        model: &ResolvedModel,
+        method: &str,
+    ) -> Result<reqwest::Url, VertexError> {
+        self.versioned_publisher_model_url(
+            model.api_version,
+            &model.publisher,
+            &model.upstream_model,
+            method,
+        )
+    }
+
+    /// An OpenAI-compatible API under the shared `openapi` endpoint, in the
+    /// model's API version:
+    /// `{base}/{version}/projects/{project}/locations/{location}/endpoints/openapi/{api}`.
+    /// The model goes in the request body, not the URL.
+    ///
+    /// # Errors
+    ///
+    /// Fails for an empty, `.` or `..` project or location.
+    pub fn openapi_url(
+        &self,
+        model: &ResolvedModel,
+        api: OpenApiPath,
+    ) -> Result<reqwest::Url, VertexError> {
+        let segments = ["endpoints", "openapi"]
+            .into_iter()
+            .chain(api.segments().iter().copied());
+        self.versioned_location_url(model.api_version, segments)
+    }
+
+    /// The Responses API under a publisher, in the model's API version:
+    /// `{base}/{version}/projects/{project}/locations/{location}/publishers/{publisher}/v1/responses`.
+    /// The `v1` after the publisher is part of that API's path and does not
+    /// follow the model's API version. The model goes in the request body.
+    ///
+    /// # Errors
+    ///
+    /// Fails for an empty, `.` or `..` project, location or publisher.
+    pub fn publisher_responses_url(
+        &self,
+        model: &ResolvedModel,
+    ) -> Result<reqwest::Url, VertexError> {
+        check_segment("publisher", &model.publisher)?;
+        self.versioned_location_url(
+            model.api_version,
+            ["publishers", &model.publisher, "v1", "responses"],
+        )
     }
 
     /// The Gemini streaming call:
@@ -425,6 +546,19 @@ impl VertexTarget {
         &self,
         segments: impl IntoIterator<Item = &'a str>,
     ) -> Result<reqwest::Url, VertexError> {
+        self.versioned_location_url(ApiVersion::V1, segments)
+    }
+
+    /// [`Self::location_url`] in API version `version`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::location_url`].
+    pub fn versioned_location_url<'a>(
+        &self,
+        version: ApiVersion,
+        segments: impl IntoIterator<Item = &'a str>,
+    ) -> Result<reqwest::Url, VertexError> {
         check_segment("project", &self.project)?;
         check_segment("location", &self.location)?;
         let segments: Vec<&str> = segments.into_iter().collect();
@@ -438,7 +572,7 @@ impl VertexTarget {
             })?;
             path.pop_if_empty();
             path.extend([
-                API_VERSION,
+                version.as_str(),
                 "projects",
                 &self.project,
                 "locations",
@@ -447,6 +581,25 @@ impl VertexTarget {
             path.extend(segments);
         }
         Ok(url)
+    }
+}
+
+/// An API under `endpoints/openapi`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenApiPath {
+    /// `responses`.
+    Responses,
+    /// `chat/completions`.
+    ChatCompletions,
+}
+
+impl OpenApiPath {
+    /// The path segments after `endpoints/openapi`.
+    pub const fn segments(self) -> &'static [&'static str] {
+        match self {
+            OpenApiPath::Responses => &["responses"],
+            OpenApiPath::ChatCompletions => &["chat", "completions"],
+        }
     }
 }
 
@@ -532,24 +685,31 @@ impl VertexClient {
     }
 
     /// Sends one Gemini `streamGenerateContent?alt=sse` request for `model`
-    /// with the resolved settings.
+    /// with the resolved settings, in the location
+    /// [`VertexTarget::for_model`] picks for it.
     ///
     /// # Errors
     ///
-    /// See [`Self::post_sse`]; an invalid setting gives
-    /// [`VertexError::configuration`].
+    /// See [`Self::post_sse`] and [`VertexTarget::for_model`].
     pub async fn stream_generate_content<B: Serialize + ?Sized>(
         &self,
         config: &ResolvedVertexConfig,
-        model: &str,
+        model: &ResolvedModel,
         body: &B,
         credentials: &VertexCredentials,
         traffic: Option<&TrafficCapture>,
     ) -> Result<VertexResponse, VertexError> {
-        let target = VertexTarget::from_config(config)?;
-        let url = target.gemini_stream_url(model)?;
-        self.post_sse(&target, model, url, body, credentials, traffic)
-            .await
+        let target = VertexTarget::for_model(config, model)?;
+        let url = target.gemini_stream_url(&model.upstream_model)?;
+        self.post_sse(
+            &target,
+            &model.upstream_model,
+            url,
+            body,
+            credentials,
+            traffic,
+        )
+        .await
     }
 
     /// POSTs `body` as JSON to `url` and asks for an event stream. `target`
@@ -638,7 +798,8 @@ impl VertexClient {
     }
 
     /// Reads at most [`MAX_ERROR_BODY_BYTES`] for at most the error-body
-    /// timeout. A body that is cut off or late is not parsed.
+    /// timeout and passes it to [`UpstreamErrorDetail::read`]. A body that is
+    /// cut off or late is not used.
     async fn error_detail(
         &self,
         response: reqwest::Response,
@@ -656,7 +817,7 @@ impl VertexClient {
         .await
         .ok()
         .and_then(|(body, cut)| (!cut).then_some(body));
-        UpstreamErrorDetail::parse(
+        UpstreamErrorDetail::read(
             complete.as_deref().unwrap_or_default(),
             retry_after.as_deref(),
             secrets,
@@ -850,6 +1011,7 @@ mod tests {
             project_setting: None,
             location_setting: setting("global", VertexSettingSource::Default),
             base_url_setting: None,
+            location_overrides_setting: None,
         };
         let error = VertexTarget::from_config(&unset).unwrap_err();
         assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -1087,6 +1249,358 @@ mod tests {
         assert_eq!(config.error_type(), "api_error");
     }
 
+    // Per-model URLs: the paths are the ones Google documents for each
+    // family (partner-model guides and the `v1` discovery document), with
+    // the project replaced by `synthetic-project`. The hosts follow the same
+    // rule as Gemini's for global, the us/eu multi-regions and a region.
+
+    fn model(raw: &str) -> ResolvedModel {
+        crate::providers::vertex::models::resolve(raw).unwrap()
+    }
+
+    #[test]
+    fn model_method_url_uses_the_documented_raw_predict_path_for_each_location_kind() {
+        for (location, raw, method, expected) in [
+            (
+                "global",
+                "vertex/anthropic/claude-opus-5-5",
+                "rawPredict",
+                "https://aiplatform.googleapis.com/v1/projects/synthetic-project/locations/global/publishers/anthropic/models/claude-opus-5-5:rawPredict",
+            ),
+            (
+                "us",
+                "vertex/anthropic/claude-opus-5-5",
+                "streamRawPredict",
+                "https://aiplatform.us.rep.googleapis.com/v1/projects/synthetic-project/locations/us/publishers/anthropic/models/claude-opus-5-5:streamRawPredict",
+            ),
+            (
+                "eu",
+                "vertex/anthropic/claude-sonnet-5",
+                "streamRawPredict",
+                "https://aiplatform.eu.rep.googleapis.com/v1/projects/synthetic-project/locations/eu/publishers/anthropic/models/claude-sonnet-5:streamRawPredict",
+            ),
+            (
+                "us-east5",
+                "vertex/anthropic/claude-opus-4-5@20251101",
+                "rawPredict",
+                "https://us-east5-aiplatform.googleapis.com/v1/projects/synthetic-project/locations/us-east5/publishers/anthropic/models/claude-opus-4-5@20251101:rawPredict",
+            ),
+            (
+                "us-central1",
+                "vertex/mistralai/mistral-medium-3",
+                "streamRawPredict",
+                "https://us-central1-aiplatform.googleapis.com/v1/projects/synthetic-project/locations/us-central1/publishers/mistralai/models/mistral-medium-3:streamRawPredict",
+            ),
+            (
+                "europe-west4",
+                "vertex/mistralai/codestral-2",
+                "rawPredict",
+                "https://europe-west4-aiplatform.googleapis.com/v1/projects/synthetic-project/locations/europe-west4/publishers/mistralai/models/codestral-2:rawPredict",
+            ),
+        ] {
+            let url = target(location)
+                .model_method_url(&model(raw), method)
+                .unwrap();
+            assert_eq!(url.as_str(), expected, "{raw} {location}");
+            assert_eq!(url.query(), None);
+        }
+    }
+
+    #[test]
+    fn openapi_url_uses_the_documented_responses_and_chat_completions_paths() {
+        let grok = model("vertex/xai/grok-4.7");
+        for (location, api, expected) in [
+            (
+                "global",
+                OpenApiPath::Responses,
+                "https://aiplatform.googleapis.com/v1/projects/synthetic-project/locations/global/endpoints/openapi/responses",
+            ),
+            (
+                "us",
+                OpenApiPath::Responses,
+                "https://aiplatform.us.rep.googleapis.com/v1/projects/synthetic-project/locations/us/endpoints/openapi/responses",
+            ),
+            (
+                "us-central1",
+                OpenApiPath::ChatCompletions,
+                "https://us-central1-aiplatform.googleapis.com/v1/projects/synthetic-project/locations/us-central1/endpoints/openapi/chat/completions",
+            ),
+            (
+                "global",
+                OpenApiPath::ChatCompletions,
+                "https://aiplatform.googleapis.com/v1/projects/synthetic-project/locations/global/endpoints/openapi/chat/completions",
+            ),
+        ] {
+            assert_eq!(
+                target(location).openapi_url(&grok, api).unwrap().as_str(),
+                expected,
+                "{location} {api:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn openapi_url_synthetic_follows_the_model_api_version() {
+        // The Llama model page sends Chat Completions to `v1beta1` in
+        // `us-east5`; no registered model uses that version yet, so the
+        // model here is synthetic.
+        let beta = ResolvedModel {
+            api_version: ApiVersion::V1Beta1,
+            ..model("vertex/xai/grok-4.7")
+        };
+        assert_eq!(
+            target("us-east5")
+                .openapi_url(&beta, OpenApiPath::ChatCompletions)
+                .unwrap()
+                .as_str(),
+            "https://us-east5-aiplatform.googleapis.com/v1beta1/projects/synthetic-project/locations/us-east5/endpoints/openapi/chat/completions"
+        );
+        assert_eq!(
+            target("us-east5")
+                .model_method_url(&beta, "rawPredict")
+                .unwrap()
+                .as_str(),
+            "https://us-east5-aiplatform.googleapis.com/v1beta1/projects/synthetic-project/locations/us-east5/publishers/xai/models/xai%2Fgrok-4.7:rawPredict"
+        );
+    }
+
+    #[test]
+    fn publisher_responses_url_uses_the_documented_path_for_each_location_kind() {
+        for (location, raw, expected) in [
+            (
+                "global",
+                "vertex/meta/muse-spark-1.3",
+                "https://aiplatform.googleapis.com/v1/projects/synthetic-project/locations/global/publishers/meta/v1/responses",
+            ),
+            (
+                "global",
+                "vertex/openai/gpt-6.1-sol",
+                "https://aiplatform.googleapis.com/v1/projects/synthetic-project/locations/global/publishers/openai/v1/responses",
+            ),
+            (
+                "us",
+                "vertex/openai/gpt-6-luna",
+                "https://aiplatform.us.rep.googleapis.com/v1/projects/synthetic-project/locations/us/publishers/openai/v1/responses",
+            ),
+            (
+                "asia-northeast1",
+                "vertex/openai/gpt-6-astra",
+                "https://asia-northeast1-aiplatform.googleapis.com/v1/projects/synthetic-project/locations/asia-northeast1/publishers/openai/v1/responses",
+            ),
+        ] {
+            assert_eq!(
+                target(location)
+                    .publisher_responses_url(&model(raw))
+                    .unwrap()
+                    .as_str(),
+                expected,
+                "{raw} {location}"
+            );
+        }
+    }
+
+    #[test]
+    fn publisher_responses_url_synthetic_keeps_its_inner_v1_and_the_base_url_prefix() {
+        let beta = ResolvedModel {
+            api_version: ApiVersion::V1Beta1,
+            ..model("vertex/openai/gpt-6.1-sol")
+        };
+        assert_eq!(
+            target("global")
+                .publisher_responses_url(&beta)
+                .unwrap()
+                .as_str(),
+            "https://aiplatform.googleapis.com/v1beta1/projects/synthetic-project/locations/global/publishers/openai/v1/responses"
+        );
+        let relayed = VertexTarget::new(
+            "synthetic-project",
+            "global",
+            Some("http://127.0.0.1:8080/relay/"),
+        )
+        .unwrap();
+        assert_eq!(
+            relayed
+                .publisher_responses_url(&model("vertex/meta/muse-ember-1.0"))
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:8080/relay/v1/projects/synthetic-project/locations/global/publishers/meta/v1/responses"
+        );
+        let empty = ResolvedModel {
+            publisher: String::new(),
+            ..model("vertex/meta/muse-ember-1.0")
+        };
+        let error = target("global")
+            .publisher_responses_url(&empty)
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    fn config_with(env: &[(&str, &str)]) -> ResolvedVertexConfig {
+        let config_dir = tempfile::TempDir::new().unwrap();
+        let env = env
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        crate::config::resolve_vertex_config(&env, config_dir.path())
+    }
+
+    #[test]
+    fn target_for_model_synthetic_takes_the_location_from_the_model_rule() {
+        let config = config_with(&[
+            ("CCP_VERTEX_PROJECT", "synthetic-project"),
+            ("CCP_VERTEX_LOCATION", "asia-northeast1"),
+            (
+                "CCP_VERTEX_LOCATION_OVERRIDES",
+                "anthropic=eu,meta=us-east5,openai/gpt-6-luna=us",
+            ),
+        ]);
+        for (raw, location) in [
+            ("gemini-3.5-flash", "asia-northeast1"),
+            ("vertex/anthropic/claude-opus-5-5", "eu"),
+            ("vertex/meta/muse-spark-1.3", "global"),
+            ("vertex/openai/gpt-6-luna", "us"),
+            ("vertex/openai/gpt-6.1-sol", "asia-northeast1"),
+        ] {
+            let target = VertexTarget::for_model(&config, &model(raw)).unwrap();
+            assert_eq!(target.location, location, "{raw}");
+            assert_eq!(
+                target.base_url.as_str(),
+                format!("https://{}/", vertex_host(location)),
+                "{raw}"
+            );
+        }
+
+        let error = VertexTarget::for_model(&config, &model("vertex/mistralai/mistral-medium-3"))
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        for needle in [
+            "CCP_VERTEX_LOCATION_OVERRIDES=mistralai=<location>",
+            "vertex.locationOverrides",
+            "us-central1 or europe-west4",
+        ] {
+            assert!(
+                error.message.contains(needle),
+                "{needle}: {}",
+                error.message
+            );
+        }
+
+        let regional = config_with(&[
+            ("CCP_VERTEX_PROJECT", "synthetic-project"),
+            ("CCP_VERTEX_LOCATION", "europe-west4"),
+        ]);
+        let target =
+            VertexTarget::for_model(&regional, &model("vertex/mistralai/mistral-medium-3"))
+                .unwrap();
+        assert_eq!(target.location, "europe-west4");
+
+        let invalid = config_with(&[
+            ("CCP_VERTEX_PROJECT", "synthetic-project"),
+            ("CCP_VERTEX_LOCATION_OVERRIDES", "anthropic=EU"),
+        ]);
+        // An invalid override is a configuration error for every model,
+        // Gemini included, so it cannot go unnoticed.
+        for raw in ["gemini-3.5-flash", "vertex/anthropic/claude-opus-5-5"] {
+            let error = VertexTarget::for_model(&invalid, &model(raw)).unwrap_err();
+            assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR, "{raw}");
+            assert!(
+                error
+                    .message
+                    .starts_with("Invalid Vertex configuration: Invalid Vertex setting CCP_VERTEX_LOCATION_OVERRIDES: "),
+                "{}",
+                error.message
+            );
+        }
+    }
+
+    // Error bodies from the partner families: neither Google's pages nor the
+    // vendors' establish which shape Vertex AI answers with for them, so the
+    // reader takes `/error/message` from each documented shape and falls back
+    // to the body itself. These bodies are synthetic.
+
+    #[test]
+    fn error_detail_synthetic_reads_the_message_from_google_anthropic_and_openai_bodies() {
+        for (body, status, message) in [
+            (
+                br#"{"error":{"code":400,"message":"Request contains an invalid argument.","status":"INVALID_ARGUMENT"}}"#.as_slice(),
+                Some("INVALID_ARGUMENT"),
+                "Request contains an invalid argument.",
+            ),
+            (
+                br#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: Field required"}}"#.as_slice(),
+                None,
+                "max_tokens: Field required",
+            ),
+            (
+                br#"{"error":{"message":"Unsupported parameter: 'reasoning.summary'","type":"invalid_request_error","param":"reasoning.summary","code":"unsupported_parameter"}}"#.as_slice(),
+                None,
+                "Unsupported parameter: 'reasoning.summary'",
+            ),
+        ] {
+            for detail in [
+                UpstreamErrorDetail::parse(body, None, &[]),
+                UpstreamErrorDetail::read(body, None, &[]),
+            ] {
+                assert_eq!(detail.status.as_deref(), status, "{message}");
+                assert_eq!(detail.message.as_deref(), Some(message));
+            }
+        }
+    }
+
+    #[test]
+    fn error_detail_synthetic_falls_back_to_the_sanitised_body() {
+        for (body, message) in [
+            (
+                b"<html><body>502 Bad Gateway</body></html>".as_slice(),
+                Some("<html><body>502 Bad Gateway</body></html>"),
+            ),
+            (br#"{"message":"x"}"#.as_slice(), Some(r#"{"message":"x"}"#)),
+            (
+                br#"{"error":"overloaded"}"#.as_slice(),
+                Some(r#"{"error":"overloaded"}"#),
+            ),
+            (b"  upstream reset \n".as_slice(), Some("upstream reset")),
+            (b"".as_slice(), None),
+            (b" \r\n\t".as_slice(), None),
+        ] {
+            let detail = UpstreamErrorDetail::read(body, Some("30"), &[]);
+            assert_eq!(detail.message.as_deref(), message, "{body:?}");
+            assert_eq!(detail.status, None, "{body:?}");
+            assert_eq!(detail.retry_after_secs, Some(30), "{body:?}");
+        }
+        // A status alone is enough; the body is not used then.
+        let status_only = br#"{"error":{"code":503,"status":"UNAVAILABLE"}}"#;
+        assert_eq!(
+            UpstreamErrorDetail::read(status_only, None, &[]),
+            UpstreamErrorDetail {
+                message: None,
+                status: Some("UNAVAILABLE".to_string()),
+                retry_after_secs: None,
+            }
+        );
+
+        let secret_body =
+            format!("upstream refused the token {SYNTHETIC_TOKEN} for synthetic@example.com");
+        let detail = UpstreamErrorDetail::read(secret_body.as_bytes(), None, &[SYNTHETIC_TOKEN]);
+        assert_eq!(
+            detail.message.as_deref(),
+            Some("upstream refused the token [redacted] for [redacted]")
+        );
+
+        // Cut to 500 characters after redaction, counted in characters.
+        let long = "Überlastung ".repeat(100);
+        let message = UpstreamErrorDetail::read(long.as_bytes(), None, &[])
+            .message
+            .unwrap();
+        assert_eq!(message.chars().count(), 500);
+        assert!(long.starts_with(&message));
+
+        // Bytes that are not UTF-8 are replaced rather than dropping the body.
+        let detail = UpstreamErrorDetail::read(b"bad \xff gateway", None, &[]);
+        assert_eq!(detail.message.as_deref(), Some("bad \u{fffd} gateway"));
+    }
+
     // Against a local upstream.
 
     #[derive(Debug, Default)]
@@ -1144,6 +1658,7 @@ mod tests {
                 base_url,
                 VertexSettingSource::Env("CCP_VERTEX_BASE_URL"),
             )),
+            location_overrides_setting: None,
         }
     }
 
@@ -1155,7 +1670,7 @@ mod tests {
         client
             .stream_generate_content(
                 &local_config(base_url),
-                MODEL,
+                &crate::providers::vertex::models::resolve(MODEL).unwrap(),
                 &serde_json::json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}),
                 &fixed_credentials(),
                 None,
@@ -1303,5 +1818,24 @@ mod tests {
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
         assert_eq!(error.kind, ProviderErrorKind::Api);
         assert_eq!(error.message_with_status(), "Vertex AI is unreachable");
+    }
+    #[tokio::test]
+    async fn request_synthetic_plain_text_error_body_becomes_the_redacted_message() {
+        fn plain() -> Response {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "upstream connect error or disconnect/reset before headers; token {SYNTHETIC_TOKEN}"
+                ),
+            )
+                .into_response()
+        }
+        let (base, _) = spawn_upstream(plain).await;
+        let error = send(&local_client(), &base).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            error.message_with_status(),
+            "upstream connect error or disconnect/reset before headers; token [redacted] (upstream HTTP 503)"
+        );
     }
 }
