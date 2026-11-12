@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 
 use crate::anthropic::schema::MessagesRequest;
 use crate::monitor::{MonitorHandle, usage_from_anthropic_sse};
@@ -14,7 +14,65 @@ use crate::providers::codex::translate::{
 use crate::providers::grok::translate::stream::SseDecoder;
 use crate::traffic::{StreamTrafficCapture, TrafficCapture};
 
+use super::chat::{
+    ReceiveContext, StreamLabels, StreamWiring, TerminalPolicy, UpstreamStream, box_upstream,
+};
 use super::client::{OpenCodeError, OpenCodeResponse};
+
+/// Responses event types the Codex translator acts on: the arms of
+/// `LiveStreamTranslator::accept` and the failure events its classifier
+/// turns into an error with the upstream's status and message. Under
+/// [`TerminalPolicy::Strict`] a frame whose `type` is in neither this list
+/// nor [`RESPONSES_HARMLESS_EVENT_TYPES`] is an error.
+pub const RESPONSES_HANDLED_EVENT_TYPES: &[&str] = &[
+    "codex.rate_limits",
+    "keepalive",
+    "response.created",
+    "response.in_progress",
+    "response.web_search_call.in_progress",
+    "response.web_search_call.searching",
+    "response.web_search_call.completed",
+    "response.output_item.added",
+    "response.reasoning_summary_part.added",
+    "response.reasoning_summary_text.delta",
+    "response.output_text.delta",
+    "response.output_text.annotation.added",
+    "response.function_call_arguments.delta",
+    "response.function_call_arguments.done",
+    "response.output_item.done",
+    "response.completed",
+    "response.incomplete",
+    "response.done",
+    "response.failed",
+    "response.error",
+    "error",
+];
+
+/// Responses event types the Codex translator ignores and that carry
+/// nothing it would need: progress notifications and the `.done` events
+/// that repeat what the deltas already delivered.
+pub const RESPONSES_HARMLESS_EVENT_TYPES: &[&str] = &[
+    "response.queued",
+    "response.content_part.added",
+    "response.content_part.done",
+    "response.output_text.done",
+    "response.reasoning_summary_part.done",
+    "response.reasoning_summary_text.done",
+];
+
+const TERMINAL_EVENT_TYPES: [&str; 3] =
+    ["response.completed", "response.incomplete", "response.done"];
+
+/// Why a strict stream rejects a parsed frame, or `None` when its `type`
+/// is listed.
+fn unlisted_frame(value: &serde_json::Value) -> Option<&'static str> {
+    let Some(event_type) = value.get("type").and_then(serde_json::Value::as_str) else {
+        return Some("missing_event_type");
+    };
+    let listed = RESPONSES_HANDLED_EVENT_TYPES.contains(&event_type)
+        || RESPONSES_HARMLESS_EVENT_TYPES.contains(&event_type);
+    (!listed).then_some("unlisted_event_type")
+}
 
 pub fn prepare_request(
     body: &MessagesRequest,
@@ -34,12 +92,78 @@ pub fn accumulate_response(
     message_id: &str,
     model: &str,
 ) -> anyhow::Result<serde_json::Value> {
-    accumulate_response_with_policy(
-        upstream,
-        message_id,
-        model,
-        IncompleteResponsePolicy::AllowMaxOutputTokens,
-    )
+    accumulate_response_with(upstream, message_id, model, &StreamWiring::default())
+}
+
+/// [`accumulate_response`] with the labels and receive policy of `wiring`.
+/// The whole body is already read, so
+/// [`super::chat::POST_TERMINAL_READ_LIMIT`] is the reader's to apply.
+/// Under [`TerminalPolicy::Strict`] every frame is checked as the
+/// streaming path checks it before the body is translated, and any event
+/// after the completion, `ping` included, is an error. The error goes
+/// through [`super::chat::ReceivePolicy::sanitize`].
+///
+/// # Errors
+///
+/// The body is not a complete, valid Responses stream, or it reports an
+/// upstream failure.
+pub fn accumulate_response_with(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    wiring: &StreamWiring,
+) -> anyhow::Result<serde_json::Value> {
+    let result = if wiring.receive.terminal == TerminalPolicy::Strict {
+        check_buffered_frames(upstream, &wiring.labels)
+    } else {
+        Ok(())
+    };
+    result
+        .and_then(|()| {
+            accumulate_response_with_policy(
+                upstream,
+                message_id,
+                model,
+                IncompleteResponsePolicy::AllowMaxOutputTokens,
+            )
+        })
+        .map_err(|error| wiring.receive.upstream_error(error))
+}
+
+/// The strict frame rules over a whole buffered body.
+fn check_buffered_frames(upstream: &[u8], labels: &StreamLabels) -> anyhow::Result<()> {
+    let invalid =
+        |kind: &str| anyhow::anyhow!("{} Responses stream is invalid: {kind}", labels.provider);
+    let mut decoder = SseDecoder::default();
+    let events = decoder
+        .push(upstream)
+        .map_err(|_| invalid("malformed_sse"))?;
+    decoder.finish().map_err(|_| invalid("incomplete_stream"))?;
+    let mut completed = false;
+    let mut done_seen = false;
+    for event in events {
+        let data = event.data.trim();
+        if data == "[DONE]" {
+            if !completed || done_seen {
+                return Err(invalid("premature_done"));
+            }
+            done_seen = true;
+            continue;
+        }
+        if completed {
+            return Err(invalid("event_after_completion"));
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(data).map_err(|_| invalid("malformed_event"))?;
+        if let Some(kind) = unlisted_frame(&value) {
+            return Err(invalid(kind));
+        }
+        completed = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|event_type| TERMINAL_EVENT_TYPES.contains(&event_type));
+    }
+    Ok(())
 }
 
 pub fn stream_body(
@@ -50,8 +174,60 @@ pub fn stream_body(
     req_id: String,
     traffic: Option<Arc<TrafficCapture>>,
 ) -> Body {
+    stream_body_with(
+        upstream.into_stream(),
+        message_id,
+        model,
+        monitor,
+        req_id,
+        traffic,
+        StreamWiring::default(),
+    )
+}
+
+/// The Anthropic SSE body translated from any Responses upstream byte
+/// stream, with the labels and receive policy of `wiring`.
+pub fn stream_body_with<S, E>(
+    upstream: S,
+    message_id: String,
+    model: String,
+    monitor: Option<MonitorHandle>,
+    req_id: String,
+    traffic: Option<Arc<TrafficCapture>>,
+    wiring: StreamWiring,
+) -> Body
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Send + 'static,
+{
+    let stream = wired_stream(
+        upstream, message_id, model, monitor, req_id, traffic, wiring,
+    );
+    let stream = futures_util::stream::unfold(stream, |mut stream| async move {
+        stream
+            .state
+            .next_output_with(&mut stream.context)
+            .await
+            .map(|bytes| (Ok::<Bytes, Infallible>(Bytes::from(bytes)), stream))
+    });
+    Body::from_stream(stream)
+}
+
+fn wired_stream<S, E>(
+    upstream: S,
+    message_id: String,
+    model: String,
+    monitor: Option<MonitorHandle>,
+    req_id: String,
+    traffic: Option<Arc<TrafficCapture>>,
+    wiring: StreamWiring,
+) -> WiredResponsesStream
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+{
+    let upstream = box_upstream(upstream);
     let state = ResponsesStreamState {
-        upstream: upstream.into_stream(),
+        upstream,
         decoder: SseDecoder::default(),
         translator: LiveStreamTranslator::new(message_id, model)
             .with_incomplete_response_policy(IncompleteResponsePolicy::AllowMaxOutputTokens),
@@ -66,13 +242,23 @@ pub fn stream_body(
         stream_capture: traffic.as_ref().map(|traffic| traffic.stream_capture()),
         traffic,
     };
-    let stream = futures_util::stream::unfold(state, |mut state| async move {
-        state
-            .next_output()
-            .await
-            .map(|bytes| (Ok::<Bytes, Infallible>(Bytes::from(bytes)), state))
-    });
-    Body::from_stream(stream)
+    WiredResponsesStream {
+        state,
+        context: ReceiveContext::new(wiring),
+    }
+}
+
+/// One stream and its wiring. Its `Drop` runs before the state's, so an
+/// abandoned stream is summarised under the wiring's labels.
+struct WiredResponsesStream {
+    state: ResponsesStreamState<UpstreamStream>,
+    context: ReceiveContext,
+}
+
+impl Drop for WiredResponsesStream {
+    fn drop(&mut self) {
+        self.state.abandon(self.context.labels());
+    }
 }
 
 struct ResponsesStreamState<S> {
@@ -95,7 +281,12 @@ impl<S> ResponsesStreamState<S>
 where
     S: futures_util::Stream<Item = Result<Bytes, OpenCodeError>> + Unpin,
 {
+    #[cfg(test)]
     async fn next_output(&mut self) -> Option<Vec<u8>> {
+        self.next_output_with(&mut ReceiveContext::default()).await
+    }
+
+    async fn next_output_with(&mut self, context: &mut ReceiveContext) -> Option<Vec<u8>> {
         if self.terminal {
             return None;
         }
@@ -105,26 +296,23 @@ where
         }
 
         loop {
-            let chunk = match self.upstream.next().await {
+            let after_terminal = context.is_strict() && self.pending_completion.is_some();
+            let next = if after_terminal {
+                match context.read_after_terminal(&mut self.upstream).await {
+                    Some(next) => next,
+                    None => return self.complete(context),
+                }
+            } else {
+                self.upstream.next().await
+            };
+            let chunk = match next {
                 Some(Ok(chunk)) => chunk,
-                Some(Err(_)) => return Some(self.fail_at("transport", "upstream_stream")),
+                Some(Err(_)) => return Some(self.fail_at("transport", "upstream_stream", context)),
                 None => {
                     if self.decoder.finish().is_err() {
-                        return Some(self.fail_at("decoder", "incomplete_stream"));
+                        return Some(self.fail_at("decoder", "incomplete_stream", context));
                     }
-                    let Some(completion) = self.pending_completion.take() else {
-                        return Some(self.fail_at("decoder", "incomplete_stream"));
-                    };
-                    let output = match self.translator.accept(&completion, self.traffic.as_deref())
-                    {
-                        Ok(output) => output,
-                        Err(_) => return Some(self.fail_at("translation", "invalid_event")),
-                    };
-                    self.terminal = true;
-                    self.record_progress(&output);
-                    self.capture_downstream(&output);
-                    self.finish_capture(true);
-                    return (!output.is_empty()).then_some(output);
+                    return self.complete(context);
                 }
             };
 
@@ -135,17 +323,20 @@ where
             }
             self.bytes = self.bytes.saturating_add(chunk.len() as u64);
             self.chunks = self.chunks.saturating_add(1);
+            if after_terminal && context.exceeds_post_terminal_bytes(chunk.len()) {
+                return Some(self.fail_at("protocol", "post_terminal_limit", context));
+            }
 
             let events = match self.decoder.push(&chunk) {
                 Ok(events) => events,
-                Err(_) => return Some(self.fail_at("decoder", "malformed_sse")),
+                Err(_) => return Some(self.fail_at("decoder", "malformed_sse", context)),
             };
             let mut output = Vec::new();
             for event in events {
                 let data = event.data.trim();
                 if data == "[DONE]" {
                     if self.pending_completion.is_none() || self.done_seen {
-                        return Some(self.fail_at("protocol", "premature_done"));
+                        return Some(self.fail_at("protocol", "premature_done", context));
                     }
                     self.done_seen = true;
                     if let Some(capture) = self.stream_capture.as_mut() {
@@ -156,17 +347,25 @@ where
                 }
                 let value: serde_json::Value = match serde_json::from_str(data) {
                     Ok(value) => value,
-                    Err(_) => return Some(self.fail_at("json", "malformed_event")),
+                    Err(_) => return Some(self.fail_at("json", "malformed_event", context)),
                 };
                 if let Some(capture) = self.stream_capture.as_mut() {
-                    capture.upstream_event(event.event.as_deref(), &value);
+                    capture.upstream_event(
+                        event.event.as_deref(),
+                        &context.wiring.receive.upstream_value(&value),
+                    );
                 }
                 let event_type = value.get("type").and_then(serde_json::Value::as_str);
                 if self.pending_completion.is_some() {
-                    if event_type == Some("ping") {
+                    if event_type == Some("ping") && !context.is_strict() {
                         continue;
                     }
-                    return Some(self.fail_at("protocol", "event_after_completion"));
+                    return Some(self.fail_at("protocol", "event_after_completion", context));
+                }
+                if context.is_strict()
+                    && let Some(kind) = unlisted_frame(&value)
+                {
+                    return Some(self.fail_at("protocol", kind, context));
                 }
                 if matches!(
                     event_type,
@@ -178,7 +377,7 @@ where
                 }
                 let translated = match self.translator.accept(&value, self.traffic.as_deref()) {
                     Ok(translated) => translated,
-                    Err(_) => return Some(self.fail_at("translation", "invalid_event")),
+                    Err(_) => return Some(self.fail_at("translation", "invalid_event", context)),
                 };
                 output.extend(translated);
             }
@@ -188,6 +387,23 @@ where
                 return Some(output);
             }
         }
+    }
+
+    /// Translates the held completion once the upstream closed or, for a
+    /// strict stream, the read window after it ended.
+    fn complete(&mut self, context: &ReceiveContext) -> Option<Vec<u8>> {
+        let Some(completion) = self.pending_completion.take() else {
+            return Some(self.fail_at("decoder", "incomplete_stream", context));
+        };
+        let output = match self.translator.accept(&completion, self.traffic.as_deref()) {
+            Ok(output) => output,
+            Err(_) => return Some(self.fail_at("translation", "invalid_event", context)),
+        };
+        self.terminal = true;
+        self.record_progress(&output);
+        self.capture_downstream(&output);
+        self.finish_capture(true, context);
+        (!output.is_empty()).then_some(output)
     }
 
     fn record_progress(&self, output: &[u8]) {
@@ -204,14 +420,15 @@ where
         );
     }
 
-    fn fail_at(&mut self, stage: &str, kind: &str) -> Vec<u8> {
+    fn fail_at(&mut self, stage: &str, kind: &str, context: &ReceiveContext) -> Vec<u8> {
+        let labels = context.labels();
         self.error_sent = true;
         if let Some(capture) = self.stream_capture.as_mut() {
             capture.malformed(stage, kind);
         }
         if let Some(traffic) = self.traffic.as_ref() {
             traffic.write_json(
-                "060-opencode-responses-stream-error",
+                &format!("060-{}-responses-stream-error", labels.capture_stem),
                 &serde_json::json!({
                     "stage": stage,
                     "kind": kind,
@@ -221,12 +438,12 @@ where
             );
         }
         let output = self.translator.error_chunk(
-            "OpenCode Go Responses stream is invalid",
+            &format!("{} Responses stream is invalid", labels.provider),
             "api_error",
             self.traffic.as_deref(),
         );
         self.capture_downstream(&output);
-        self.finish_capture(false);
+        self.finish_capture(false, context);
         output
     }
 
@@ -244,7 +461,7 @@ where
         }
     }
 
-    fn finish_capture(&mut self, completed: bool) {
+    fn finish_capture(&mut self, completed: bool, context: &ReceiveContext) {
         if let (Some(capture), Some(traffic)) = (self.stream_capture.take(), self.traffic.as_ref())
         {
             capture.finish_named(
@@ -254,14 +471,18 @@ where
                     "bytes": self.bytes,
                     "chunks": self.chunks,
                 }),
-                "061-opencode-responses-stream-summary",
+                &summary_name(context.labels()),
             );
         }
     }
 }
 
-impl<S> Drop for ResponsesStreamState<S> {
-    fn drop(&mut self) {
+fn summary_name(labels: &StreamLabels) -> String {
+    format!("061-{}-responses-stream-summary", labels.capture_stem)
+}
+
+impl<S> ResponsesStreamState<S> {
+    fn abandon(&mut self, labels: &StreamLabels) {
         if self.terminal || self.stream_capture.is_none() {
             return;
         }
@@ -275,9 +496,15 @@ impl<S> Drop for ResponsesStreamState<S> {
                     "bytes": self.bytes,
                     "chunks": self.chunks,
                 }),
-                "061-opencode-responses-stream-summary",
+                &summary_name(labels),
             );
         }
+    }
+}
+
+impl<S> Drop for ResponsesStreamState<S> {
+    fn drop(&mut self) {
+        self.abandon(&StreamLabels::OPENCODE_GO);
     }
 }
 
@@ -490,5 +717,182 @@ mod tests {
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("message_stop"));
         assert!(!text.contains("OpenCode Go Responses stream is invalid"));
+    }
+
+    use crate::providers::opencode::chat::{POST_TERMINAL_READ_LIMIT, ReceivePolicy, Sanitizer};
+
+    const INVALID: &str = "Synthetic Gateway Responses stream is invalid";
+
+    fn strict_wiring() -> StreamWiring {
+        StreamWiring {
+            labels: StreamLabels {
+                provider: "Synthetic Gateway",
+                capture_stem: "synthetic",
+            },
+            receive: ReceivePolicy {
+                terminal: TerminalPolicy::Strict,
+                sanitize: None,
+            },
+        }
+    }
+
+    fn strict_body<S>(upstream: S) -> Body
+    where
+        S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    {
+        stream_body_with(
+            upstream,
+            "msg_strict".into(),
+            "synthetic-model".into(),
+            None,
+            "req".into(),
+            None,
+            strict_wiring(),
+        )
+    }
+
+    async fn body_text(body: Body) -> String {
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn chunks(parts: &[&str]) -> Vec<Result<Bytes, std::io::Error>> {
+        parts
+            .iter()
+            .map(|part| Ok(Bytes::copy_from_slice(part.as_bytes())))
+            .collect()
+    }
+
+    #[test]
+    fn listed_event_types_are_distinct_and_cover_every_terminal_event() {
+        let mut all = RESPONSES_HANDLED_EVENT_TYPES
+            .iter()
+            .chain(RESPONSES_HARMLESS_EVENT_TYPES)
+            .collect::<Vec<_>>();
+        let listed = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), listed);
+        for terminal in TERMINAL_EVENT_TYPES {
+            assert!(RESPONSES_HANDLED_EVENT_TYPES.contains(&terminal));
+        }
+        assert!(!all.contains(&&"ping"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_rejects_unreadable_or_unlisted_frames() {
+        for frame in [
+            "data: not-json\n\n",
+            "data: {\"delta\":\"no type\"}\n\n",
+            "data: {\"type\":7}\n\n",
+            "data: {\"type\":\"response.refusal.delta\",\"delta\":\"no\"}\n\n",
+            "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+        ] {
+            let upstream = futures_util::stream::iter(chunks(&[frame, COMPLETION]));
+            let text = body_text(strict_body(upstream)).await;
+            assert!(text.contains(INVALID), "frame {frame}: {text}");
+            assert!(!text.contains("message_stop"), "frame {frame}: {text}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_passes_harmless_progress_events() {
+        let wire = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{}}\n\n",
+            "data: {\"type\":\"response.in_progress\",\"response\":{}}\n\n",
+            "data: {\"type\":\"response.queued\"}\n\n",
+            "data: {\"type\":\"response.content_part.added\",\"output_index\":0}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"early\"}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"text\":\"early\"}\n\n",
+            "data: {\"type\":\"response.content_part.done\",\"output_index\":0}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let started = tokio::time::Instant::now();
+        let text = body_text(strict_body(futures_util::stream::iter(chunks(&[wire])))).await;
+        assert!(started.elapsed() < POST_TERMINAL_READ_LIMIT);
+        assert!(text.contains("early"), "{text}");
+        assert!(text.contains("message_stop"), "{text}");
+        assert!(!text.contains("api_error"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_rejects_any_tail_after_a_valid_completion() {
+        for tail in [
+            "data: not-json\n\n",
+            PING,
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n",
+            "data: [DONE]\n\ndata: [DONE]\n\n",
+        ] {
+            let wire = format!("{COMPLETION}{tail}");
+            for split in [COMPLETION.len(), wire.len()] {
+                let upstream =
+                    futures_util::stream::iter(chunks(&[&wire[..split], &wire[split..]]));
+                let text = body_text(strict_body(upstream)).await;
+                assert!(text.contains(INVALID), "tail {tail}, split {split}: {text}");
+                assert!(
+                    !text.contains("message_stop"),
+                    "tail {tail}, split {split}: {text}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_completes_at_the_read_limit_when_upstream_stays_open() {
+        for wire in [
+            COMPLETION.to_string(),
+            format!("{COMPLETION}data: [DONE]\n\n"),
+            format!("{COMPLETION}data: {{\"ty"),
+        ] {
+            let upstream =
+                futures_util::stream::iter(chunks(&[&wire])).chain(futures_util::stream::pending());
+            let started = tokio::time::Instant::now();
+            let text = body_text(strict_body(upstream)).await;
+            assert!(started.elapsed() >= POST_TERMINAL_READ_LIMIT, "{wire}");
+            assert!(text.contains("message_stop"), "{wire}: {text}");
+            assert!(!text.contains("api_error"), "{wire}: {text}");
+        }
+    }
+
+    #[test]
+    fn synthetic_strict_buffered_response_checks_every_frame() {
+        let wiring = strict_wiring();
+        for wire in [
+            format!("data: not-json\n\n{COMPLETION}"),
+            format!("data: {{\"delta\":\"no type\"}}\n\n{COMPLETION}"),
+            format!("data: {{\"type\":\"response.refusal.delta\"}}\n\n{COMPLETION}"),
+            format!("{COMPLETION}{PING}"),
+            format!("{COMPLETION}data: [DONE]\n\ndata: [DONE]\n\n"),
+            format!("data: [DONE]\n\n{COMPLETION}"),
+            format!("{COMPLETION}data: {{\"ty"),
+        ] {
+            let error = accumulate_response_with(wire.as_bytes(), "msg", "model", &wiring)
+                .unwrap_err()
+                .to_string();
+            assert!(error.starts_with(INVALID), "{wire}: {error}");
+        }
+        let wire = format!(
+            "data: {{\"type\":\"response.created\"}}\n\ndata: {{\"type\":\"response.content_part.added\"}}\n\n{COMPLETION}data: [DONE]\n\n"
+        );
+        assert!(accumulate_response_with(wire.as_bytes(), "msg", "model", &wiring).is_ok());
+        let wire = format!("{COMPLETION}{PING}");
+        assert!(accumulate_response(wire.as_bytes(), "msg", "model").is_ok());
+    }
+
+    #[test]
+    fn synthetic_sanitizer_cleans_the_upstream_failure_of_a_buffered_response() {
+        let sanitize: Sanitizer = Arc::new(|text: &str| text.replace("SECRET-123", "[redacted]"));
+        let mut wiring = strict_wiring();
+        wiring.receive.sanitize = Some(sanitize);
+        let wire = concat!(
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",",
+            "\"error\":{\"code\":\"server_error\",\"message\":\"model saw SECRET-123\"}}}\n\n"
+        );
+        let error = accumulate_response_with(wire.as_bytes(), "msg", "model", &wiring)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("[redacted]"), "{error}");
+        assert!(!error.contains("SECRET-123"), "{error}");
     }
 }

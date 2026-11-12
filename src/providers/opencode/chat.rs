@@ -1,10 +1,13 @@
+use std::borrow::Cow;
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use base64::Engine;
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -23,6 +26,240 @@ use crate::providers::{
 use crate::traffic::{StreamTrafficCapture, TrafficCapture};
 
 const DEFAULT_MAX_TOKENS: u32 = 32_000;
+
+/// How long the upstream may stay open after the terminal event (`[DONE]`,
+/// `message_stop`, `response.completed`) under [`TerminalPolicy::Strict`]
+/// before the response is completed without waiting for it to close.
+pub const POST_TERMINAL_READ_LIMIT: Duration = Duration::from_secs(2);
+
+/// Most bytes read after the terminal event under
+/// [`TerminalPolicy::Strict`]; more is an error.
+pub const POST_TERMINAL_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Cleans upstream prose before it reaches a traffic capture or an error
+/// returned to the client. It is the same type as the Vertex provider's
+/// sanitiser, so one closure serves both.
+pub type Sanitizer = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
+/// The names the stream wiring of this module, [`super::messages`] and
+/// [`super::responses`] writes: the provider name in error messages and the
+/// stem of traffic-capture file names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamLabels {
+    /// Provider name in error messages, as in `OpenCode Go stream is
+    /// invalid`.
+    pub provider: &'static str,
+    /// Stem of traffic-capture file names, as in
+    /// `061-opencode-stream-summary`.
+    pub capture_stem: &'static str,
+}
+
+impl StreamLabels {
+    /// The labels OpenCode Go uses.
+    pub const OPENCODE_GO: Self = Self {
+        provider: "OpenCode Go",
+        capture_stem: "opencode",
+    };
+}
+
+impl Default for StreamLabels {
+    fn default() -> Self {
+        Self::OPENCODE_GO
+    }
+}
+
+/// What happens after the terminal event of an upstream stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerminalPolicy {
+    /// OpenCode Go's rules. Chat Completions settles at `[DONE]` (or at EOF
+    /// after a `finish_reason`) and accepts OpenCode's cost metadata after
+    /// `[DONE]`; Messages settles at `message_stop`; Responses waits for EOF
+    /// after the completion and accepts `ping` events in between.
+    #[default]
+    OpenCodeGo,
+    /// After the terminal event, keep reading until the upstream closes, for
+    /// at most [`POST_TERMINAL_READ_LIMIT`] and [`POST_TERMINAL_MAX_BYTES`].
+    /// Any event in that window, a second `[DONE]` included, is an error,
+    /// and the terminal output reaches the client only after the window.
+    /// When the upstream stays open, the response completes at the read
+    /// limit. A partial frame still buffered then is discarded by the Chat
+    /// Completions and Responses translators; the Messages pass-through
+    /// forwards upstream bytes as received and fails instead. Responses
+    /// frames must also carry a `type` listed in
+    /// [`super::responses::RESPONSES_HANDLED_EVENT_TYPES`] or
+    /// [`super::responses::RESPONSES_HARMLESS_EVENT_TYPES`].
+    Strict,
+}
+
+/// How a translator receives the upstream response.
+#[derive(Clone, Default)]
+pub struct ReceivePolicy {
+    /// The rules after the terminal event.
+    pub terminal: TerminalPolicy,
+    /// Applied to every string under a `message` key of an upstream event
+    /// before the event is captured, and to the error a buffered response
+    /// returns. `None` keeps both as the upstream sent them.
+    pub sanitize: Option<Sanitizer>,
+}
+
+impl ReceivePolicy {
+    fn is_strict(&self) -> bool {
+        self.terminal == TerminalPolicy::Strict
+    }
+
+    pub(super) fn upstream_value<'a>(&self, value: &'a Value) -> Cow<'a, Value> {
+        match self.sanitize.as_ref() {
+            Some(sanitize) => {
+                let mut value = value.clone();
+                sanitize_messages(&mut value, &**sanitize);
+                Cow::Owned(value)
+            }
+            None => Cow::Borrowed(value),
+        }
+    }
+
+    pub(super) fn upstream_error(&self, error: anyhow::Error) -> anyhow::Error {
+        match self.sanitize.as_ref() {
+            Some(sanitize) => anyhow::anyhow!(sanitize(&format!("{error:#}"))),
+            None => error,
+        }
+    }
+}
+
+fn sanitize_messages(value: &mut Value, sanitize: &dyn Fn(&str) -> String) {
+    match value {
+        Value::Object(object) => {
+            for (key, item) in object.iter_mut() {
+                match item {
+                    Value::String(text) if key == "message" => *text = sanitize(text),
+                    _ => sanitize_messages(item, sanitize),
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                sanitize_messages(item, sanitize);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Labels and receive policy for one upstream stream. [`Default`] is OpenCode
+/// Go's.
+#[derive(Clone, Default)]
+pub struct StreamWiring {
+    /// Names in error messages and traffic-capture files.
+    pub labels: StreamLabels,
+    /// How the upstream response is received.
+    pub receive: ReceivePolicy,
+}
+
+pub(super) type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Bytes, OpenCodeError>> + Send>>;
+
+/// Boxes any upstream byte stream for the stream states, which only note
+/// that a transport error happened and never read it.
+pub(super) fn box_upstream<S, E>(upstream: S) -> UpstreamStream
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+{
+    Box::pin(upstream.map(|item| {
+        item.map_err(|_| OpenCodeError {
+            status: http::StatusCode::BAD_GATEWAY,
+            retry_after: None,
+            message: "upstream stream failed".to_string(),
+        })
+    }))
+}
+
+/// The wiring of one stream plus what it has to remember between reads.
+#[derive(Default)]
+pub(super) struct ReceiveContext {
+    pub(super) wiring: StreamWiring,
+    read_deadline: Option<tokio::time::Instant>,
+    post_terminal_bytes: usize,
+}
+
+impl ReceiveContext {
+    pub(super) fn new(wiring: StreamWiring) -> Self {
+        Self {
+            wiring,
+            read_deadline: None,
+            post_terminal_bytes: 0,
+        }
+    }
+
+    pub(super) fn is_strict(&self) -> bool {
+        self.wiring.receive.is_strict()
+    }
+
+    pub(super) fn labels(&self) -> &StreamLabels {
+        &self.wiring.labels
+    }
+
+    /// The next upstream item after the terminal event, or `None` when
+    /// [`POST_TERMINAL_READ_LIMIT`] passed first. The limit runs from the
+    /// first call.
+    pub(super) async fn read_after_terminal<S>(
+        &mut self,
+        upstream: &mut S,
+    ) -> Option<Option<S::Item>>
+    where
+        S: Stream + Unpin,
+    {
+        let deadline = *self
+            .read_deadline
+            .get_or_insert_with(|| tokio::time::Instant::now() + POST_TERMINAL_READ_LIMIT);
+        tokio::time::timeout_at(deadline, upstream.next())
+            .await
+            .ok()
+    }
+
+    /// Counts bytes read after the terminal event; `true` once they exceed
+    /// [`POST_TERMINAL_MAX_BYTES`].
+    pub(super) fn exceeds_post_terminal_bytes(&mut self, len: usize) -> bool {
+        self.post_terminal_bytes = self.post_terminal_bytes.saturating_add(len);
+        self.post_terminal_bytes > POST_TERMINAL_MAX_BYTES
+    }
+}
+
+/// How [`prepare_request_with`] treats reasoning. [`Default`] is OpenCode
+/// Go's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RequestPolicy {
+    /// How `reasoning_effort` is set.
+    pub effort: EffortPolicy,
+    /// When an assistant turn carries its reasoning back as
+    /// `reasoning_content`.
+    pub reasoning_replay: ReasoningReplay,
+}
+
+/// How `reasoning_effort` is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EffortPolicy {
+    /// Map the requested effort by OpenCode Go model name and reject the
+    /// values a model does not accept.
+    #[default]
+    OpenCodeGo,
+    /// Leave `reasoning_effort` unset and the requested effort unread; the
+    /// caller sets the field itself.
+    Untouched,
+}
+
+/// When an assistant turn carries its reasoning back as `reasoning_content`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasoningReplay {
+    /// Always for a model whose name contains `deepseek`, otherwise as
+    /// [`Self::WhenPresent`].
+    #[default]
+    OpenCodeGo,
+    /// When the turn has reasoning text.
+    WhenPresent,
+    /// On every assistant turn, empty when the turn has no reasoning.
+    Always,
+    /// Never; thinking blocks are dropped.
+    Never,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
@@ -49,7 +286,23 @@ pub struct StreamOptions {
 /// Translate the Anthropic Messages wire model to the OpenAI-compatible wire
 /// model accepted by OpenCode Go's `/chat/completions` endpoint.
 pub fn prepare_request(req: &MessagesRequest, model: &str) -> anyhow::Result<ChatRequest> {
-    let messages = build_messages(req, model)?;
+    prepare_request_with(req, model, RequestPolicy::default())
+}
+
+/// [`prepare_request`] with the reasoning rules of `policy`, for a provider
+/// whose models do not follow OpenCode Go's effort names.
+///
+/// # Errors
+///
+/// The request cannot be expressed as Chat Completions, or, under
+/// [`EffortPolicy::OpenCodeGo`], the model does not accept the requested
+/// effort.
+pub fn prepare_request_with(
+    req: &MessagesRequest,
+    model: &str,
+    policy: RequestPolicy,
+) -> anyhow::Result<ChatRequest> {
+    let messages = build_messages(req, model, policy.reasoning_replay)?;
     let tools = read_tools(req)?;
     let (tool_choice, parallel_tool_calls) = read_tool_choice(req)?;
     if tools.is_empty()
@@ -74,12 +327,25 @@ pub fn prepare_request(req: &MessagesRequest, model: &str) -> anyhow::Result<Cha
             .max_tokens
             .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_MAX_TOKENS),
-        reasoning_effort: map_reasoning_effort(req, model)?,
+        reasoning_effort: match policy.effort {
+            EffortPolicy::OpenCodeGo => map_reasoning_effort(req, model)?,
+            EffortPolicy::Untouched => None,
+        },
     })
 }
 
-fn build_messages(req: &MessagesRequest, model: &str) -> anyhow::Result<Vec<Value>> {
-    let deepseek = model.to_ascii_lowercase().contains("deepseek");
+fn build_messages(
+    req: &MessagesRequest,
+    model: &str,
+    replay: ReasoningReplay,
+) -> anyhow::Result<Vec<Value>> {
+    let replay = match replay {
+        ReasoningReplay::OpenCodeGo if model.to_ascii_lowercase().contains("deepseek") => {
+            ReasoningReplay::Always
+        }
+        ReasoningReplay::OpenCodeGo => ReasoningReplay::WhenPresent,
+        other => other,
+    };
     let mut system = Vec::new();
     if let Some(text) = flatten_system_text(req.extra.get("system")) {
         system.push(text);
@@ -104,7 +370,7 @@ fn build_messages(req: &MessagesRequest, model: &str) -> anyhow::Result<Vec<Valu
             }
             "user" => push_user_messages(&mut messages, &blocks),
             "assistant" => {
-                if let Some(message) = assistant_message(&blocks, deepseek)? {
+                if let Some(message) = assistant_message(&blocks, replay)? {
                     messages.push(message);
                 }
             }
@@ -179,13 +445,17 @@ fn push_user_messages(messages: &mut Vec<Value>, blocks: &[ContentBlock]) {
     flush(messages, &mut content);
 }
 
-fn assistant_message(blocks: &[ContentBlock], deepseek: bool) -> anyhow::Result<Option<Value>> {
+fn assistant_message(
+    blocks: &[ContentBlock],
+    replay: ReasoningReplay,
+) -> anyhow::Result<Option<Value>> {
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
     for block in blocks {
         match block {
             ContentBlock::Text { text: value } => text.push_str(value),
+            ContentBlock::Thinking { .. } if replay == ReasoningReplay::Never => {}
             ContentBlock::Thinking {
                 thinking,
                 signature: _,
@@ -220,7 +490,7 @@ fn assistant_message(blocks: &[ContentBlock], deepseek: bool) -> anyhow::Result<
     message.insert("content".into(), Value::String(text));
     // DeepSeek requires the field on every replayed assistant message, even
     // when that turn did not contain visible reasoning.
-    if deepseek || !reasoning.is_empty() {
+    if replay == ReasoningReplay::Always || !reasoning.is_empty() {
         message.insert("reasoning_content".into(), Value::String(reasoning));
     }
     if !tool_calls.is_empty() {
@@ -527,6 +797,7 @@ enum ToolBlockState {
 struct TranslationState {
     message_id: String,
     model: String,
+    provider: &'static str,
     message_started: bool,
     finished: bool,
     next_block_index: usize,
@@ -539,10 +810,11 @@ struct TranslationState {
 }
 
 impl TranslationState {
-    fn new(message_id: String, model: String) -> Self {
+    fn new(message_id: String, model: String, provider: &'static str) -> Self {
         Self {
             message_id,
             model,
+            provider,
             message_started: false,
             finished: false,
             next_block_index: 0,
@@ -557,11 +829,12 @@ impl TranslationState {
 
     fn apply_chunk(&mut self, chunk: StreamChunk) -> anyhow::Result<Vec<u8>> {
         if self.finished {
-            anyhow::bail!("OpenCode Go event after terminal completion");
+            anyhow::bail!("{} event after terminal completion", self.provider);
         }
         if let Some(error) = chunk.error {
             anyhow::bail!(
-                "OpenCode Go upstream error: {}",
+                "{} upstream error: {}",
+                self.provider,
                 error.message.unwrap_or_else(|| "unknown error".into())
             );
         }
@@ -575,7 +848,7 @@ impl TranslationState {
             return Ok(Vec::new());
         }
         if choices.len() != 1 {
-            anyhow::bail!("OpenCode Go stream returned multiple choices");
+            anyhow::bail!("{} stream returned multiple choices", self.provider);
         }
         let choice = choices.into_iter().next().expect("one choice");
         let mut out = Vec::new();
@@ -583,9 +856,9 @@ impl TranslationState {
             self.apply_delta(delta, &mut out)?;
         }
         if let Some(reason) = choice.finish_reason {
-            let reason = parse_finish_reason(&reason)?;
+            let reason = parse_finish_reason(&reason, self.provider)?;
             if self.pending_stop.is_some_and(|current| current != reason) {
-                anyhow::bail!("OpenCode Go stream changed finish_reason");
+                anyhow::bail!("{} stream changed finish_reason", self.provider);
             }
             self.pending_stop = Some(reason);
         }
@@ -705,7 +978,8 @@ impl TranslationState {
         };
         if self.tools[position].state == ToolBlockState::Closed {
             anyhow::bail!(
-                "OpenCode Go tool call {} continued after its content block was closed",
+                "{} tool call {} continued after its content block was closed",
+                self.provider,
                 upstream_index
             );
         }
@@ -801,7 +1075,8 @@ impl TranslationState {
         for slot in &self.tools {
             if slot.state == ToolBlockState::Pending {
                 anyhow::bail!(
-                    "OpenCode Go tool call {} ended without id or function name",
+                    "{} tool call {} ended without id or function name",
+                    self.provider,
                     slot.upstream_index
                 );
             }
@@ -809,9 +1084,11 @@ impl TranslationState {
         for block in &self.blocks {
             if let BlockKind::Tool { args, .. } = &block.kind {
                 let value: Value = serde_json::from_str(if args.is_empty() { "{}" } else { args })
-                    .map_err(|_| anyhow::anyhow!("OpenCode Go tool arguments are invalid JSON"))?;
+                    .map_err(|_| {
+                        anyhow::anyhow!("{} tool arguments are invalid JSON", self.provider)
+                    })?;
                 if !value.is_object() {
-                    anyhow::bail!("OpenCode Go tool arguments must be a JSON object");
+                    anyhow::bail!("{} tool arguments must be a JSON object", self.provider);
                 }
             }
         }
@@ -839,7 +1116,7 @@ impl TranslationState {
 
     fn response(&self) -> anyhow::Result<Value> {
         if !self.finished {
-            anyhow::bail!("OpenCode Go response is not complete");
+            anyhow::bail!("{} response is not complete", self.provider);
         }
         let mut content = Vec::new();
         for block in &self.blocks {
@@ -942,13 +1219,13 @@ impl TranslationState {
     }
 }
 
-fn parse_finish_reason(reason: &str) -> anyhow::Result<StopReason> {
+fn parse_finish_reason(reason: &str, provider: &str) -> anyhow::Result<StopReason> {
     match reason {
         "stop" => Ok(StopReason::EndTurn),
         "tool_calls" | "function_call" => Ok(StopReason::ToolUse),
         "length" => Ok(StopReason::MaxTokens),
-        "content_filter" => anyhow::bail!("OpenCode Go response was blocked by a content filter"),
-        other => anyhow::bail!("unsupported OpenCode Go finish_reason: {other}"),
+        "content_filter" => anyhow::bail!("{provider} response was blocked by a content filter"),
+        other => anyhow::bail!("unsupported {provider} finish_reason: {other}"),
     }
 }
 
@@ -974,13 +1251,35 @@ fn emit(out: &mut Vec<u8>, event: &str, value: Value) {
 pub struct LiveStreamTranslator {
     decoder: SseDecoder,
     state: TranslationState,
+    terminal: TerminalPolicy,
+    done_seen: bool,
 }
 
 impl LiveStreamTranslator {
     pub fn new(message_id: String, model: String) -> Self {
+        Self::with_wiring(
+            message_id,
+            model,
+            StreamLabels::OPENCODE_GO,
+            TerminalPolicy::OpenCodeGo,
+        )
+    }
+
+    /// A translator whose errors name `labels.provider`. Under
+    /// [`TerminalPolicy::Strict`], `[DONE]` does not complete the response:
+    /// a second `[DONE]` or any later event is an error, and the closing
+    /// events come from [`Self::finish`] or [`Self::finish_after_read_limit`].
+    pub fn with_wiring(
+        message_id: String,
+        model: String,
+        labels: StreamLabels,
+        terminal: TerminalPolicy,
+    ) -> Self {
         Self {
             decoder: SseDecoder::default(),
-            state: TranslationState::new(message_id, model),
+            state: TranslationState::new(message_id, model, labels.provider),
+            terminal,
+            done_seen: false,
         }
     }
 
@@ -988,16 +1287,28 @@ impl LiveStreamTranslator {
         let mut out = Vec::new();
         for event in self.decoder.push(input)? {
             let data = event.data.trim();
+            if self.terminal == TerminalPolicy::Strict {
+                if data == "[DONE]" {
+                    if self.done_seen {
+                        anyhow::bail!("{} stream sent [DONE] twice", self.state.provider);
+                    }
+                    self.done_seen = true;
+                    continue;
+                }
+                if self.done_seen {
+                    anyhow::bail!("{} event after [DONE]", self.state.provider);
+                }
+            }
             if data == "[DONE]" {
                 out.extend(self.state.finalize()?);
                 continue;
             }
             if self.state.finished {
-                validate_post_done_metadata(data)?;
+                validate_post_done_metadata(data, self.state.provider)?;
                 continue;
             }
             let chunk: StreamChunk = serde_json::from_str(data)
-                .map_err(|_| anyhow::anyhow!("malformed OpenCode Go SSE event"))?;
+                .map_err(|_| anyhow::anyhow!("malformed {} SSE event", self.state.provider))?;
             out.extend(self.state.apply_chunk(chunk)?);
         }
         Ok(out)
@@ -1008,8 +1319,29 @@ impl LiveStreamTranslator {
         if self.state.finished {
             return Ok(Vec::new());
         }
-        if self.state.pending_stop.is_none() {
-            anyhow::bail!("OpenCode Go stream ended without [DONE] or finish_reason");
+        if self.state.pending_stop.is_none() && !self.done_seen {
+            anyhow::bail!(
+                "{} stream ended without [DONE] or finish_reason",
+                self.state.provider
+            );
+        }
+        self.state.finalize()
+    }
+
+    /// Completes the response when the upstream stayed open for
+    /// [`POST_TERMINAL_READ_LIMIT`] after the terminal event. A partial frame
+    /// still buffered is discarded.
+    ///
+    /// # Errors
+    ///
+    /// No `[DONE]` or `finish_reason` has arrived, or the response content
+    /// is invalid.
+    pub fn finish_after_read_limit(&mut self) -> anyhow::Result<Vec<u8>> {
+        if !self.is_terminal() {
+            anyhow::bail!(
+                "{} stream ended without [DONE] or finish_reason",
+                self.state.provider
+            );
         }
         self.state.finalize()
     }
@@ -1017,14 +1349,20 @@ impl LiveStreamTranslator {
     pub fn is_finished(&self) -> bool {
         self.state.finished
     }
+
+    /// Whether `[DONE]` or a `finish_reason` has arrived; from then on a
+    /// strict caller reads for at most [`POST_TERMINAL_READ_LIMIT`].
+    pub fn is_terminal(&self) -> bool {
+        self.state.finished || self.done_seen || self.state.pending_stop.is_some()
+    }
 }
 
-fn validate_post_done_metadata(data: &str) -> anyhow::Result<()> {
+fn validate_post_done_metadata(data: &str, provider: &str) -> anyhow::Result<()> {
     let value: Value = serde_json::from_str(data)
-        .map_err(|_| anyhow::anyhow!("malformed OpenCode Go SSE event after [DONE]"))?;
+        .map_err(|_| anyhow::anyhow!("malformed {provider} SSE event after [DONE]"))?;
     let object = value
         .as_object()
-        .ok_or_else(|| anyhow::anyhow!("OpenCode Go event after terminal completion"))?;
+        .ok_or_else(|| anyhow::anyhow!("{provider} event after terminal completion"))?;
     let has_empty_choices = object
         .get("choices")
         .and_then(Value::as_array)
@@ -1041,14 +1379,39 @@ fn validate_post_done_metadata(data: &str) -> anyhow::Result<()> {
     if has_empty_choices && has_cost && known_keys {
         return Ok(());
     }
-    anyhow::bail!("OpenCode Go event after terminal completion")
+    anyhow::bail!("{provider} event after terminal completion")
 }
 
 pub fn accumulate_response(input: &[u8], message_id: &str, model: &str) -> anyhow::Result<Value> {
-    let mut translator = LiveStreamTranslator::new(message_id.into(), model.into());
-    translator.push(input)?;
-    translator.finish()?;
-    translator.state.response()
+    accumulate_response_with(input, message_id, model, &StreamWiring::default())
+}
+
+/// [`accumulate_response`] with the labels and receive policy of `wiring`.
+/// The whole body is already read, so [`POST_TERMINAL_READ_LIMIT`] is the
+/// reader's to apply; under [`TerminalPolicy::Strict`] any event after
+/// `[DONE]` in `input` is an error. The error goes through
+/// [`ReceivePolicy::sanitize`].
+///
+/// # Errors
+///
+/// The body is not a complete, valid Chat Completions stream.
+pub fn accumulate_response_with(
+    input: &[u8],
+    message_id: &str,
+    model: &str,
+    wiring: &StreamWiring,
+) -> anyhow::Result<Value> {
+    let mut translator = LiveStreamTranslator::with_wiring(
+        message_id.into(),
+        model.into(),
+        wiring.labels,
+        wiring.receive.terminal,
+    );
+    let result = translator
+        .push(input)
+        .and_then(|_| translator.finish())
+        .and_then(|_| translator.state.response());
+    result.map_err(|error| wiring.receive.upstream_error(error))
 }
 
 pub fn stream_error(message: &str) -> Vec<u8> {
@@ -1066,9 +1429,66 @@ pub fn stream_body(
     req_id: String,
     traffic: Option<Arc<TrafficCapture>>,
 ) -> Body {
+    stream_body_with(
+        upstream.into_stream(),
+        message_id,
+        model,
+        monitor,
+        req_id,
+        traffic,
+        StreamWiring::default(),
+    )
+}
+
+/// The Anthropic SSE body translated from any Chat Completions upstream
+/// byte stream, with the labels and receive policy of `wiring`.
+pub fn stream_body_with<S, E>(
+    upstream: S,
+    message_id: String,
+    model: String,
+    monitor: Option<MonitorHandle>,
+    req_id: String,
+    traffic: Option<Arc<TrafficCapture>>,
+    wiring: StreamWiring,
+) -> Body
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Send + 'static,
+{
+    let stream = wired_stream(
+        upstream, message_id, model, monitor, req_id, traffic, wiring,
+    );
+    let stream = futures_util::stream::unfold(stream, |mut stream| async move {
+        stream
+            .state
+            .next_output_with(&mut stream.context)
+            .await
+            .map(|bytes| (Ok::<Bytes, Infallible>(Bytes::from(bytes)), stream))
+    });
+    Body::from_stream(stream)
+}
+
+fn wired_stream<S, E>(
+    upstream: S,
+    message_id: String,
+    model: String,
+    monitor: Option<MonitorHandle>,
+    req_id: String,
+    traffic: Option<Arc<TrafficCapture>>,
+    wiring: StreamWiring,
+) -> WiredChatStream
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+{
+    let upstream = box_upstream(upstream);
     let state = OpenCodeChatStreamState {
-        upstream: upstream.into_stream(),
-        translator: LiveStreamTranslator::new(message_id, model),
+        upstream,
+        translator: LiveStreamTranslator::with_wiring(
+            message_id,
+            model,
+            wiring.labels,
+            wiring.receive.terminal,
+        ),
         capture_decoder: SseDecoder::default(),
         terminal: false,
         error_sent: false,
@@ -1079,13 +1499,23 @@ pub fn stream_body(
         stream_capture: traffic.as_ref().map(|traffic| traffic.stream_capture()),
         traffic,
     };
-    let stream = futures_util::stream::unfold(state, |mut state| async move {
-        state
-            .next_output()
-            .await
-            .map(|bytes| (Ok::<Bytes, Infallible>(Bytes::from(bytes)), state))
-    });
-    Body::from_stream(stream)
+    WiredChatStream {
+        state,
+        context: ReceiveContext::new(wiring),
+    }
+}
+
+/// One stream and its wiring. Its `Drop` runs before the state's, so an
+/// abandoned stream is summarised under the wiring's labels.
+struct WiredChatStream {
+    state: OpenCodeChatStreamState<UpstreamStream>,
+    context: ReceiveContext,
+}
+
+impl Drop for WiredChatStream {
+    fn drop(&mut self) {
+        self.state.abandon(self.context.labels());
+    }
 }
 
 struct OpenCodeChatStreamState<S> {
@@ -1106,7 +1536,12 @@ impl<S> OpenCodeChatStreamState<S>
 where
     S: futures_util::Stream<Item = Result<Bytes, OpenCodeError>> + Unpin,
 {
+    #[cfg(test)]
     async fn next_output(&mut self) -> Option<Vec<u8>> {
+        self.next_output_with(&mut ReceiveContext::default()).await
+    }
+
+    async fn next_output_with(&mut self, context: &mut ReceiveContext) -> Option<Vec<u8>> {
         if self.terminal {
             return None;
         }
@@ -1115,20 +1550,41 @@ where
             return None;
         }
         loop {
-            let chunk = match self.upstream.next().await {
+            let after_terminal = context.is_strict() && self.translator.is_terminal();
+            let next = if after_terminal {
+                match context.read_after_terminal(&mut self.upstream).await {
+                    Some(next) => next,
+                    None => {
+                        let result = self.translator.finish_after_read_limit();
+                        return Some(self.settle_strict(result, context));
+                    }
+                }
+            } else {
+                self.upstream.next().await
+            };
+            let chunk = match next {
                 Some(Ok(chunk)) => chunk,
-                Some(Err(_)) => return Some(self.fail_at("transport", "upstream_stream")),
+                Some(Err(_)) => return Some(self.fail_at("transport", "upstream_stream", context)),
+                None if context.is_strict() => {
+                    let result = self.translator.finish();
+                    if result.is_ok() && self.capture_decoder.finish().is_err() {
+                        return Some(self.fail_at("capture", "incomplete_stream", context));
+                    }
+                    return Some(self.settle_strict(result, context));
+                }
                 None => {
                     let output = match self.translator.finish() {
                         Ok(output) => output,
-                        Err(_) => return Some(self.fail_at("decoder", "incomplete_stream")),
+                        Err(_) => {
+                            return Some(self.fail_at("decoder", "incomplete_stream", context));
+                        }
                     };
                     if self.capture_decoder.finish().is_err() {
-                        return Some(self.fail_at("capture", "incomplete_stream"));
+                        return Some(self.fail_at("capture", "incomplete_stream", context));
                     }
                     self.terminal = true;
                     self.capture_downstream(&output);
-                    self.finish_capture(true);
+                    self.finish_capture(true, context);
                     return (!output.is_empty()).then_some(output);
                 }
             };
@@ -1139,31 +1595,25 @@ where
             }
             self.bytes = self.bytes.saturating_add(chunk.len() as u64);
             self.chunks = self.chunks.saturating_add(1);
-            self.capture_upstream(&chunk);
+            self.capture_upstream(&chunk, context);
+            if after_terminal && context.exceeds_post_terminal_bytes(chunk.len()) {
+                return Some(self.fail_at("protocol", "post_terminal_limit", context));
+            }
 
             let output = match self.translator.push(&chunk) {
                 Ok(output) => output,
-                Err(_) => return Some(self.fail_at("translation", "invalid_event")),
+                Err(_) => return Some(self.fail_at("translation", "invalid_event", context)),
             };
             if !output.is_empty() {
-                let (input_tokens, output_tokens) = usage_from_anthropic_sse(&output);
-                if let Some(monitor) = self.monitor.as_ref() {
-                    monitor.stream_progress(
-                        &self.req_id,
-                        output.len() as u64,
-                        count_sse_events(&output),
-                        input_tokens,
-                        output_tokens,
-                    );
-                }
+                self.report_progress(&output);
                 self.capture_downstream(&output);
             }
             if self.translator.is_finished() {
                 if self.translator.finish().is_err() || self.capture_decoder.finish().is_err() {
-                    return Some(self.fail_at("decoder", "trailing_incomplete_frame"));
+                    return Some(self.fail_at("decoder", "trailing_incomplete_frame", context));
                 }
                 self.terminal = true;
-                self.finish_capture(true);
+                self.finish_capture(true, context);
                 return (!output.is_empty()).then_some(output);
             }
             if !output.is_empty() {
@@ -1172,7 +1622,40 @@ where
         }
     }
 
-    fn capture_upstream(&mut self, bytes: &[u8]) {
+    /// Ends a strict stream with the closing events, or with an error event
+    /// when the response cannot be completed.
+    fn settle_strict(
+        &mut self,
+        result: anyhow::Result<Vec<u8>>,
+        context: &ReceiveContext,
+    ) -> Vec<u8> {
+        let output = match result {
+            Ok(output) => output,
+            Err(_) => return self.fail_at("decoder", "incomplete_stream", context),
+        };
+        self.terminal = true;
+        if !output.is_empty() {
+            self.report_progress(&output);
+            self.capture_downstream(&output);
+        }
+        self.finish_capture(true, context);
+        output
+    }
+
+    fn report_progress(&self, output: &[u8]) {
+        let (input_tokens, output_tokens) = usage_from_anthropic_sse(output);
+        if let Some(monitor) = self.monitor.as_ref() {
+            monitor.stream_progress(
+                &self.req_id,
+                output.len() as u64,
+                count_sse_events(output),
+                input_tokens,
+                output_tokens,
+            );
+        }
+    }
+
+    fn capture_upstream(&mut self, bytes: &[u8], context: &ReceiveContext) {
         let events = match self.capture_decoder.push(bytes) {
             Ok(events) => events,
             Err(_) => {
@@ -1187,7 +1670,10 @@ where
         };
         for event in events {
             match serde_json::from_str(&event.data) {
-                Ok(value) => capture.upstream_event(event.event.as_deref(), &value),
+                Ok(value) => capture.upstream_event(
+                    event.event.as_deref(),
+                    &context.wiring.receive.upstream_value(&value),
+                ),
                 Err(_) if event.data.trim() == "[DONE]" => {
                     capture.upstream_event(event.event.as_deref(), &json!("[DONE]"));
                 }
@@ -1207,18 +1693,18 @@ where
         }
     }
 
-    fn fail_at(&mut self, stage: &str, kind: &str) -> Vec<u8> {
+    fn fail_at(&mut self, stage: &str, kind: &str, context: &ReceiveContext) -> Vec<u8> {
         self.error_sent = true;
-        let output = stream_error("OpenCode Go stream is invalid");
+        let output = stream_error(&format!("{} stream is invalid", context.labels().provider));
         if let Some(capture) = self.stream_capture.as_mut() {
             capture.malformed(stage, kind);
         }
         self.capture_downstream(&output);
-        self.finish_capture(false);
+        self.finish_capture(false, context);
         output
     }
 
-    fn finish_capture(&mut self, completed: bool) {
+    fn finish_capture(&mut self, completed: bool, context: &ReceiveContext) {
         if let (Some(capture), Some(traffic)) = (self.stream_capture.take(), self.traffic.as_ref())
         {
             capture.finish_named(
@@ -1228,14 +1714,18 @@ where
                     "bytes":self.bytes,
                     "chunks":self.chunks,
                 }),
-                "061-opencode-stream-summary",
+                &summary_name(context.labels()),
             );
         }
     }
 }
 
-impl<S> Drop for OpenCodeChatStreamState<S> {
-    fn drop(&mut self) {
+fn summary_name(labels: &StreamLabels) -> String {
+    format!("061-{}-stream-summary", labels.capture_stem)
+}
+
+impl<S> OpenCodeChatStreamState<S> {
+    fn abandon(&mut self, labels: &StreamLabels) {
         if self.terminal || self.stream_capture.is_none() {
             return;
         }
@@ -1249,9 +1739,15 @@ impl<S> Drop for OpenCodeChatStreamState<S> {
                     "bytes":self.bytes,
                     "chunks":self.chunks,
                 }),
-                "061-opencode-stream-summary",
+                &summary_name(labels),
             );
         }
+    }
+}
+
+impl<S> Drop for OpenCodeChatStreamState<S> {
+    fn drop(&mut self) {
+        self.abandon(&StreamLabels::OPENCODE_GO);
     }
 }
 
@@ -1697,5 +2193,381 @@ mod tests {
         };
         let output = state.next_output().await.expect("error event");
         assert!(String::from_utf8_lossy(&output).contains("OpenCode Go stream is invalid"));
+    }
+
+    const SYNTHETIC_LABELS: StreamLabels = StreamLabels {
+        provider: "Synthetic Gateway",
+        capture_stem: "synthetic",
+    };
+    const TEXT_THEN_STOP: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+        "data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}\n\n"
+    );
+
+    fn strict_wiring() -> StreamWiring {
+        StreamWiring {
+            labels: SYNTHETIC_LABELS,
+            receive: ReceivePolicy {
+                terminal: TerminalPolicy::Strict,
+                sanitize: None,
+            },
+        }
+    }
+
+    fn strict_body<S>(upstream: S) -> Body
+    where
+        S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    {
+        stream_body_with(
+            upstream,
+            "msg_strict".into(),
+            "synthetic-model".into(),
+            None,
+            "req".into(),
+            None,
+            strict_wiring(),
+        )
+    }
+
+    async fn body_text(body: Body) -> String {
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn chunks(parts: &[&str]) -> Vec<Result<Bytes, std::io::Error>> {
+        parts
+            .iter()
+            .map(|part| Ok(Bytes::copy_from_slice(part.as_bytes())))
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_rejects_an_event_in_a_later_chunk_after_done() {
+        for late in [
+            "data: {\"choices\":[],\"cost\":\"0\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n",
+            "data: not-json\n\n",
+        ] {
+            let done = format!("{TEXT_THEN_STOP}data: [DONE]\n\n");
+            let upstream = futures_util::stream::iter(chunks(&[&done, late]));
+            let text = body_text(strict_body(upstream)).await;
+            assert!(
+                text.contains("Synthetic Gateway stream is invalid"),
+                "late {late}: {text}"
+            );
+            assert!(!text.contains("OpenCode Go"), "late {late}: {text}");
+            assert!(!text.contains("message_stop"), "late {late}: {text}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_rejects_a_second_done_in_a_later_chunk() {
+        let done = format!("{TEXT_THEN_STOP}data: [DONE]\n\n");
+        let upstream = futures_util::stream::iter(chunks(&[&done, "data: [DONE]\n\n"]));
+        let text = body_text(strict_body(upstream)).await;
+        assert!(
+            text.contains("Synthetic Gateway stream is invalid"),
+            "{text}"
+        );
+        assert!(!text.contains("message_stop"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_completes_without_waiting_when_upstream_closes() {
+        let done = format!("{TEXT_THEN_STOP}data: [DONE]\n\n");
+        let started = tokio::time::Instant::now();
+        let text = body_text(strict_body(futures_util::stream::iter(chunks(&[&done])))).await;
+        assert!(started.elapsed() < POST_TERMINAL_READ_LIMIT);
+        assert!(text.contains("\"text\":\"hello\""), "{text}");
+        assert!(text.contains("\"stop_reason\":\"end_turn\""), "{text}");
+        assert!(
+            text.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_completes_at_the_read_limit_when_upstream_stays_open() {
+        for wire in [
+            format!("{TEXT_THEN_STOP}data: [DONE]\n\n"),
+            TEXT_THEN_STOP.to_string(),
+            format!("{TEXT_THEN_STOP}data: [DONE]\n\ndata: {{\"choi"),
+        ] {
+            let upstream =
+                futures_util::stream::iter(chunks(&[&wire])).chain(futures_util::stream::pending());
+            let started = tokio::time::Instant::now();
+            let text = body_text(strict_body(upstream)).await;
+            assert!(started.elapsed() >= POST_TERMINAL_READ_LIMIT, "{wire}");
+            assert!(
+                text.contains("\"stop_reason\":\"end_turn\""),
+                "{wire}: {text}"
+            );
+            assert!(
+                text.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+                "{wire}: {text}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_sends_message_stop_only_after_the_read_window() {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let upstream = futures_util::stream::unfold(receiver, |mut receiver| async {
+            receiver.recv().await.map(|chunk| (chunk, receiver))
+        });
+        let mut stream = wired_stream(
+            upstream,
+            "msg_held".into(),
+            "synthetic-model".into(),
+            None,
+            "req".into(),
+            None,
+            strict_wiring(),
+        );
+        sender
+            .send(Ok(Bytes::from(format!("{TEXT_THEN_STOP}data: [DONE]\n\n"))))
+            .await
+            .unwrap();
+        let first = stream
+            .state
+            .next_output_with(&mut stream.context)
+            .await
+            .unwrap();
+        let first = String::from_utf8(first).unwrap();
+        assert!(first.contains("\"text\":\"hello\""), "{first}");
+        assert!(!first.contains("message_stop"), "{first}");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                stream.state.next_output_with(&mut stream.context)
+            )
+            .await
+            .is_err()
+        );
+        drop(sender);
+        let last = stream
+            .state
+            .next_output_with(&mut stream.context)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(last).unwrap().contains("message_stop"));
+        assert!(
+            stream
+                .state
+                .next_output_with(&mut stream.context)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_rejects_more_than_the_post_terminal_byte_limit() {
+        let done = format!("{TEXT_THEN_STOP}data: [DONE]\n\n");
+        // Comment-only frames carry no event, so only the byte limit stops them.
+        let comment = format!(":{}\n\n", "x".repeat(512 * 1024));
+        let mut parts = vec![done.as_str()];
+        parts.extend(std::iter::repeat_n(
+            comment.as_str(),
+            POST_TERMINAL_MAX_BYTES / comment.len() + 1,
+        ));
+        let upstream =
+            futures_util::stream::iter(chunks(&parts)).chain(futures_util::stream::pending());
+        let text = body_text(strict_body(upstream)).await;
+        assert!(
+            text.contains("Synthetic Gateway stream is invalid"),
+            "{text}"
+        );
+        assert!(!text.contains("message_stop"), "{text}");
+    }
+
+    #[test]
+    fn synthetic_strict_buffered_response_rejects_events_after_done() {
+        let wiring = strict_wiring();
+        for tail in [
+            "data: {\"choices\":[],\"cost\":\"0\"}\n\n",
+            "data: [DONE]\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n",
+        ] {
+            let upstream = format!("{TEXT_THEN_STOP}data: [DONE]\n\n{tail}");
+            let error = accumulate_response_with(upstream.as_bytes(), "msg", "model", &wiring)
+                .unwrap_err()
+                .to_string();
+            assert!(error.starts_with("Synthetic Gateway"), "{tail}: {error}");
+        }
+        let upstream = format!("{TEXT_THEN_STOP}data: [DONE]\n\n");
+        let response =
+            accumulate_response_with(upstream.as_bytes(), "msg", "model", &wiring).unwrap();
+        assert_eq!(response["content"][0]["text"], "hello");
+        assert_eq!(response["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn synthetic_labels_name_the_provider_in_translation_errors() {
+        let wiring = StreamWiring {
+            labels: SYNTHETIC_LABELS,
+            receive: ReceivePolicy::default(),
+        };
+        for (upstream, expected) in [
+            (
+                "data: [DONE]\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n",
+                "Synthetic Gateway event after terminal completion",
+            ),
+            (
+                "data: {\"choices\":[{\"finish_reason\":\"mystery\"}]}\n\n",
+                "unsupported Synthetic Gateway finish_reason: mystery",
+            ),
+            (
+                "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n",
+                "Synthetic Gateway stream ended without [DONE] or finish_reason",
+            ),
+            (
+                "data: not-json\n\n",
+                "malformed Synthetic Gateway SSE event",
+            ),
+        ] {
+            let error = accumulate_response_with(upstream.as_bytes(), "msg", "model", &wiring)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, expected);
+        }
+    }
+
+    #[test]
+    fn synthetic_sanitizer_cleans_the_upstream_error_of_a_buffered_response() {
+        let sanitize: Sanitizer = Arc::new(|text: &str| text.replace("SECRET-123", "[redacted]"));
+        let wiring = StreamWiring {
+            labels: SYNTHETIC_LABELS,
+            receive: ReceivePolicy {
+                terminal: TerminalPolicy::Strict,
+                sanitize: Some(sanitize),
+            },
+        };
+        let upstream = b"data: {\"error\":{\"message\":\"quota for SECRET-123 exhausted\"}}\n\n";
+        let error = accumulate_response_with(upstream, "msg", "model", &wiring)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Synthetic Gateway upstream error: quota for [redacted] exhausted"
+        );
+        let unsanitized = accumulate_response(upstream, "msg", "model")
+            .unwrap_err()
+            .to_string();
+        assert!(unsanitized.contains("SECRET-123"), "{unsanitized}");
+    }
+
+    #[test]
+    fn sanitizer_reaches_every_message_string_of_a_captured_event() {
+        let policy = ReceivePolicy {
+            terminal: TerminalPolicy::Strict,
+            sanitize: Some(Arc::new(|text: &str| text.replace("SECRET", "[redacted]"))),
+        };
+        let value = json!({
+            "error":{"message":"SECRET in error"},
+            "response":{"error":{"message":"SECRET in response"}},
+            "items":[{"message":"SECRET in array"}],
+            "message":{"content":"SECRET is not a message string"}
+        });
+        let captured = policy.upstream_value(&value);
+        assert_eq!(captured["error"]["message"], "[redacted] in error");
+        assert_eq!(
+            captured["response"]["error"]["message"],
+            "[redacted] in response"
+        );
+        assert_eq!(captured["items"][0]["message"], "[redacted] in array");
+        assert_eq!(
+            captured["message"]["content"],
+            "SECRET is not a message string"
+        );
+        assert!(matches!(
+            ReceivePolicy::default().upstream_value(&value),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn untouched_effort_policy_leaves_effort_to_the_caller_for_a_model_the_default_rejects() {
+        let req = request(json!({
+            "model":"vertex/zai-org/glm-5.2-maas",
+            "messages":[{"role":"user","content":"hello"}],
+            "output_config":{"effort":"low"}
+        }));
+        let error = prepare_request(&req, "zai-org/glm-5.2-maas")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not support reasoning effort low"),
+            "{error}"
+        );
+
+        let policy = RequestPolicy {
+            effort: EffortPolicy::Untouched,
+            reasoning_replay: ReasoningReplay::OpenCodeGo,
+        };
+        let wire = serde_json::to_value(
+            prepare_request_with(&req, "zai-org/glm-5.2-maas", policy).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wire["model"], "zai-org/glm-5.2-maas");
+        assert!(wire.get("reasoning_effort").is_none(), "{wire}");
+
+        let req = request(json!({
+            "messages":[{"role":"user","content":"hello"}],
+            "output_config":{"effort":"bogus"}
+        }));
+        assert!(prepare_request_with(&req, "zai-org/glm-5.2-maas", policy).is_ok());
+    }
+
+    #[test]
+    fn reasoning_replay_policy_controls_reasoning_content() {
+        let req = request(json!({
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"thinking","thinking":"reason","signature":"opaque"},
+                    {"type":"text","text":"first"}
+                ]},
+                {"role":"user","content":"next"},
+                {"role":"assistant","content":[{"type":"text","text":"second"}]},
+                {"role":"user","content":"again"},
+                {"role":"assistant","content":[
+                    {"type":"thinking","thinking":"only reasoning","signature":"opaque"}
+                ]},
+                {"role":"user","content":"last"}
+            ]
+        }));
+        let wire = |model: &str, reasoning_replay| {
+            let policy = RequestPolicy {
+                effort: EffortPolicy::OpenCodeGo,
+                reasoning_replay,
+            };
+            serde_json::to_value(prepare_request_with(&req, model, policy).unwrap()).unwrap()
+        };
+
+        let never = wire("deepseek-v4-pro", ReasoningReplay::Never);
+        let roles = never["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(roles, ["assistant", "user", "assistant", "user", "user"]);
+        assert!(never["messages"][0].get("reasoning_content").is_none());
+        assert!(never["messages"][2].get("reasoning_content").is_none());
+
+        let always = wire("zai-org/glm-5.2-maas", ReasoningReplay::Always);
+        assert_eq!(always["messages"][0]["reasoning_content"], "reason");
+        assert_eq!(always["messages"][2]["reasoning_content"], "");
+        assert_eq!(always["messages"][4]["reasoning_content"], "only reasoning");
+
+        let present = wire("deepseek-v4-pro", ReasoningReplay::WhenPresent);
+        assert_eq!(present["messages"][0]["reasoning_content"], "reason");
+        assert!(present["messages"][2].get("reasoning_content").is_none());
+
+        let default = wire("deepseek-v4-pro", ReasoningReplay::OpenCodeGo);
+        assert_eq!(default["messages"][2]["reasoning_content"], "");
+        assert_eq!(
+            serde_json::to_value(prepare_request(&req, "deepseek-v4-pro").unwrap()).unwrap(),
+            default
+        );
     }
 }
