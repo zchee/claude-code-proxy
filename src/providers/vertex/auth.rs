@@ -210,13 +210,65 @@ fn build_error_reason(error: &google_cloud_auth::build_errors::Error) -> String 
     sanitize_vertex_text(&error.to_string(), &[])
 }
 
-/// Describes a failed token fetch. The crate's text can embed the whole
-/// answer of the token server or the metadata server, which may echo an
-/// access token, a refresh token or other encoded material, so it is
-/// scrubbed like Vertex AI's own error prose before it reaches a client or
+/// Describes a failed token fetch. The crate writes the answer of the token
+/// server or the metadata server into its text as `<what failed>,
+/// body=<answer> <retry note>`, and that answer can echo a client secret or
+/// a refresh token too short for any pattern to recognise. So the answer is
+/// never forwarded: only the text before it, an OAuth `error` code from it
+/// and the crate's retry note are kept, and the result is scrubbed like
+/// Vertex AI's own error prose before it reaches a client or
 /// `vertex auth status`.
 fn token_error_reason(error: &google_cloud_auth::errors::CredentialsError) -> String {
-    sanitize_vertex_text(&error.to_string(), &[])
+    sanitize_vertex_text(&without_response_body(&error.to_string()), &[])
+}
+
+/// The retry notes `CredentialsError` appends after its message.
+const RETRY_NOTES: [&str; 2] = [
+    "but future attempts may succeed",
+    "and future attempts will not succeed",
+];
+
+/// Replaces the `body=<...>` part of a crate error text with the OAuth
+/// `error` code it carries, when the body is a JSON object whose `error` is
+/// 1 to 64 characters of `[A-Za-z0-9_.-]` (`invalid_grant`). Everything
+/// else in the body, `error_description` included, is dropped. The retry
+/// note after the body is kept when it is one the crate writes.
+fn without_response_body(text: &str) -> String {
+    let Some((before, after)) = text.split_once("body=<") else {
+        return text.to_string();
+    };
+    let before = before.trim_end_matches([',', ' ']);
+    let (body, note) = RETRY_NOTES
+        .iter()
+        .find_map(|note| {
+            after
+                .strip_suffix(note)
+                .and_then(|rest| rest.strip_suffix("> "))
+                .map(|body| (body, Some(*note)))
+        })
+        .unwrap_or((after, None));
+    let mut reason = before.to_string();
+    if let Some(code) = oauth_error_code(body) {
+        reason.push_str(", OAuth error ");
+        reason.push_str(&code);
+    }
+    if let Some(note) = note {
+        reason.push(' ');
+        reason.push_str(note);
+    }
+    reason
+}
+
+/// The OAuth `error` code of a token server answer (RFC 6749), when the
+/// answer is JSON and the code is a plain token.
+fn oauth_error_code(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let code = value.get("error")?.as_str()?;
+    let plain = (1..=64).contains(&code.len())
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte));
+    plain.then(|| code.to_string())
 }
 
 #[cfg(test)]
@@ -310,40 +362,102 @@ mod tests {
         }
     }
 
+    /// A client secret and a refresh token both shorter than an encoded run
+    /// and without the access-token prefix, so only dropping the body keeps
+    /// them out.
+    const SYNTHETIC_CLIENT_SECRET: &str = "GOCSPX-synthetic0secret0value";
+    const SYNTHETIC_REFRESH_TOKEN: &str = "1//0synthetic-short-refresh";
+
+    /// The 401 text and the `vertex auth status` reason for a token error.
+    fn shown(error: &google_cloud_auth::errors::CredentialsError) -> (String, String) {
+        let error = VertexAuthError::Token(token_error_reason(error));
+        let reason = error.reason().to_string();
+        (error.into_provider_error().message, reason)
+    }
+
     #[test]
-    fn token_errors_synthetic_echoed_token_server_body_is_scrubbed() {
+    fn token_errors_synthetic_echoed_short_secrets_never_reach_the_401_or_status() {
         // The crate quotes the token server's answer in its error text. This
-        // answer echoes an access token, a refresh token and an e-mail
-        // address back, none of which may reach the 401 or `auth status`.
-        let refresh_token = format!("1//{}", "synthetic0Refresh0Token0Body".repeat(3));
+        // answer echoes what the library sent.
         let body = format!(
-            "{{\"error\": \"invalid_grant\", \"access_token\": \"{SYNTHETIC_TOKEN}\", \"refresh_token\": \"{refresh_token}\", \"account\": \"synthetic.person@example.com\"}}"
+            "{{\"client_id\": \"synthetic.apps.example\", \"client_secret\": \"{SYNTHETIC_CLIENT_SECRET}\", \"refresh_token\": \"{SYNTHETIC_REFRESH_TOKEN}\", \"access_token\": \"{SYNTHETIC_TOKEN}\", \"account\": \"synthetic.person@example.com\"}}"
         );
         let error = google_cloud_auth::errors::CredentialsError::from_msg(
             false,
             format!("failed to refresh user access token, body=<{body}>"),
         );
-        let reason = token_error_reason(&error);
-        assert!(
-            reason.starts_with("failed to refresh user access token, body=<"),
-            "{reason}"
+        assert_eq!(
+            token_error_reason(&error),
+            "failed to refresh user access token and future attempts will not succeed"
         );
-        assert!(reason.contains("invalid_grant"), "{reason}");
-        for secret in [
-            SYNTHETIC_TOKEN,
-            "ya29.",
-            refresh_token.as_str(),
-            "synthetic0Refresh0Token0Body",
-            "synthetic.person@example.com",
-        ] {
-            assert!(!reason.contains(secret), "leaked {secret:?}: {reason}");
+        let (message, reason) = shown(&error);
+        assert_eq!(
+            message,
+            "Google access token could not be obtained: failed to refresh user access token and future attempts will not succeed. Run `gcloud auth application-default login`, or set GOOGLE_APPLICATION_CREDENTIALS to a service account key file"
+        );
+        for (place, text) in [("401", &message), ("status", &reason)] {
+            for secret in [
+                SYNTHETIC_CLIENT_SECRET,
+                SYNTHETIC_REFRESH_TOKEN,
+                SYNTHETIC_TOKEN,
+                "synthetic.person@example.com",
+                "synthetic.apps.example",
+            ] {
+                assert!(!text.contains(secret), "{place} leaked {secret:?}: {text}");
+            }
         }
-        let message = VertexAuthError::Token(reason).into_provider_error().message;
-        assert!(
-            message.starts_with("Google access token could not be obtained: failed to refresh"),
-            "{message}"
+    }
+
+    #[test]
+    fn token_errors_synthetic_oauth_error_code_is_kept_and_description_dropped() {
+        let error = google_cloud_auth::errors::CredentialsError::from_msg(
+            false,
+            "failed to refresh user access token, body=<{\"error\": \"invalid_grant\", \"error_description\": \"Token has been expired or revoked for synthetic-user\"}>",
         );
-        assert!(!message.contains(SYNTHETIC_TOKEN), "{message}");
+        let (message, reason) = shown(&error);
+        assert_eq!(
+            reason,
+            "failed to refresh user access token, OAuth error invalid_grant and future attempts will not succeed"
+        );
+        assert!(message.contains("invalid_grant"), "{message}");
+        assert!(!message.contains("expired or revoked"), "{message}");
+        assert!(!message.contains("synthetic-user"), "{message}");
+    }
+
+    #[test]
+    fn token_errors_synthetic_bodies_without_a_plain_error_code_are_dropped() {
+        for body in [
+            // Not JSON.
+            format!("<html>synthetic {SYNTHETIC_CLIENT_SECRET}</html>"),
+            // A Google API error object, not an OAuth code.
+            format!("{{\"error\": {{\"code\": 400, \"message\": \"{SYNTHETIC_CLIENT_SECRET}\"}}}}"),
+            // A code with characters outside the plain-token set.
+            format!("{{\"error\": \"invalid {SYNTHETIC_REFRESH_TOKEN}\"}}"),
+            // A code longer than 64 characters.
+            format!("{{\"error\": \"{}\"}}", "a".repeat(65)),
+            // A `>` and the retry note inside the body.
+            format!("{SYNTHETIC_REFRESH_TOKEN}> but future attempts may succeed"),
+            String::new(),
+        ] {
+            let error = google_cloud_auth::errors::CredentialsError::from_msg(
+                true,
+                format!("failed to fetch token, body=<{body}>"),
+            );
+            assert_eq!(
+                token_error_reason(&error),
+                "failed to fetch token but future attempts may succeed",
+                "{body}"
+            );
+        }
+        // Text without a body is kept, scrubbed as before.
+        let error = google_cloud_auth::errors::CredentialsError::from_msg(
+            true,
+            format!("synthetic metadata server failure for {SYNTHETIC_TOKEN}"),
+        );
+        assert_eq!(
+            token_error_reason(&error),
+            "synthetic metadata server failure for [redacted] but future attempts may succeed"
+        );
     }
 
     #[test]

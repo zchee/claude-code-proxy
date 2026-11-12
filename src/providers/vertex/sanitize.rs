@@ -13,27 +13,37 @@ use crate::providers::muse::sanitize::sanitize_upstream_text;
 /// Shortest run of base64 characters that is treated as encoded data.
 pub const MIN_ENCODED_RUN: usize = 64;
 
+/// Most input bytes scanned. The result is cut to 500 characters anyway, so
+/// a longer field only costs time; everything past this point is dropped.
+pub const MAX_SCANNED_BYTES: usize = 64 * 1024;
+
 const REDACTED: &str = "[redacted]";
 
-/// Runs of the standard and URL-safe base64 alphabets, with padding.
+/// Runs of the standard and URL-safe base64 alphabets, with padding. A
+/// percent escape (`%2F`) counts as one character of the run, so data that
+/// was percent-encoded once is a run too.
 static BASE64_RUN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[A-Za-z0-9+/_-]{64,}={0,2}").expect("base64 run pattern is a valid regex")
+    Regex::new(r"(?:[A-Za-z0-9+/_-]|%[0-9A-Fa-f]{2}){64,}(?:=|%3[Dd]){0,2}")
+        .expect("base64 run pattern is a valid regex")
 });
 
 /// A Google OAuth access token: `ya29.` followed by the token characters
-/// of RFC 6750. A period may separate parts of the token (`ya29.c.…`), but
-/// one that ends it is left alone, so a sentence-ending period survives.
+/// of RFC 6750, any of them percent-encoded once (`ya29%2Ec%2E…`). A period
+/// may separate parts of the token (`ya29.c.…`), but one that ends it is
+/// left alone, so a sentence-ending period survives.
 static ACCESS_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"ya29\.[A-Za-z0-9_~+/-]+(?:\.[A-Za-z0-9_~+/-]+)*=*")
-        .expect("access token pattern is a valid regex")
+    Regex::new(
+        r"ya29(?:\.|%2[Ee])(?:[A-Za-z0-9_~+/-]|%[0-9A-Fa-f]{2})+(?:\.(?:[A-Za-z0-9_~+/-]|%[0-9A-Fa-f]{2})+)*=*",
+    )
+    .expect("access token pattern is a valid regex")
 });
 
 /// A whole base64 run that is a Google resource name. The run can begin in
 /// the middle of a URL (after the host's last `.`), so short lower-case
 /// segments such as `com/v1/` may come first; then
 /// `projects/<id>/locations/<id>`, any number of `/<collection>/<id>` pairs
-/// and at most one trailing collection. Every segment is shorter than an
-/// encoded run, so data cannot hide in an ID position.
+/// and at most one trailing collection, every segment at most 63
+/// characters. Data written to fit this grammar is kept like a real name.
 static RESOURCE_NAME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^/?(?:[a-z0-9-]{1,63}/)*projects/[A-Za-z0-9_-]{1,63}/locations/[A-Za-z0-9_-]{1,63}(?:/[a-z][A-Za-z0-9]{0,62}/[A-Za-z0-9_-]{1,63})*(?:/[a-z][A-Za-z0-9]{0,62})?/?$",
@@ -43,27 +53,42 @@ static RESOURCE_NAME: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Scrubs one piece of upstream prose, in this order:
 ///
-/// 1. every occurrence of each secret (pass the access token) becomes
-///    `[redacted]`, whether it appears verbatim or with any of its bytes
-///    percent-encoded, and so does anything shaped like a Google access
-///    token (`ya29.` and token characters), listed or not;
-/// 2. every run of 64 or more base64 or base64url characters becomes
-///    `[redacted len=N]`, unless the whole run is a Google resource name
-///    such as `projects/my-project/locations/global/publishers/google/models/gemini-x`,
-///    which is the useful part of a not-found message;
-/// 3. e-mail addresses are redacted and the result is cut to 500
+/// 1. only the first [`MAX_SCANNED_BYTES`] are kept, cut on a character
+///    boundary; when the cut falls inside a run of token or base64
+///    characters (letters, digits, `+/_-=%.~`), that partial run is dropped
+///    too, so a shortened secret or data run cannot survive as a prefix;
+/// 2. every occurrence of each secret (pass the access token) becomes
+///    `[redacted]`, and so does anything shaped like a Google access token
+///    (`ya29.` and token characters), listed or not;
+/// 3. every run of 64 or more base64 or base64url characters becomes
+///    `[redacted len=N]`, N being its length in the text, unless the whole
+///    run is a Google resource name such as
+///    `projects/my-project/locations/global/publishers/google/models/gemini-x`,
+///    which is the useful part of a not-found message; a run that contains a
+///    percent escape is never treated as a resource name;
+/// 4. e-mail addresses are redacted and the result is cut to 500
 ///    characters by `muse::sanitize::sanitize_upstream_text`.
 ///
 /// Every replacement happens before the cut, so a value that straddles the
 /// 500th character cannot survive as a prefix. Encoded data is redacted
 /// whatever mix of character classes it has: an upper-case-only or
 /// hexadecimal value is as opaque as any other.
+///
+/// Percent-encoding is undone one level only. A secret is found verbatim
+/// and with any of its bytes percent-encoded once, in either hex case; a
+/// `%` inside a secret is matched only as itself, so a secret that
+/// contains `%` is found verbatim but not where that `%` was encoded. In
+/// the token and run rules a percent escape counts as one character.
+/// Out of scope: double encoding (`%252F`), and separators such as spaces,
+/// line breaks or `...` inserted inside a secret, a token or a run, which
+/// break the match.
 pub fn sanitize_vertex_text(text: &str, secrets: &[&str]) -> String {
-    let without_secrets = redact_secrets_in_any_encoding(text, secrets);
+    let bounded = bounded_prefix(text);
+    let without_secrets = redact_secrets_in_any_encoding(bounded, secrets);
     let without_tokens = ACCESS_TOKEN.replace_all(&without_secrets, REDACTED);
     let without_data = BASE64_RUN.replace_all(&without_tokens, |captures: &Captures| {
         let run = &captures[0];
-        if RESOURCE_NAME.is_match(run) {
+        if !run.contains('%') && RESOURCE_NAME.is_match(run) {
             run.to_string()
         } else {
             format!("[redacted len={}]", run.len())
@@ -72,11 +97,37 @@ pub fn sanitize_vertex_text(text: &str, secrets: &[&str]) -> String {
     sanitize_upstream_text(&without_data, secrets)
 }
 
+/// A character that the secret, token and run rules can match as part of a
+/// longer value.
+fn is_run_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "+/_-=%.~".contains(c)
+}
+
+/// The first [`MAX_SCANNED_BYTES`] of `text`, cut on a character boundary.
+/// When the cut splits a run of [`is_run_char`] characters, the part of the
+/// run before the cut is dropped as well.
+fn bounded_prefix(text: &str) -> &str {
+    if text.len() <= MAX_SCANNED_BYTES {
+        return text;
+    }
+    let mut end = MAX_SCANNED_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let (head, rest) = text.split_at(end);
+    if rest.starts_with(is_run_char) {
+        head.trim_end_matches(is_run_char)
+    } else {
+        head
+    }
+}
+
 /// Replaces every occurrence of each non-empty secret with `[redacted]`.
 /// Each byte of the secret may appear as itself or percent-encoded with
 /// either case of hex digit (`/`, `%2F` or `%2f`), so a secret quoted from a
-/// URL or a form body is found too. Matches start and end on character
-/// boundaries.
+/// URL or a form body is found too. Where several secrets match at one
+/// position the longest match wins, so a secret that begins with another
+/// one is redacted whole. Matches start and end on character boundaries.
 fn redact_secrets_in_any_encoding(text: &str, secrets: &[&str]) -> String {
     let secrets: Vec<&[u8]> = secrets
         .iter()
@@ -91,15 +142,15 @@ fn redact_secrets_in_any_encoding(text: &str, secrets: &[&str]) -> String {
     let mut copied = 0;
     let mut at = 0;
     while at < bytes.len() {
-        let end = text
-            .is_char_boundary(at)
-            .then(|| {
-                secrets
-                    .iter()
-                    .find_map(|secret| match_end(bytes, at, secret))
-            })
-            .flatten()
-            .filter(|end| text.is_char_boundary(*end));
+        let end = if text.is_char_boundary(at) {
+            secrets
+                .iter()
+                .filter_map(|secret| match_end(bytes, at, secret))
+                .filter(|end| text.is_char_boundary(*end))
+                .max()
+        } else {
+            None
+        };
         match end {
             Some(end) => {
                 out.push_str(&text[copied..at]);
@@ -366,6 +417,114 @@ mod tests {
         assert_eq!(
             sanitize_vertex_text(&text, &[SYNTHETIC_ACCESS_TOKEN]),
             "token [redacted] end"
+        );
+    }
+
+    #[test]
+    fn sanitize_synthetic_percent_encoded_unlisted_token_is_redacted() {
+        // Not in the secret list, and the periods arrive as `%2E`.
+        assert_eq!(
+            sanitize_vertex_text("access_token=ya29%2Ec%2Exxxx", &[]),
+            "access_token=[redacted]"
+        );
+        assert_eq!(
+            sanitize_vertex_text("Bearer ya29%2ec.xxxx. Retry later.", &[]),
+            "Bearer [redacted]. Retry later."
+        );
+    }
+
+    #[test]
+    fn sanitize_synthetic_run_broken_only_by_percent_escapes_is_redacted() {
+        // "QUJD/" repeated, with every `/` percent-encoded: 160 characters
+        // of base64 once decoded, 224 bytes as written.
+        let text = "QUJD%2F".repeat(32);
+        assert_eq!(sanitize_vertex_text(&text, &[]), "[redacted len=224]");
+        // Encoded padding belongs to the run.
+        let padded = format!("{}%3D%3D end", "Ab3dEf9GhIjK0lMn".repeat(4));
+        assert_eq!(sanitize_vertex_text(&padded, &[]), "[redacted len=70] end");
+    }
+
+    #[test]
+    fn sanitize_synthetic_run_with_an_escape_is_not_a_resource_name() {
+        let text =
+            "projects/p%2Flocations/global/publishers/google/models/gemini-3-flash-preview-x";
+        assert_eq!(sanitize_vertex_text(text, &[]), "[redacted len=79]");
+    }
+
+    #[test]
+    fn sanitize_synthetic_longest_listed_secret_wins() {
+        // One secret is a prefix of the other; the order of the list must
+        // not leave a suffix of the longer one behind.
+        assert_eq!(
+            sanitize_vertex_text("abcdef", &["abc", "abcdef"]),
+            "[redacted]"
+        );
+        assert_eq!(
+            sanitize_vertex_text("abcdef", &["abcdef", "abc"]),
+            "[redacted]"
+        );
+        assert_eq!(
+            sanitize_vertex_text("abc abcdef abcd", &["abc", "abcdef"]),
+            "[redacted] [redacted] [redacted]d"
+        );
+    }
+
+    #[test]
+    fn sanitize_synthetic_secret_with_a_percent_sign_is_matched_verbatim_only() {
+        // The `%` of the secret is matched only as itself, so its encoded
+        // form `%25` is not found.
+        assert_eq!(
+            sanitize_vertex_text("%2541 and %41", &["%41"]),
+            "%2541 and [redacted]"
+        );
+    }
+
+    #[test]
+    fn sanitize_synthetic_multi_megabyte_field_is_bounded() {
+        // 8 MiB of base64 in one run: the run passes the 64 KiB bound, so
+        // what is left of it is dropped.
+        let run = format!("Invalid data: \"{}\"", "QUJD".repeat(2 * 1024 * 1024));
+        assert_eq!(sanitize_vertex_text(&run, &[]), "Invalid data: \"");
+        // 20 MiB of words: the usual 500-character cut.
+        let prose = "word ".repeat(4 * 1024 * 1024);
+        assert_eq!(sanitize_vertex_text(&prose, &[]), "word ".repeat(100));
+        // 16 MiB of runs one character short of the data rule.
+        let near_miss = format!("{} ", "A".repeat(63)).repeat(256 * 1024);
+        assert_eq!(
+            sanitize_vertex_text(&near_miss, &[]),
+            format!("{} ", "A".repeat(63)).repeat(7) + &"A".repeat(52)
+        );
+    }
+
+    #[test]
+    fn sanitize_synthetic_run_straddling_the_scan_bound_leaves_no_fragment() {
+        // The first run shrinks to its marker, which brings the end of the
+        // scanned text inside the 500-character output.
+        let blob = "Ab3dEf9GhIjK0lMn".repeat(64);
+        let text = format!("{} {blob}", "A".repeat(65000));
+        assert_eq!(sanitize_vertex_text(&text, &[]), "[redacted len=65000] ");
+        // A short listed secret across the bound is dropped, not shortened.
+        let secret = "GOCSPX-synthetic-short";
+        let text = format!("{} {secret} tail", "A".repeat(65525));
+        assert_eq!(
+            sanitize_vertex_text(&text, &[secret]),
+            "[redacted len=65525] "
+        );
+        // A run that ends exactly at the bound is complete and redacted.
+        let text = format!(
+            "{} {} tail",
+            "A".repeat(65455),
+            "Ab3dEf9GhIjK0lMn".repeat(5)
+        );
+        assert_eq!(
+            sanitize_vertex_text(&text, &[]),
+            "[redacted len=65455] [redacted len=80]"
+        );
+        // A two-byte character across the bound is cut before it.
+        let text = format!("{} {}\u{e9}xxxxxxxxxx", "A".repeat(65000), " ".repeat(534));
+        assert_eq!(
+            sanitize_vertex_text(&text, &[]),
+            format!("[redacted len=65000] {}", " ".repeat(479))
         );
     }
 }
