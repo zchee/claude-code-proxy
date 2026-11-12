@@ -694,23 +694,33 @@ impl BufferedCapture {
 /// streaming error event carries, with a matching status. An in-stream
 /// upstream error with a 4xx code keeps that code.
 fn stream_error(error: &StreamError, sanitize: &Sanitizer) -> ProviderError {
-    let (status, kind) = match error.error_type() {
+    let (status, kind) = match (error.error_type(), error) {
+        (
+            "invalid_request_error",
+            StreamError::Upstream {
+                code: Some(code @ 400..=499),
+                ..
+            },
+        ) => (
+            StatusCode::from_u16(*code).unwrap_or(StatusCode::BAD_REQUEST),
+            ProviderErrorKind::InvalidRequest,
+        ),
+        (error_type, _) => status_for_error_type(error_type),
+    };
+    ProviderError::new(status, kind, error.message_with(&**sanitize))
+}
+
+/// The status and kind the proxy answers with for an Anthropic error type:
+/// 429, 401, 403 and 400 for the rate-limit, authentication, permission and
+/// invalid-request types, a 502 `api_error` for every other type.
+pub(super) fn status_for_error_type(error_type: &str) -> (StatusCode, ProviderErrorKind) {
+    match error_type {
         "rate_limit_error" => (StatusCode::TOO_MANY_REQUESTS, ProviderErrorKind::RateLimit),
         "authentication_error" => (StatusCode::UNAUTHORIZED, ProviderErrorKind::Authentication),
         "permission_error" => (StatusCode::FORBIDDEN, ProviderErrorKind::Permission),
-        "invalid_request_error" => {
-            let status = match error {
-                StreamError::Upstream {
-                    code: Some(code @ 400..=499),
-                    ..
-                } => StatusCode::from_u16(*code).unwrap_or(StatusCode::BAD_REQUEST),
-                _ => StatusCode::BAD_REQUEST,
-            };
-            (status, ProviderErrorKind::InvalidRequest)
-        }
+        "invalid_request_error" => (StatusCode::BAD_REQUEST, ProviderErrorKind::InvalidRequest),
         _ => (StatusCode::BAD_GATEWAY, ProviderErrorKind::Api),
-    };
-    ProviderError::new(status, kind, error.message_with(&**sanitize))
+    }
 }
 
 /// Validates every setting a request reads: project, location, base URL

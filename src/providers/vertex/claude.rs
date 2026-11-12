@@ -38,7 +38,7 @@ use super::sanitize::sanitize_vertex_text;
 use super::translate::stream::Sanitizer;
 use super::{
     MAX_BUFFERED_RESPONSE_BYTES, VertexProvider, error_response, invalid_request,
-    report_error_events, sse_response,
+    report_error_events, sse_response, status_for_error_type,
 };
 
 /// The `anthropic_version` put in a body that has none. Vertex AI also
@@ -354,6 +354,11 @@ fn stream_body(started: Started, ctx: &RequestContext) -> Body {
 /// parses as JSON. The capture records it after the sanitiser, which
 /// cleans every string under a `message` key, at any depth, as the
 /// streaming path cleans the events it captures.
+///
+/// A body that is an Anthropic error object (`{"type": "error", "error":
+/// {"type", "message"}}`) is not a message, whatever the status: it is
+/// answered with the status [`status_for_error_type`] gives for its type
+/// and its message, sanitised.
 async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
     let Started { upstream, sanitize } = started;
     let bytes = match read_body(upstream.into_byte_stream()).await {
@@ -367,6 +372,23 @@ async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
             "Vertex AI returned a Claude response that is not JSON",
         ));
     };
+    if value.get("type").and_then(Value::as_str) == Some("error") {
+        let error = error_in_message_body(&value, &sanitize);
+        if let Some(traffic) = ctx.traffic.as_ref() {
+            traffic.write_json(
+                "032-upstream-response-body",
+                &sanitize_upstream_messages(&value, &*sanitize),
+            );
+            traffic.write_json(
+                "051-downstream-response",
+                &json!({
+                    "type": "error",
+                    "error": {"type": error.error_type(), "message": &error.message},
+                }),
+            );
+        }
+        return error_response(error);
+    }
     if let Some(traffic) = ctx.traffic.as_ref() {
         let captured = sanitize_upstream_messages(&value, &*sanitize);
         traffic.write_json("032-upstream-response-body", &captured);
@@ -387,6 +409,28 @@ async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
         Bytes::from(bytes),
     )
         .into_response()
+}
+
+/// The error a successful response reports in an Anthropic error body:
+/// the status and kind of its `error.type`, and a message naming that type
+/// and carrying its `error.message`, both sanitised.
+fn error_in_message_body(value: &Value, sanitize: &Sanitizer) -> ProviderError {
+    let error_type = value
+        .pointer("/error/type")
+        .and_then(Value::as_str)
+        .unwrap_or("api_error");
+    let (status, kind) = status_for_error_type(error_type);
+    let detail = value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .map(|message| sanitize(message))
+        .filter(|message| !message.trim().is_empty());
+    let named = sanitize(error_type);
+    let message = match detail {
+        Some(detail) => format!("Vertex AI returned a Claude {named}: {detail}"),
+        None => format!("Vertex AI returned a Claude {named}"),
+    };
+    ProviderError::new(status, kind, message)
 }
 
 /// Reads the whole body. More than [`MAX_BUFFERED_RESPONSE_BYTES`] or a
@@ -1098,5 +1142,86 @@ mod tests {
             .unwrap();
         assert_eq!(std::str::from_utf8(&bytes).unwrap(), SYNTHETIC_SSE);
         assert_eq!(outcome.failure(), None);
+    }
+
+    /// A local upstream that answers every request with `body` as JSON and
+    /// status 200.
+    async fn spawn_json_upstream(body: String) -> String {
+        let app = Router::new().route(
+            "/{*path}",
+            post(move || {
+                let body = body.clone();
+                async move { ([(http::header::CONTENT_TYPE, "application/json")], body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn non_streaming_synthetic_error_body_with_status_200_is_an_error_response() {
+        let echoed = format!("saw {SYNTHETIC_TOKEN}");
+        let tests = [
+            (
+                "rate_limit_error",
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+            ),
+            (
+                "invalid_request_error",
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+            ),
+            ("overloaded_error", StatusCode::BAD_GATEWAY, "api_error"),
+            ("api_error", StatusCode::BAD_GATEWAY, "api_error"),
+        ];
+        for (upstream_type, status, error_type) in tests {
+            let body = json!({
+                "type": "error",
+                "error": {"type": upstream_type, "message": echoed},
+            })
+            .to_string();
+            let base = spawn_json_upstream(body).await;
+            let provider = local_provider(&base);
+            let response = provider
+                .handle_messages(claude_request(false), context())
+                .await;
+            assert_eq!(response.status(), status, "{upstream_type}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["type"], "error", "{upstream_type}: {value}");
+            assert_eq!(
+                value["error"]["type"], error_type,
+                "{upstream_type}: {value}"
+            );
+            assert_eq!(
+                value["error"]["message"],
+                format!("Vertex AI returned a Claude {upstream_type}: saw [redacted]"),
+                "{upstream_type}"
+            );
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains(SYNTHETIC_TOKEN),
+                "{upstream_type}"
+            );
+        }
+
+        // Without a type or a message the error is still not a message.
+        let base = spawn_json_upstream(json!({"type": "error"}).to_string()).await;
+        let response = local_provider(&base)
+            .handle_messages(claude_request(false), context())
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["error"]["message"],
+            "Vertex AI returned a Claude api_error"
+        );
     }
 }
