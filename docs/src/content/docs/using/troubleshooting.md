@@ -41,7 +41,8 @@ OpenCode Go has no `auth status` command; configure its API key through
 `config.json`.
 Vertex AI has no login in the proxy. `vertex auth status` shows the credential
 file and type, the project, location and endpoint with the setting each came
-from, the quota project, and whether an access token was obtained. An HTTP 401
+from, the location overrides, the quota project, and whether an access token
+was obtained. An HTTP 401
 that starts with `Google credentials are not available` or `Google access token
 could not be obtained` means Application Default Credentials found nothing
 usable: run `gcloud auth application-default login` and retry, or set
@@ -60,8 +61,8 @@ the missing or invalid setting, usually the project or a location override; see
 Each message ends with `(upstream HTTP <status>)` and names what to check:
 
 - **401**: Google rejected the access token. Run `gcloud auth application-default login` again, or check the key file named by `GOOGLE_APPLICATION_CREDENTIALS`, then restart the proxy: it keeps the credentials from the first Vertex AI request that obtained an access token.
-- **403**: the account needs `roles/aiplatform.user` on the project, the Vertex AI API (`aiplatform.googleapis.com`) must be enabled there, and user credentials may need a quota project. Set one with `gcloud auth application-default set-quota-project PROJECT_ID`. For a Claude, Grok, OpenAI, Muse, or Mistral model, also check that the model is enabled in Model Garden for the project, and for OpenAI that the project has Private Preview access.
-- **404**: the model is not available in that project and location, or a partner model is not enabled in Model Garden. Check the model ID, then try `global` or a location where the model is offered, through `CCP_VERTEX_LOCATION`, `GOOGLE_CLOUD_LOCATION`, or `vertex.location`, or for one publisher or model through `CCP_VERTEX_LOCATION_OVERRIDES`. Claude 4.7 and later need `global`, `us`, or `eu`; Muse always uses `global`.
+- **403**: the account needs `roles/aiplatform.user` on the project, the Vertex AI API (`aiplatform.googleapis.com`) must be enabled there, and user credentials may need a quota project. Set one with `gcloud auth application-default set-quota-project PROJECT_ID`. For a Claude, Grok, OpenAI, Muse, or Mistral model, the message ends with `Also check that model <model> is enabled in Model Garden for project <project> in location <location> and, for a preview model, that the project has been granted access`: enable the model on its Model Garden page, and for OpenAI check that the project has Private Preview access.
+- **404**: the model is not available in that project and location, or a partner model is not enabled in Model Garden; partner 404 messages end with the same Model Garden check as 403. Check the model ID, then try `global` or a location where the model is offered, through `CCP_VERTEX_LOCATION`, `GOOGLE_CLOUD_LOCATION`, or `vertex.location`, or for one publisher or model through `CCP_VERTEX_LOCATION_OVERRIDES`. Claude 4.7 and later need `global`, `us`, or `eu`; Muse always uses `global`.
 - **429**: the project's quota or Google's shared capacity for the model in that location is used up. The response carries `retry-after` when Google sends a delay.
 
 See [Vertex AI errors](/providers/vertex/#errors) for the full table.
@@ -70,7 +71,7 @@ See [Vertex AI errors](/providers/vertex/#errors) for the full table.
 
 These answers come from the proxy before Vertex AI is called:
 
-- **500 `Invalid Vertex configuration: Invalid Vertex setting CCP_VERTEX_LOCATION_OVERRIDES: ...`**, or the same with `vertex.locationOverrides in config.json`: a location override is malformed, and every Vertex AI request fails until it is fixed. An entry is `<key>=<location>` in the variable and `"<key>": "<location>"` in `config.json`; a key is `<publisher>` or `<publisher>/<model-id>`, listed once, and never `endpoint`. `vertex auth status` does not check the overrides.
+- **500 `Invalid Vertex configuration: Invalid Vertex setting CCP_VERTEX_LOCATION_OVERRIDES: ...`**, or the same with `vertex.locationOverrides in config.json`: a location override is malformed, and every Vertex AI request fails until it is fixed. An entry is `<key>=<location>` in the variable and `"<key>": "<location>"` in `config.json`; a key is `<publisher>` or `<publisher>/<model-id>`, listed once, and never `endpoint`. `vertex auth status` prints the overrides and names the same error.
 - **400 `Vertex AI models of publisher mistralai are not served in location global: ...`**: Mistral needs `us-central1` or `europe-west4`. Start the proxy with `CCP_VERTEX_LOCATION_OVERRIDES=mistralai=us-central1`, or set the location itself.
 - **400 `Vertex AI does not serve the hosted web_search tool for <family> models; ...`**: Grok, OpenAI, and Muse on Vertex AI do not take the web search tool. Remove it from the request.
 - **400 `this version of claude-code-proxy does not support the ... model family on Vertex AI`**: managed open models (`-maas`) and deployed endpoints are not supported.

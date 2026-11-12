@@ -33,7 +33,7 @@ Every name that starts with `vertex/` routes to Vertex AI, and the Vertex AI pro
 
 Unregistered IDs in these forms are sent too, so a new model works before the proxy lists it. Managed open models (`vertex/<publisher>/<model-id>-maas`), deployed endpoints (`vertex/endpoint/<name>`), and every other `vertex/<publisher>/<model-id>` return HTTP 400. A bare ID that is not registered, such as a new `gemini-*` model, is not routed to Vertex AI; use the `vertex/` form.
 
-Only Gemini IDs reach Vertex AI without the prefix. Bare `claude-*`, `gpt-*`, `grok-*`, and `muse-*` IDs keep their own providers: `claude-opus-5-5` is a Codex alias, `gpt-6.1-sol` is Codex, `grok-4.7` is Grok, and `muse-spark-1.3` is Muse. The same model on Vertex AI is reached only as `vertex/<publisher>/<model-id>`, billed to your Google Cloud project. See [Vertex AI models](/providers/vertex/#models).
+Only Gemini IDs reach Vertex AI without the prefix. Bare `claude-*`, `gpt-*`, `grok-*`, and `muse-*` IDs keep their own providers: `claude-opus-5-5` is an Anthropic-style alias that follows the alias provider setting (Codex by default; see [Alias routing](#alias-routing)), `gpt-6.1-sol` is Codex, `grok-4.7` is Grok, and `muse-spark-1.3` is Muse. The same model on Vertex AI is reached only as `vertex/<publisher>/<model-id>`, billed to your Google Cloud project. See [Vertex AI models](/providers/vertex/#models).
 
 An unknown ID returns HTTP 400 with the supported provider catalog. There is no implicit fallback for arbitrary model names.
 

@@ -108,18 +108,19 @@ The command requests one access token and prints:
 - `Credential type:` the file's `type`, or `metadata server`
 - a `Note:` line when `CLOUDSDK_CONFIG` points elsewhere and `GOOGLE_APPLICATION_CREDENTIALS` is not set, with the `GOOGLE_APPLICATION_CREDENTIALS=...` value to set
 - `Project:`, `Location:`, and `Endpoint:` with the setting each value came from
+- `Location overrides:` the [location overrides](#location-overrides) as `<key>=<location>` entries with their source, such as `mistralai=europe-west4 (CCP_VERTEX_LOCATION_OVERRIDES)`, or `none`, or the error when they are malformed
 - `Quota project:` and its source, or `none`
 - `Access token obtained: true`, or `false` with the reason
 
 It reads only the `type` and `quota_project_id` fields of the credentials file and never prints a token, key, or secret. Without a credentials file it contacts the metadata server and can wait up to 30 seconds for an answer.
 
-The command does not read the [location overrides](#location-overrides) and does not check that a partner model is enabled. A malformed override is reported by the first Vertex AI request instead.
+The command does not check that a partner model is enabled in Model Garden; only a request to the model shows that.
 
 | Exit status | Meaning |
 | --- | --- |
-| 0 | A project is set, the project, location, and base URL settings are valid, and an access token was obtained. |
+| 0 | A project is set, the project, location, base URL, and location override settings are valid, and an access token was obtained. |
 | 1 | No credential was found or no token was obtained. After the report it prints `Not authenticated`, and the gcloud hint on stderr. |
-| 2 | A Vertex setting is missing or invalid. After the report it prints the error, which names the setting. This wins when credentials are also missing. |
+| 2 | A Vertex setting is missing or invalid, a malformed location override included. After the report it prints the error, which names the setting. This wins when credentials are also missing. |
 
 `vertex auth login` and `vertex auth device` print the `gcloud auth application-default login` hint on stderr and exit with status 2. `vertex auth logout` removes nothing: it fails with a message that gcloud manages the credentials and points at `gcloud auth application-default revoke`, and exits with status 1.
 
@@ -199,7 +200,7 @@ For each request the location comes from the first rule that applies:
 
 A publisher override therefore does not move a Muse model; only an override naming the model does.
 
-An override is checked on the first Vertex AI request, before credentials are looked up. A key that is not `<publisher>` or `<publisher>/<model-id>`, a key listed twice, the key `endpoint`, a location that fails the location check, an entry without a location, or a `vertex.locationOverrides` value that is not an object is an error. Every Vertex AI request then fails with HTTP 500, for every family, Gemini included:
+`vertex auth status` prints the overrides and exits with status 2 when they are malformed. A request checks them too, on the first Vertex AI request, before credentials are looked up. A key that is not `<publisher>` or `<publisher>/<model-id>`, a key listed twice, the key `endpoint`, a location that fails the location check, an entry without a location, or a `vertex.locationOverrides` value that is not an object is an error. Every Vertex AI request then fails with HTTP 500, for every family, Gemini included:
 
 ```text
 Invalid Vertex configuration: Invalid Vertex setting CCP_VERTEX_LOCATION_OVERRIDES: entry "mistralai" has no location; an entry is <key>=<location> in the variable and "<key>": "<location>" in config.json
@@ -285,7 +286,7 @@ curl -sS http://127.0.0.1:18765/v1/messages -H 'content-type: application/json' 
 | Meta Muse | `vertex/meta/muse-spark-1.3`, `vertex/meta/muse-wonder-1.0`, `vertex/meta/muse-ember-1.0` |
 | Mistral | `vertex/mistralai/mistral-medium-3`, `vertex/mistralai/mistral-small-2503`, `vertex/mistralai/codestral-2` |
 
-Only Gemini IDs are accepted bare. A bare `claude-*`, `gpt-*`, `grok-*`, or `muse-*` ID keeps its own provider and never reaches Vertex AI: `claude-opus-5-5` is a Codex alias, `gpt-6.1-sol` is Codex, `grok-4.7` is Grok, and `muse-spark-1.3` is Muse. The `vertex/<publisher>/` prefix is what selects Vertex AI. A trailing `[1m]` is removed before routing, as for every model.
+Only Gemini IDs are accepted bare. A bare `claude-*`, `gpt-*`, `grok-*`, or `muse-*` ID keeps its own provider and never reaches Vertex AI: `claude-opus-5-5` is an Anthropic-style alias that follows the alias provider setting (`aliasProvider`, Codex by default), `gpt-6.1-sol` is Codex, `grok-4.7` is Grok, and `muse-spark-1.3` is Muse. The `vertex/<publisher>/` prefix is what selects Vertex AI. A trailing `[1m]` is removed before routing, as for every model.
 
 An ID that is not registered still reaches Vertex AI when it matches its family's form, so a new model works before the proxy lists it:
 
@@ -409,7 +410,7 @@ Everything else, including `stream`, `system`, `tools`, `tool_choice`, `thinking
 
 A streaming response is forwarded byte for byte. The proxy checks it as it passes: an upstream `error` event, a stream that ends before `message_stop`, or any event after `message_stop`, `ping` included, ends the stream with an `api_error` event, `Vertex AI Messages stream is invalid`. Google's own error text is not forwarded to the client; the [traffic capture](/reference/files-and-storage/#traffic-captures) records it. The chunk that carries `message_stop` is held until Vertex AI closes the stream or 2 seconds pass, so the end of a turn can arrive up to 2 seconds late. More than 16 MiB after `message_stop` is an error.
 
-A non-streaming response is read whole, up to 16 MiB, and returned unchanged once it parses as JSON. A larger body is a 502, `Vertex AI Claude response exceeds 16 MiB`, and a body that is not JSON is a 502, `Vertex AI returned a Claude response that is not JSON`.
+A non-streaming response is read whole, up to 16 MiB, and returned unchanged once it parses as JSON. A larger body is a 502, `Vertex AI Claude response exceeds 16 MiB`, and a body that is not JSON is a 502, `Vertex AI returned a Claude response that is not JSON`. A 200 whose body is an Anthropic error object (`"type": "error"`) is answered as an error, `Vertex AI returned a Claude <type>: <message>`, with the status of its `error.type`: 429 for `rate_limit_error`, 401 for `authentication_error`, 403 for `permission_error`, 400 for `invalid_request_error`, and 502 for any other type.
 
 `/v1/messages/count_tokens` is the proxy's local estimate; Vertex AI's Claude token-counting endpoint is not used.
 
@@ -497,11 +498,14 @@ The stream fails when an event:
 - is not JSON, or has no string `type`.
 - has a `type` the translator does not handle and the proxy has not classified as harmless. The accepted types are the ones the translator handles, such as `response.created`, `response.output_item.added`, `response.output_text.delta`, `response.function_call_arguments.delta`, `response.completed`, `response.failed`, and `error`, plus the progress events `response.queued`, `response.content_part.added`, `response.content_part.done`, `response.output_text.done`, `response.reasoning_summary_part.done`, and `response.reasoning_summary_text.done`. `ping`, `response.refusal.*`, and `response.reasoning_text.*` are not accepted.
 - is a `.done` snapshot or a `response.output_item.done` that carries text no delta delivered, because the translator would drop that text.
+- is a `response.content_part.added`, `response.content_part.done`, or message `response.output_item.done` that carries a non-empty `refusal`.
 - arrives after `response.completed`, `response.incomplete`, or `response.done`.
 
 After the completion event the proxy reads until Vertex AI closes the stream or 2 seconds pass, and accepts at most 16 MiB more. A single event is limited to 1 MiB.
 
-A streaming client gets an `api_error` event with `Vertex AI Responses stream is invalid`. A non-streaming client gets a 502 whose message adds the reason, such as `Vertex AI Responses stream is invalid: unlisted_event_type`. The [traffic capture](/reference/files-and-storage/#traffic-captures) records the event and the reason in `060-vertex-responses-stream-error`. Report the capture when this happens, so the event can be added to the accepted list.
+A streaming client gets an `api_error` event with `Vertex AI Responses stream is invalid`. A non-streaming client gets a 502 whose message adds the reason, such as `Vertex AI Responses stream is invalid: unlisted_event_type` or `Vertex AI Responses stream is invalid: refusal_in_snapshot`.
+
+A non-streaming read stops as soon as the outcome is known, without waiting for Vertex AI to close the stream: at a rejected event, at an upstream failure event, and at a Read call the translator repaired. The completion event itself is followed by the same 2-second read as on a stream. The [traffic capture](/reference/files-and-storage/#traffic-captures) records the event and the reason in `060-vertex-responses-stream-error`. Report the capture when this happens, so the event can be added to the accepted list.
 
 ### xAI Grok
 
@@ -595,7 +599,7 @@ When the OpenAI routes are enabled, every Vertex AI model works with both `POST 
 
 ## Errors
 
-The proxy chooses the error type from the HTTP status of Vertex AI. When Vertex AI answered the request with an error status, the message ends with `(upstream HTTP <status>)`, even when the proxy answers with a different status. The message is taken from `error.message` in the body, where Google, Anthropic, and OpenAI all put it; when the body has no such field, the body text itself is used. Google's error text is cleaned first: the access token, e-mail addresses, and long runs of base64 data (a thought signature or image the request carried) are replaced, and the text is cut to 500 characters.
+The proxy chooses the error type from the HTTP status of Vertex AI. When Vertex AI answered the request with an error status, the message ends with `(upstream HTTP <status>)`, even when the proxy answers with a different status. The message is taken from `error.message` in the body, where Google, Anthropic, and OpenAI all put it, or else from a top-level `message`, where Mistral puts it; when the body has neither, the body text itself is used. Google's error text is cleaned first: the access token, e-mail addresses, and long runs of base64 data (a thought signature or image the request carried) are replaced, and the text is cut to 500 characters.
 
 | Situation | Proxy answer |
 | --- | --- |
@@ -606,14 +610,22 @@ The proxy chooses the error type from the HTTP status of Vertex AI. When Vertex 
 | Mistral without a Mistral location | 400 `invalid_request_error`, `Vertex AI models of publisher mistralai are not served in location <location>: ...` naming the settings |
 | No credential, or no access token (including no answer within 30 seconds) | 401 `authentication_error`, `Google credentials are not available: ...` or `Google access token could not be obtained: ...`, followed by the `gcloud auth application-default login` hint |
 | Vertex AI 401 | 401 `authentication_error`, `Vertex AI rejected the Google access token: ...` with the same hint |
-| Vertex AI 403 | 403 `permission_error`. The message asks you to check the role `roles/aiplatform.user` on the project, that `aiplatform.googleapis.com` is enabled there, and, for user credentials, that a quota project is set with `gcloud auth application-default set-quota-project <project>` |
-| Vertex AI 404 | 404 `invalid_request_error`, `Model <model> is not available in project <project> / location <location>: ...`, naming the three location settings |
+| Vertex AI 403 | 403 `permission_error`. The message asks you to check the role `roles/aiplatform.user` on the project, that `aiplatform.googleapis.com` is enabled there, and, for user credentials, that a quota project is set with `gcloud auth application-default set-quota-project <project>`. For Claude, Grok, OpenAI, Muse, and Mistral it adds the Model Garden check below |
+| Vertex AI 404 | 404 `invalid_request_error`, `Model <model> is not available in project <project> / location <location>: ...`, naming the three location settings. For Claude, Grok, OpenAI, Muse, and Mistral it adds the Model Garden check below |
 | Vertex AI 429 | 429 `rate_limit_error`. The message names the model and location and suggests retrying later or another location. `retry-after` is set from Google's `RetryInfo`, or from a whole-second `Retry-After` header, when it is between 0 and 86400 seconds |
 | Other Vertex AI 4xx, such as a Claude feature Vertex AI does not accept | Same status, `invalid_request_error`, with the upstream message |
 | Vertex AI 5xx, or no connection | 502 `api_error`; `Vertex AI is unreachable` when no status arrived |
 | No response headers within 300 seconds | 504 `api_error` |
 | Error inside a Gemini 200 stream | A blocked prompt (`blockReason`), a stop other than `STOP` or `MAX_TOKENS` (`finishReason`, with Google's `finishMessage`), a stream that ends without a `finishReason`, an `error` chunk, response content over 16 MiB, or an event or part with none of the documented fields. Streaming requests get an `error` event. Non-streaming requests get the matching status: 429 for rate limits, 401 and 403 for credential errors, the in-stream 4xx code or 400 for invalid requests and blocked prompts, and 502 for the rest |
 | Error inside a Claude, Grok, OpenAI, Muse, or Mistral 200 stream | Streaming requests get an `api_error` event: `Vertex AI Messages stream is invalid` for Claude, `Vertex AI Responses stream is invalid` for Grok, OpenAI, and Muse, `Vertex AI Mistral stream is invalid` for Mistral. Non-streaming requests get a 502 |
+
+For a Claude, Grok, OpenAI, Muse, or Mistral model, a 403 or 404 message adds this sentence before `(upstream HTTP <status>)`:
+
+```text
+Also check that model {model} is enabled in Model Garden for project {project} in location {location} and, for a preview model, that the project has been granted access; the status alone does not say which of these is the cause
+```
+
+`{model}` is the model ID sent upstream, such as `xai/grok-4.7` or `claude-opus-5-5`, and the project and location are the ones the request used, an override included.
 
 What to check for each status:
 
@@ -637,7 +649,7 @@ With [traffic capture](/reference/files-and-storage/#traffic-captures) on, Verte
 | Mistral stream | `061-vertex-mistral-stream-summary` |
 | Non-streaming Gemini, Grok, OpenAI, Muse, Mistral | `061-vertex-buffered-summary` and `051-downstream-response` |
 
-The `060-...-stream-error` file is written only when the stream failed.
+The `060-...-stream-error` file is written only when the stream failed. No capture file holds the request's access token, in any field: every string the proxy writes for a Vertex AI request has the token replaced with `[redacted]`. Apart from that replacement, upstream text in these files is kept whole, however long, except upstream error and finish messages, which also go through the cleaning described in [Errors](#errors) and are cut to 500 characters.
 
 ## Configuration
 
@@ -666,7 +678,7 @@ No request to Vertex AI was observed while this provider was built. The request 
 | All | User credentials without a quota project are accepted. | HTTP 403. Run `gcloud auth application-default set-quota-project PROJECT_ID`. |
 | Gemini | Claude Code keeps empty thinking blocks that carry only a signature. | No error; the proxy sends the placeholder signature, and answer quality may drop. |
 | Gemini | Error bodies carry `RetryInfo`, and errors inside a stream arrive as a chunk with an `error` key. | 429 responses have no `retry-after`. An unknown chunk shape ends the stream with an error. |
-| All partner families | Error bodies carry their text at `error.message`. | Error messages show the raw body instead of Google's sentence. The status mapping is unchanged. |
+| All partner families | Error bodies carry their text at `error.message` or a top-level `message`. | Error messages show the raw body instead of the upstream sentence. The status mapping is unchanged. |
 | Claude | The Claude stream on Vertex AI has the same events as Anthropic's. | Broken display or usage in Claude Code, or `Vertex AI Messages stream is invalid` when `message_stop` never arrives. |
 | Claude | Vertex AI accepts the request fields Claude Code sends when it believes it talks to Anthropic. | Requests that use a certain feature fail with HTTP 400 naming the field. `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` is expected to reduce them. |
 | Claude | Vertex AI accepts every value on the beta list. | HTTP 400 naming a beta. |
@@ -690,7 +702,7 @@ No request to Vertex AI was observed while this provider was built. The request 
 - Grok, OpenAI, Muse, and Mistral do not carry reasoning across turns. Hosted tools are refused. Stored responses (`store: true`, `previous_response_id`) and OpenAI's `/responses/compact` are not used.
 - Grok, OpenAI, Muse, and Mistral streams end with an error on any event the proxy does not recognise, and accept events up to 1 MiB each.
 - Token counts for `/v1/messages/count_tokens` are local estimates for every family; Vertex AI's token-counting endpoints are not used.
-- `vertex auth status` does not read the location overrides.
+- A non-streaming Gemini, Grok, OpenAI, Muse, or Mistral request has no deadline before the first terminal event (Gemini's `finishReason`, the Responses completion, or Mistral's `finish_reason` or `[DONE]`): like a stream, it waits as long as the model takes. After that event the read ends when Vertex AI closes the stream or 2 seconds pass. A non-streaming Claude request is read until Vertex AI closes the response, also without a deadline.
 - Express mode (API keys), the Interactions API, explicit context caches, and Provisioned Throughput are not supported.
 
 If requests fail, run `claude-code-proxy vertex auth status` first. It shows which credential, project, location, endpoint, and quota project the proxy resolves, and whether a token can be obtained.
