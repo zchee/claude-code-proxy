@@ -1355,6 +1355,10 @@ impl LiveStreamTranslator {
     /// [`TerminalPolicy::Strict`], `[DONE]` does not complete the response:
     /// a second `[DONE]` or any later event is an error, and the closing
     /// events come from [`Self::finish`] or [`Self::finish_after_read_limit`].
+    /// Between a `finish_reason` and `[DONE]` only chunks without content
+    /// are accepted (usage, or a choice with an empty delta and the same
+    /// finish reason); text, reasoning, a tool-call delta or a different
+    /// finish reason there is an error.
     pub fn with_wiring(
         message_id: String,
         model: String,
@@ -1395,6 +1399,9 @@ impl LiveStreamTranslator {
             }
             let chunk: StreamChunk = serde_json::from_str(data)
                 .map_err(|_| anyhow::anyhow!("malformed {} SSE event", self.state.provider))?;
+            if self.terminal == TerminalPolicy::Strict && self.state.pending_stop.is_some() {
+                check_after_finish_reason(&chunk, self.state.provider)?;
+            }
             out.extend(self.state.apply_chunk(chunk)?);
         }
         Ok(out)
@@ -1446,6 +1453,30 @@ impl LiveStreamTranslator {
     fn has_seen_done(&self) -> bool {
         self.done_seen
     }
+}
+
+/// Under [`TerminalPolicy::Strict`], rejects a chunk after a `finish_reason`
+/// that carries text, reasoning or a tool-call delta. A different finish
+/// reason is rejected by [`TranslationState::apply_chunk`] in every policy.
+fn check_after_finish_reason(chunk: &StreamChunk, provider: &str) -> anyhow::Result<()> {
+    let has_text = |text: &Option<String>| text.as_deref().is_some_and(|text| !text.is_empty());
+    let carries_content = chunk
+        .choices
+        .iter()
+        .flatten()
+        .filter_map(|choice| choice.delta.as_ref())
+        .any(|delta| {
+            has_text(&delta.content)
+                || has_text(&delta.reasoning_content)
+                || delta
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty())
+        });
+    if carries_content {
+        anyhow::bail!("{provider} stream sent content after finish_reason");
+    }
+    Ok(())
 }
 
 fn validate_post_done_metadata(data: &str, provider: &str) -> anyhow::Result<()> {
@@ -2944,5 +2975,83 @@ mod tests {
                 "{wire}: {text}"
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_rejects_content_after_finish_reason() {
+        let tests = [
+            (
+                "text",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n",
+            ),
+            (
+                "reasoning",
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"late\"}}]}\n\n",
+            ),
+            (
+                "tool call delta",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"Read\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            ),
+            (
+                "different finish reason",
+                "data: {\"choices\":[{\"finish_reason\":\"length\"}]}\n\n",
+            ),
+        ];
+        for (name, late) in tests {
+            let tail = format!("{late}data: [DONE]\n\n");
+            let wire = format!("{TEXT_THEN_STOP}{tail}");
+            for parts in [vec![wire.as_str()], vec![TEXT_THEN_STOP, tail.as_str()]] {
+                let text = body_text(strict_body(futures_util::stream::iter(chunks(&parts)))).await;
+                let case = format!("{name} in {} items", parts.len());
+                assert!(
+                    text.contains("Synthetic Gateway stream is invalid"),
+                    "{case}: {text}"
+                );
+                assert!(!text.contains("message_stop"), "{case}: {text}");
+                assert!(!text.contains("late"), "{case}: {text}");
+            }
+            let error = accumulate_response_with(wire.as_bytes(), "msg", "model", &strict_wiring())
+                .unwrap_err()
+                .to_string();
+            assert!(error.starts_with("Synthetic Gateway"), "{name}: {error}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_accepts_usage_and_one_done_after_finish_reason() {
+        let tests = [
+            (
+                "usage only",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7}}\n\n",
+            ),
+            (
+                "empty delta with the same finish reason",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7}}\n\n",
+            ),
+        ];
+        for (name, after) in tests {
+            let wire = format!("{TEXT_THEN_STOP}{after}data: [DONE]\n\n");
+            let text = body_text(strict_body(futures_util::stream::iter(chunks(&[&wire])))).await;
+            assert!(text.contains("\"text\":\"hello\""), "{name}: {text}");
+            assert!(text.contains("\"output_tokens\":7"), "{name}: {text}");
+            assert!(
+                text.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+                "{name}: {text}"
+            );
+            let response =
+                accumulate_response_with(wire.as_bytes(), "msg", "model", &strict_wiring())
+                    .unwrap();
+            assert_eq!(response["content"][0]["text"], "hello", "{name}");
+            assert_eq!(response["usage"]["output_tokens"], 7, "{name}");
+        }
+    }
+
+    #[test]
+    fn default_policy_still_accepts_content_after_finish_reason() {
+        let upstream = format!(
+            "{TEXT_THEN_STOP}data: {{\"choices\":[{{\"delta\":{{\"content\":\"late\"}}}}]}}\n\ndata: [DONE]\n\n"
+        );
+        let response = accumulate_response(upstream.as_bytes(), "msg", "glm-5.2").unwrap();
+        assert_eq!(response["content"][0]["text"], "hellolate");
     }
 }
