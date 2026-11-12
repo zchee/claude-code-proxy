@@ -8,48 +8,134 @@ use std::sync::LazyLock;
 
 use regex_lite::{Captures, Regex};
 
-use crate::providers::muse::sanitize::{redact_secrets, sanitize_upstream_text};
+use crate::providers::muse::sanitize::sanitize_upstream_text;
 
 /// Shortest run of base64 characters that is treated as encoded data.
 pub const MIN_ENCODED_RUN: usize = 64;
+
+const REDACTED: &str = "[redacted]";
 
 /// Runs of the standard and URL-safe base64 alphabets, with padding.
 static BASE64_RUN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[A-Za-z0-9+/_-]{64,}={0,2}").expect("base64 run pattern is a valid regex")
 });
 
-/// Scrubs one piece of upstream prose, in this order: every occurrence of
-/// each secret (pass the access token) becomes `[redacted]`; every run of 64
-/// or more base64 characters that mixes upper case, lower case and digits
-/// becomes `[redacted len=N]`; e-mail addresses are redacted and the result
-/// is cut to 500 characters by `muse::sanitize::sanitize_upstream_text`.
+/// A Google OAuth access token: `ya29.` followed by the token characters
+/// of RFC 6750. A period may separate parts of the token (`ya29.c.…`), but
+/// one that ends it is left alone, so a sentence-ending period survives.
+static ACCESS_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"ya29\.[A-Za-z0-9_~+/-]+(?:\.[A-Za-z0-9_~+/-]+)*=*")
+        .expect("access token pattern is a valid regex")
+});
+
+/// A whole base64 run that is a Google resource name. The run can begin in
+/// the middle of a URL (after the host's last `.`), so short lower-case
+/// segments such as `com/v1/` may come first; then
+/// `projects/<id>/locations/<id>`, any number of `/<collection>/<id>` pairs
+/// and at most one trailing collection. Every segment is shorter than an
+/// encoded run, so data cannot hide in an ID position.
+static RESOURCE_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^/?(?:[a-z0-9-]{1,63}/)*projects/[A-Za-z0-9_-]{1,63}/locations/[A-Za-z0-9_-]{1,63}(?:/[a-z][A-Za-z0-9]{0,62}/[A-Za-z0-9_-]{1,63})*(?:/[a-z][A-Za-z0-9]{0,62})?/?$",
+    )
+    .expect("resource name pattern is a valid regex")
+});
+
+/// Scrubs one piece of upstream prose, in this order:
 ///
-/// The mixed-character rule keeps resource names such as
-/// `projects/my-project/locations/global/publishers/google/models/gemini-x`,
-/// which use the same alphabet but no upper case, and which are the useful
-/// part of a not-found message. Encoded data of that length virtually always
-/// has all three kinds of character.
+/// 1. every occurrence of each secret (pass the access token) becomes
+///    `[redacted]`, whether it appears verbatim or with any of its bytes
+///    percent-encoded, and so does anything shaped like a Google access
+///    token (`ya29.` and token characters), listed or not;
+/// 2. every run of 64 or more base64 or base64url characters becomes
+///    `[redacted len=N]`, unless the whole run is a Google resource name
+///    such as `projects/my-project/locations/global/publishers/google/models/gemini-x`,
+///    which is the useful part of a not-found message;
+/// 3. e-mail addresses are redacted and the result is cut to 500
+///    characters by `muse::sanitize::sanitize_upstream_text`.
 ///
-/// Both replacements happen before the cut, so a value that straddles the
-/// 500th character cannot survive as a prefix.
+/// Every replacement happens before the cut, so a value that straddles the
+/// 500th character cannot survive as a prefix. Encoded data is redacted
+/// whatever mix of character classes it has: an upper-case-only or
+/// hexadecimal value is as opaque as any other.
 pub fn sanitize_vertex_text(text: &str, secrets: &[&str]) -> String {
-    let redacted = redact_secrets(text, secrets);
-    let without_data = BASE64_RUN.replace_all(&redacted, |captures: &Captures| {
+    let without_secrets = redact_secrets_in_any_encoding(text, secrets);
+    let without_tokens = ACCESS_TOKEN.replace_all(&without_secrets, REDACTED);
+    let without_data = BASE64_RUN.replace_all(&without_tokens, |captures: &Captures| {
         let run = &captures[0];
-        if looks_encoded(run) {
-            format!("[redacted len={}]", run.len())
-        } else {
+        if RESOURCE_NAME.is_match(run) {
             run.to_string()
+        } else {
+            format!("[redacted len={}]", run.len())
         }
     });
     sanitize_upstream_text(&without_data, secrets)
 }
 
-fn looks_encoded(run: &str) -> bool {
-    let bytes = run.as_bytes();
-    bytes.iter().any(u8::is_ascii_uppercase)
-        && bytes.iter().any(u8::is_ascii_lowercase)
-        && bytes.iter().any(u8::is_ascii_digit)
+/// Replaces every occurrence of each non-empty secret with `[redacted]`.
+/// Each byte of the secret may appear as itself or percent-encoded with
+/// either case of hex digit (`/`, `%2F` or `%2f`), so a secret quoted from a
+/// URL or a form body is found too. Matches start and end on character
+/// boundaries.
+fn redact_secrets_in_any_encoding(text: &str, secrets: &[&str]) -> String {
+    let secrets: Vec<&[u8]> = secrets
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .map(|secret| secret.as_bytes())
+        .collect();
+    if secrets.is_empty() {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        let end = text
+            .is_char_boundary(at)
+            .then(|| {
+                secrets
+                    .iter()
+                    .find_map(|secret| match_end(bytes, at, secret))
+            })
+            .flatten()
+            .filter(|end| text.is_char_boundary(*end));
+        match end {
+            Some(end) => {
+                out.push_str(&text[copied..at]);
+                out.push_str(REDACTED);
+                copied = end;
+                at = end;
+            }
+            None => at += 1,
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// Where a match of `secret` that starts at `start` ends, or `None`.
+fn match_end(text: &[u8], start: usize, secret: &[u8]) -> Option<usize> {
+    let mut at = start;
+    for &expected in secret {
+        match text.get(at) {
+            Some(&byte) if byte == expected => at += 1,
+            Some(b'%') if text.get(at + 1..at + 3).and_then(percent_decoded) == Some(expected) => {
+                at += 3;
+            }
+            _ => return None,
+        }
+    }
+    Some(at)
+}
+
+/// The byte two hex digits stand for.
+fn percent_decoded(digits: &[u8]) -> Option<u8> {
+    let [high, low] = digits else {
+        return None;
+    };
+    let value = |digit: u8| char::from(digit).to_digit(16);
+    u8::try_from(value(*high)? * 16 + value(*low)?).ok()
 }
 
 #[cfg(test)]
@@ -123,9 +209,110 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_synthetic_lowercase_hex_digests_are_kept() {
-        let text = format!("digest {}", "0123456789abcdef".repeat(4));
-        assert_eq!(sanitize_vertex_text(&text, &[]), text);
+    fn sanitize_synthetic_encoded_runs_are_redacted_whatever_their_character_classes() {
+        // Upper case only: "ABC" repeated, base64-encoded.
+        let upper = "QUJD".repeat(32);
+        // Letters of both cases, no digit.
+        let digit_free = "AbCdEfGhIjKlMnOp".repeat(4);
+        // Lower case and digits only: a hexadecimal digest.
+        let hex = "0123456789abcdef".repeat(4);
+        // Lower case only, URL-safe alphabet.
+        let lower = "abcdefgh_ijklmno-".repeat(4);
+        for run in [&upper, &digit_free, &hex, &lower] {
+            let text = format!("Invalid value \"{run}\" here");
+            assert_eq!(
+                sanitize_vertex_text(&text, &[]),
+                format!("Invalid value \"[redacted len={}]\" here", run.len()),
+                "{run}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_synthetic_resource_name_inside_a_url_is_kept() {
+        let text = "Not found: https://aiplatform.googleapis.com/v1/projects/synthetic-project-123/locations/us-central1/publishers/google/models/gemini-3-flash-preview:streamGenerateContent";
+        assert_eq!(sanitize_vertex_text(text, &[]), text);
+        let text = "Collection projects/synthetic-project-123/locations/europe-west4/publishers/google/models is empty";
+        assert_eq!(sanitize_vertex_text(text, &[]), text);
+    }
+
+    #[test]
+    fn sanitize_synthetic_data_in_a_resource_name_position_is_redacted() {
+        // A resource-name prefix does not exempt data glued to it: the run
+        // is only kept when every segment fits the resource-name grammar.
+        let blob = "Ab3dEf9GhIjK0lMn".repeat(5);
+        let run = format!("projects/synthetic-project/locations/global/cachedContents/{blob}");
+        let text = format!("Unknown {run} here");
+        assert_eq!(
+            sanitize_vertex_text(&text, &[]),
+            format!("Unknown [redacted len={}] here", run.len())
+        );
+        let run = format!("{blob}/projects/synthetic-project/locations/global");
+        assert_eq!(
+            sanitize_vertex_text(&run, &[]),
+            format!("[redacted len={}]", run.len())
+        );
+    }
+
+    #[test]
+    fn sanitize_synthetic_unlisted_access_token_shapes_are_redacted() {
+        // Neither token is in the secret list. The first is shorter than an
+        // encoded run, the second has only lower case and digits.
+        let short = "ya29.c.b0Synthetic-Short_Token";
+        let lower = format!("ya29.a0{}", "synthetic0lower0case0".repeat(4));
+        for token in [short, lower.as_str()] {
+            let text = format!("Bearer {token}. Retry later.");
+            assert_eq!(
+                sanitize_vertex_text(&text, &[]),
+                "Bearer [redacted]. Retry later.",
+                "{token}"
+            );
+        }
+        // The prefix alone is not a token.
+        let prose = "tokens start with ya29. and nothing else";
+        assert_eq!(sanitize_vertex_text(prose, &[]), prose);
+    }
+
+    #[test]
+    fn sanitize_synthetic_percent_encoded_secrets_are_redacted() {
+        let secret = "1//synthetic+secret/value=";
+        for encoded in [
+            // As a form body or query string writes it.
+            "1%2F%2Fsynthetic%2Bsecret%2Fvalue%3D",
+            // Lower-case hex digits.
+            "1%2f%2fsynthetic%2bsecret%2fvalue%3d",
+            // Unreserved bytes encoded as well.
+            "%31%2F%2F%73ynthetic%2Bsecret%2Fvalue%3D",
+        ] {
+            let text = format!("refresh_token={encoded}&grant_type=refresh_token");
+            assert_eq!(
+                sanitize_vertex_text(&text, &[secret]),
+                "refresh_token=[redacted]&grant_type=refresh_token",
+                "{encoded}"
+            );
+        }
+        let encoded_token = SYNTHETIC_ACCESS_TOKEN
+            .replace('.', "%2E")
+            .replace('_', "%5F");
+        let text = format!("access_token={encoded_token}");
+        assert_eq!(
+            sanitize_vertex_text(&text, &[SYNTHETIC_ACCESS_TOKEN]),
+            "access_token=[redacted]"
+        );
+        // A percent sign that does not encode the next secret byte breaks
+        // the match.
+        let text = "1%2G/synthetic";
+        assert_eq!(sanitize_vertex_text(text, &[secret]), text);
+    }
+
+    #[test]
+    fn sanitize_synthetic_secret_next_to_multibyte_text_is_redacted() {
+        let secret = "synthetic-secret-ü-value";
+        let text = format!("é{secret}ü and é{}ü", secret.replace('ü', "%C3%BC"));
+        assert_eq!(
+            sanitize_vertex_text(&text, &[secret]),
+            "é[redacted]ü and é[redacted]ü"
+        );
     }
 
     #[test]

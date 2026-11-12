@@ -10,8 +10,8 @@ use std::time::Duration;
 use google_cloud_auth::credentials::{Builder, CacheableResource, Credentials};
 use http::{HeaderMap, StatusCode};
 
+use super::sanitize::sanitize_vertex_text;
 use crate::provider::{ProviderError, ProviderErrorKind};
-use crate::providers::muse::sanitize::sanitize_upstream_text;
 
 /// OAuth scope that covers every Vertex AI method.
 pub const CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
@@ -168,10 +168,7 @@ impl VertexCredentials {
             Ok(CacheableResource::NotModified) => Err(VertexAuthError::Token(
                 "the credential library returned no headers".to_string(),
             )),
-            Err(error) => Err(VertexAuthError::Token(sanitize_upstream_text(
-                &error.to_string(),
-                &[],
-            ))),
+            Err(error) => Err(VertexAuthError::Token(token_error_reason(&error))),
         }
     }
 }
@@ -205,11 +202,21 @@ pub fn install_default_crypto_provider() {
 
 /// Describes a load failure without repeating file contents: a parse error
 /// from the crate can quote a value from the file, so it gets a fixed text.
+/// Any other error text is scrubbed like Vertex AI's own error prose.
 fn build_error_reason(error: &google_cloud_auth::build_errors::Error) -> String {
     if error.is_parsing() {
         return "the credentials file is not valid credentials JSON".to_string();
     }
-    sanitize_upstream_text(&error.to_string(), &[])
+    sanitize_vertex_text(&error.to_string(), &[])
+}
+
+/// Describes a failed token fetch. The crate's text can embed the whole
+/// answer of the token server or the metadata server, which may echo an
+/// access token, a refresh token or other encoded material, so it is
+/// scrubbed like Vertex AI's own error prose before it reaches a client or
+/// `vertex auth status`.
+fn token_error_reason(error: &google_cloud_auth::errors::CredentialsError) -> String {
+    sanitize_vertex_text(&error.to_string(), &[])
 }
 
 #[cfg(test)]
@@ -301,6 +308,42 @@ mod tests {
                 mapped.message
             );
         }
+    }
+
+    #[test]
+    fn token_errors_synthetic_echoed_token_server_body_is_scrubbed() {
+        // The crate quotes the token server's answer in its error text. This
+        // answer echoes an access token, a refresh token and an e-mail
+        // address back, none of which may reach the 401 or `auth status`.
+        let refresh_token = format!("1//{}", "synthetic0Refresh0Token0Body".repeat(3));
+        let body = format!(
+            "{{\"error\": \"invalid_grant\", \"access_token\": \"{SYNTHETIC_TOKEN}\", \"refresh_token\": \"{refresh_token}\", \"account\": \"synthetic.person@example.com\"}}"
+        );
+        let error = google_cloud_auth::errors::CredentialsError::from_msg(
+            false,
+            format!("failed to refresh user access token, body=<{body}>"),
+        );
+        let reason = token_error_reason(&error);
+        assert!(
+            reason.starts_with("failed to refresh user access token, body=<"),
+            "{reason}"
+        );
+        assert!(reason.contains("invalid_grant"), "{reason}");
+        for secret in [
+            SYNTHETIC_TOKEN,
+            "ya29.",
+            refresh_token.as_str(),
+            "synthetic0Refresh0Token0Body",
+            "synthetic.person@example.com",
+        ] {
+            assert!(!reason.contains(secret), "leaked {secret:?}: {reason}");
+        }
+        let message = VertexAuthError::Token(reason).into_provider_error().message;
+        assert!(
+            message.starts_with("Google access token could not be obtained: failed to refresh"),
+            "{message}"
+        );
+        assert!(!message.contains(SYNTHETIC_TOKEN), "{message}");
     }
 
     #[test]
