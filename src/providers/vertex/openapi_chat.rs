@@ -58,8 +58,9 @@ const REQUEST_POLICY: RequestPolicy = RequestPolicy {
 ///   `reasoning_effort` `low` or `medium`, and `high` for `high`, `xhigh`
 ///   and `max`; no effort sends none.
 /// - [`ThinkingControl::EnableThinking`]: `chat_template_kwargs` is
-///   `{"enable_thinking": true}` when Claude Code turned thinking on (any
-///   `thinking.type` but `disabled`), `false` otherwise.
+///   `{"enable_thinking": true}` when thinking is on: `thinking` is present
+///   with any `type` but `disabled`, or `thinking` is absent and the request
+///   carries an effort. Otherwise it is `false`.
 /// - [`ThinkingControl::NoSwitch`]: neither field.
 ///
 /// # Errors
@@ -128,11 +129,19 @@ fn check_tool_choice(
     Ok(())
 }
 
-/// Whether Claude Code turned thinking on: a `thinking` object whose `type`
-/// is not `disabled`.
+/// Whether thinking is on: a `thinking` object whose `type` is not
+/// `disabled`, or, without `thinking`, an `output_config.effort`. The
+/// OpenAI-compatible routes carry a client's `reasoning_effort` as the
+/// effort and never set `thinking`, so the effort alone must be able to
+/// turn thinking on; an explicit `thinking` always decides.
+///
+/// # Errors
+///
+/// `thinking` is not an object, or, without `thinking`, the effort is not
+/// one of the valid values.
 fn thinking_on(body: &MessagesRequest) -> anyhow::Result<bool> {
     match body.extra.get("thinking") {
-        None | Some(Value::Null) => Ok(false),
+        None | Some(Value::Null) => Ok(read_effort(body)?.is_some()),
         Some(Value::Object(thinking)) => {
             Ok(thinking.get("type").and_then(Value::as_str) != Some("disabled"))
         }
@@ -358,7 +367,8 @@ mod tests {
                 (json!({"type": "adaptive"}), true),
                 (json!({"type": "enabled", "budget_tokens": 2_048}), true),
                 (json!({"type": "disabled"}), false),
-                (Value::Null, false),
+                // No thinking setting: the request's effort turns it on.
+                (Value::Null, true),
             ] {
                 let body = prepared(raw, &synthetic_full_request(raw, "low", thinking.clone()));
                 let mut expected = expected_common(upstream);
@@ -382,6 +392,73 @@ mod tests {
             )
             .unwrap_err();
             assert_eq!(error.to_string(), "thinking must be an object");
+        }
+    }
+
+    #[test]
+    fn request_synthetic_glm_and_gemma_without_thinking_follow_the_effort() {
+        for raw in [
+            "vertex/zai-org/glm-5.2-maas",
+            "vertex/google/gemma-4-26b-a4b-it-maas",
+        ] {
+            for (case, thinking, effort, enabled) in [
+                ("thinking absent, effort present", None, Some("high"), true),
+                ("thinking absent, no effort", None, None, false),
+                (
+                    "thinking disabled, effort present",
+                    Some(json!({"type": "disabled"})),
+                    Some("high"),
+                    false,
+                ),
+                (
+                    "thinking enabled, no effort",
+                    Some(json!({"type": "enabled", "budget_tokens": 2_048})),
+                    None,
+                    true,
+                ),
+                (
+                    "thinking adaptive, no effort",
+                    Some(json!({"type": "adaptive"})),
+                    None,
+                    true,
+                ),
+                (
+                    "thinking adaptive, effort present",
+                    Some(json!({"type": "adaptive"})),
+                    Some("max"),
+                    true,
+                ),
+            ] {
+                let mut value =
+                    json!({"model": raw, "messages": [{"role": "user", "content": "hi"}]});
+                if let Some(thinking) = thinking {
+                    value["thinking"] = thinking;
+                }
+                if let Some(effort) = effort {
+                    value["output_config"] = json!({"effort": effort});
+                }
+                let body = prepared(raw, &request(value));
+                assert_eq!(
+                    body["chat_template_kwargs"],
+                    json!({"enable_thinking": enabled}),
+                    "{raw}: {case}"
+                );
+                assert!(body.get("reasoning_effort").is_none(), "{raw}: {case}");
+            }
+            let error = prepare_request(
+                &request(json!({
+                    "model": raw,
+                    "output_config": {"effort": "huge"},
+                    "messages": [{"role": "user", "content": "hi"}]
+                })),
+                &resolve(raw).unwrap(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Invalid output_config.effort: huge",
+                "{raw}"
+            );
         }
     }
 

@@ -2499,6 +2499,53 @@ async fn vertex_open_models_synthetic_glm_thinking_off_unless_claude_code_turns_
 }
 
 #[tokio::test]
+async fn vertex_open_models_synthetic_reasoning_effort_on_the_chat_completions_route_turns_glm_thinking_on()
+ {
+    // The OpenAI-compatible route sets an effort and never a thinking
+    // setting, so the effort alone decides enable_thinking for GLM.
+    let upstream = FakeVertex::start(vec![
+        open_model_sse(&open_model_text("Hello")),
+        open_model_sse(&open_model_text("Hello")),
+    ])
+    .await;
+    let registry = registry(provider(&upstream, &[]));
+    for (effort, enabled) in [(Some("high"), true), (None, false)] {
+        let mut request = json!({
+            "model": "vertex/zai-org/glm-5.2-maas",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        if let Some(effort) = effort {
+            request["reasoning_effort"] = json!(effort);
+        }
+        let (status, _, body) = tokio::time::timeout(
+            REQUEST_DEADLINE,
+            post(
+                app_with_options(registry.clone(), None, true),
+                "/v1/chat/completions",
+                &request,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("effort {effort:?}: no answer from /v1/chat/completions"));
+        assert_eq!(status, StatusCode::OK, "effort {effort:?}: {body}");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["content"], "Hello",
+            "effort {effort:?}: {body}"
+        );
+        let sent = upstream.requests().last().cloned().unwrap();
+        assert_eq!(
+            sent.body["chat_template_kwargs"],
+            json!({"enable_thinking": enabled}),
+            "effort {effort:?}: {}",
+            sent.body
+        );
+        assert!(sent.body.get("reasoning_effort").is_none(), "{}", sent.body);
+    }
+    assert_eq!(upstream.requests().len(), 2);
+}
+
+#[tokio::test]
 async fn vertex_open_models_synthetic_reasoning_becomes_thinking_in_both_modes() {
     let frames = vec![
         open_model_chunk(
