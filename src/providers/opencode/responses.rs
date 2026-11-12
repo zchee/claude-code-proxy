@@ -16,8 +16,8 @@ use crate::providers::grok::translate::stream::SseDecoder;
 use crate::traffic::{StreamTrafficCapture, TrafficCapture};
 
 use super::chat::{
-    FrameScanner, POST_TERMINAL_MAX_BYTES, RawFrameEnds, ReceiveContext, StreamLabels,
-    StreamWiring, TerminalPolicy, UpstreamStream, box_upstream,
+    RawFrameEnds, ReceiveContext, StreamLabels, StreamWiring, TerminalPolicy, UpstreamStream,
+    box_upstream,
 };
 use super::client::{OpenCodeError, OpenCodeResponse};
 
@@ -56,7 +56,8 @@ pub const RESPONSES_HANDLED_EVENT_TYPES: &[&str] = &[
 /// [`TerminalPolicy::Strict`] a snapshot here, or a `response.output_item.done`,
 /// that carries output text or reasoning summary text when no delta of that
 /// kind has arrived in the stream is an error: the translator would drop
-/// that text.
+/// that text. So is a content part, or a message item's part, that carries
+/// a non-empty `refusal`, which the translator has no output for.
 pub const RESPONSES_HARMLESS_EVENT_TYPES: &[&str] = &[
     "response.queued",
     "response.content_part.added",
@@ -87,7 +88,11 @@ impl DeltasSeen {
             text.and_then(serde_json::Value::as_str)
                 .is_some_and(|text| !text.is_empty())
         };
-        let (carries_text, delivered) = match value.get("type")?.as_str()? {
+        let event_type = value.get("type")?.as_str()?;
+        if carries_refusal(event_type, value) {
+            return Some("refusal_in_snapshot");
+        }
+        let (carries_text, delivered) = match event_type {
             "response.output_text.delta" => {
                 self.output_text |= has_text(value.get("delta"));
                 return None;
@@ -122,6 +127,31 @@ impl DeltasSeen {
             _ => return None,
         };
         (carries_text && !delivered).then_some("snapshot_without_delta")
+    }
+}
+
+/// Whether a snapshot the translator ignores carries a refusal: a
+/// `response.content_part.*` part, or a part of a message
+/// `response.output_item.done`, with a non-empty `refusal`. The translator
+/// has no refusal output, so the refusal would be lost.
+fn carries_refusal(event_type: &str, value: &serde_json::Value) -> bool {
+    let refuses = |part: &serde_json::Value| {
+        part.get("refusal")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|refusal| !refusal.is_empty())
+    };
+    match event_type {
+        "response.content_part.added" | "response.content_part.done" => {
+            value.get("part").is_some_and(refuses)
+        }
+        "response.output_item.done" => value.get("item").is_some_and(|item| {
+            item.get("type").and_then(serde_json::Value::as_str) == Some("message")
+                && item
+                    .get("content")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|parts| parts.iter().any(refuses))
+        }),
+        _ => false,
     }
 }
 
@@ -170,7 +200,8 @@ pub fn accumulate_response(
 /// Under [`TerminalPolicy::Strict`] every frame is checked as the
 /// streaming path checks it before the body is translated: any event after
 /// the completion, `ping` included, is an error, and so is more than
-/// [`POST_TERMINAL_MAX_BYTES`] after the end of the completion's frame.
+/// [`super::chat::POST_TERMINAL_MAX_BYTES`] after the end of the
+/// completion's frame.
 ///
 /// # Errors
 ///
@@ -204,66 +235,161 @@ pub fn accumulate_response_with(
 /// the body is settled there, as on the streaming path, and what follows is
 /// not checked. The accumulator stops at the same point.
 fn check_buffered_frames(upstream: &[u8], labels: &StreamLabels) -> anyhow::Result<()> {
-    let invalid =
-        |kind: &str| anyhow::anyhow!("{} Responses stream is invalid: {kind}", labels.provider);
-    let mut translator = LiveStreamTranslator::new("", "")
-        .with_incomplete_response_policy(IncompleteResponsePolicy::AllowMaxOutputTokens);
-    let mut decoder = SseDecoder::default();
-    let mut frames = FrameScanner::default();
-    let mut deltas = DeltasSeen::default();
-    let mut completed = false;
-    let mut done_seen = false;
-    let mut start = 0;
-    for end in frames
-        .raw_frame_ends(upstream)
-        .ends
-        .into_iter()
-        .chain([upstream.len()])
-    {
-        if end == start {
-            continue;
-        }
-        let events = decoder
-            .push(&upstream[start..end])
-            .map_err(|_| invalid("malformed_sse"))?;
-        start = end;
-        for event in events {
-            let data = event.data.trim();
-            if data == "[DONE]" {
-                if !completed || done_seen {
-                    return Err(invalid("premature_done"));
-                }
-                done_seen = true;
-                continue;
-            }
-            if completed {
-                return Err(invalid("event_after_completion"));
-            }
-            let value: serde_json::Value =
-                serde_json::from_str(data).map_err(|_| invalid("malformed_event"))?;
-            if let Some(kind) = unlisted_frame(&value).or_else(|| deltas.check(&value)) {
-                return Err(invalid(kind));
-            }
-            completed = value
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|event_type| TERMINAL_EVENT_TYPES.contains(&event_type));
-            if completed && upstream.len() - end > POST_TERMINAL_MAX_BYTES {
-                return Err(invalid("post_terminal_limit"));
-            }
-            // An upstream failure is reported by the accumulator, so a
-            // translation error ends the frame check without one of its own.
-            if !completed
-                && translator
-                    .accept(&value, None)
-                    .map_or(true, |_| translator.is_finished())
-            {
-                return Ok(());
-            }
+    let mut observer = StrictResponsesObserver::new(*labels);
+    match observer.push(upstream)? {
+        ObservedChunk::Settled { .. } => Ok(()),
+        ObservedChunk::Reading => observer.finish(),
+    }
+}
+
+/// What [`StrictResponsesObserver::push`] found in one chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservedChunk {
+    /// No frame so far ends the body; keep reading.
+    Reading,
+    /// The body is settled `at` bytes into the chunk, at the end of the
+    /// frame that settled it: the translator closed the message by itself
+    /// (it repaired a `Read` call whose arguments stalled on whitespace), or
+    /// the upstream reported a failure. The upstream is not read again;
+    /// [`accumulate_response_with`] over the body up to there returns the
+    /// repaired message or the failure.
+    Settled {
+        /// Bytes of the chunk that belong to the settled body.
+        at: usize,
+    },
+}
+
+/// The strict frame rules of [`accumulate_response_with`], applied chunk by
+/// chunk while a buffered body is still being read, so that the reader
+/// stops where the streaming path stops instead of waiting for the
+/// upstream to close.
+///
+/// [`Self::push`] fails at the first frame the strict policy rejects: an
+/// SSE frame the decoder cannot read, an event that is not JSON, a `type`
+/// in neither [`RESPONSES_HANDLED_EVENT_TYPES`] nor
+/// [`RESPONSES_HARMLESS_EVENT_TYPES`], a snapshot carrying text no delta
+/// delivered or a refusal, `[DONE]` before the completion or twice, any
+/// other event after the completion, or more than
+/// [`super::chat::POST_TERMINAL_MAX_BYTES`] after the completion's frame.
+/// The error says `<provider> Responses stream is invalid: <kind>` and
+/// carries no upstream text. Under the strict policy
+/// [`accumulate_response_with`] over the bytes read so far fails with the
+/// same error, so a reader may stop reading at the error and let the
+/// accumulator report it. After an error or [`ObservedChunk::Settled`] the
+/// observer is not fed again.
+pub struct StrictResponsesObserver {
+    labels: StreamLabels,
+    translator: LiveStreamTranslator,
+    decoder: SseDecoder,
+    context: ReceiveContext,
+    deltas: DeltasSeen,
+    completed: bool,
+    done_seen: bool,
+}
+
+impl StrictResponsesObserver {
+    /// An observer whose errors name `labels.provider`.
+    pub fn new(labels: StreamLabels) -> Self {
+        Self {
+            labels,
+            translator: LiveStreamTranslator::new("", "")
+                .with_incomplete_response_policy(IncompleteResponsePolicy::AllowMaxOutputTokens),
+            decoder: SseDecoder::default(),
+            context: ReceiveContext::new(StreamWiring {
+                labels,
+                receive: super::chat::ReceivePolicy {
+                    terminal: TerminalPolicy::Strict,
+                    sanitize: None,
+                },
+            }),
+            deltas: DeltasSeen::default(),
+            completed: false,
+            done_seen: false,
         }
     }
-    decoder.finish().map_err(|_| invalid("incomplete_stream"))?;
-    Ok(())
+
+    /// Checks the next chunk of the body, one frame at a time.
+    ///
+    /// # Errors
+    ///
+    /// The first frame the strict policy rejects, as listed on the type.
+    pub fn push(&mut self, chunk: &[u8]) -> anyhow::Result<ObservedChunk> {
+        let RawFrameEnds { continued, ends } = self.context.raw_frame_ends(chunk);
+        if self.completed && self.context.charge_after_terminal(chunk, continued) {
+            return Err(self.invalid("post_terminal_limit"));
+        }
+        let mut start = 0;
+        for end in ends.into_iter().chain([chunk.len()]) {
+            if end == start {
+                continue;
+            }
+            let events = self
+                .decoder
+                .push(&chunk[start..end])
+                .map_err(|_| self.invalid("malformed_sse"))?;
+            start = end;
+            let completed_before = self.completed;
+            for event in events {
+                if self.settles(&event)? {
+                    return Ok(ObservedChunk::Settled { at: end });
+                }
+            }
+            if !completed_before && self.completed && self.context.terminal_frame_ended(chunk, end)
+            {
+                return Err(self.invalid("post_terminal_limit"));
+            }
+        }
+        Ok(ObservedChunk::Reading)
+    }
+
+    /// Ends the body where the upstream closed it.
+    ///
+    /// # Errors
+    ///
+    /// The body ends inside a frame.
+    pub fn finish(&mut self) -> anyhow::Result<()> {
+        self.decoder
+            .finish()
+            .map_err(|_| self.invalid("incomplete_stream"))
+    }
+
+    fn invalid(&self, kind: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "{} Responses stream is invalid: {kind}",
+            self.labels.provider
+        )
+    }
+
+    /// Checks one event; `true` when the body is settled at it.
+    fn settles(&mut self, event: &SseEvent) -> anyhow::Result<bool> {
+        let data = event.data.trim();
+        if data == "[DONE]" {
+            if !self.completed || self.done_seen {
+                return Err(self.invalid("premature_done"));
+            }
+            self.done_seen = true;
+            return Ok(false);
+        }
+        if self.completed {
+            return Err(self.invalid("event_after_completion"));
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(data).map_err(|_| self.invalid("malformed_event"))?;
+        if let Some(kind) = unlisted_frame(&value).or_else(|| self.deltas.check(&value)) {
+            return Err(self.invalid(kind));
+        }
+        self.completed = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|event_type| TERMINAL_EVENT_TYPES.contains(&event_type));
+        // An upstream failure is reported by the accumulator, so a
+        // translation error settles the body without an error of its own.
+        Ok(!self.completed
+            && self
+                .translator
+                .accept(&value, None)
+                .map_or(true, |_| self.translator.is_finished()))
+    }
 }
 
 pub fn stream_body(
@@ -462,6 +588,7 @@ where
                 match self.strict_chunk(&chunk, context, strict) {
                     Ok(output) if self.translator.is_finished() => {
                         self.terminal = true;
+                        self.write_released_events(&output);
                         self.record_progress(&output);
                         self.capture_downstream(&output);
                         self.finish_capture(true, context);
@@ -469,6 +596,7 @@ where
                     }
                     Ok(output) if output.is_empty() => continue,
                     Ok(output) => {
+                        self.write_released_events(&output);
                         self.record_progress(&output);
                         self.capture_downstream(&output);
                         return Some(output);
@@ -535,11 +663,11 @@ where
     }
 
     /// Handles one chunk of a strict stream a frame at a time. The bytes after
-    /// the completion's frame are charged to [`POST_TERMINAL_MAX_BYTES`] by
-    /// position, so a tail counts the same in the completion's chunk as in
-    /// later ones. When the translator closes the message by itself, the
-    /// rest of the chunk is left unread and the output ends with that
-    /// closing.
+    /// the completion's frame are charged to
+    /// [`super::chat::POST_TERMINAL_MAX_BYTES`] by position, so a tail counts
+    /// the same in the completion's chunk as in later ones. When the
+    /// translator closes the message by itself, the rest of the chunk is
+    /// left unread and the output ends with that closing.
     fn strict_chunk(
         &mut self,
         chunk: &[u8],
@@ -619,12 +747,38 @@ where
             self.pending_completion = Some(value);
             return Ok(());
         }
+        // Nothing is written to the traffic capture here: a later frame of
+        // the same chunk can still discard this output, so its downstream
+        // events are written when it is released.
         let translated = self
             .translator
-            .accept(&value, self.traffic.as_deref())
+            .accept(&value, None)
             .map_err(|_| ("translation", "invalid_event"))?;
         output.extend(translated);
         Ok(())
+    }
+
+    /// Writes the downstream event files for output a strict stream
+    /// releases, in the form the translator writes them on the default
+    /// path.
+    fn write_released_events(&self, output: &[u8]) {
+        let Some(traffic) = self.traffic.as_ref() else {
+            return;
+        };
+        let Ok(events) = SseDecoder::default().push(output) else {
+            return;
+        };
+        for event in events {
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&event.data) {
+                traffic.write_json_event(
+                    "050-downstream-event",
+                    &serde_json::json!({
+                        "event": event.event.as_deref().unwrap_or("message"),
+                        "data": data,
+                    }),
+                );
+            }
+        }
     }
 
     /// Translates the held completion once the upstream closed or, for a
@@ -1574,6 +1728,198 @@ mod tests {
                     std::time::Duration::from_millis(3_000),
                     "{case}"
                 );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_rejects_a_snapshot_that_carries_a_refusal() {
+        let message_added = "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_a\"}}\n\n";
+        let tests = [
+            (
+                "content part added",
+                "{\"type\":\"response.content_part.added\",\"output_index\":0,\"part\":{\"type\":\"refusal\",\"refusal\":\"I cannot help\"}}",
+            ),
+            (
+                "content part done",
+                "{\"type\":\"response.content_part.done\",\"output_index\":0,\"part\":{\"type\":\"refusal\",\"refusal\":\"I cannot help\"}}",
+            ),
+            (
+                "message item done",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_a\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"I cannot help\"}]}}",
+            ),
+        ];
+        for (name, snapshot) in tests {
+            let wire = format!("{message_added}data: {snapshot}\n\n{COMPLETION}");
+            let text = body_text(strict_body(futures_util::stream::iter(chunks(&[&wire])))).await;
+            assert!(text.contains(INVALID), "{name}: {text}");
+            assert!(!text.contains("message_stop"), "{name}: {text}");
+            let error = accumulate_response_with(wire.as_bytes(), "msg", "model", &strict_wiring())
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, format!("{INVALID}: refusal_in_snapshot"), "{name}");
+        }
+
+        // A refusal part that is still empty carries nothing to lose.
+        let wire = format!(
+            "{message_added}data: {}\n\n{COMPLETION}",
+            "{\"type\":\"response.content_part.added\",\"output_index\":0,\"part\":{\"type\":\"refusal\",\"refusal\":\"\"}}"
+        );
+        let text = body_text(strict_body(futures_util::stream::iter(chunks(&[&wire])))).await;
+        assert!(text.contains("message_stop"), "{text}");
+        assert!(!text.contains(INVALID), "{text}");
+        assert!(
+            accumulate_response_with(wire.as_bytes(), "msg", "model", &strict_wiring()).is_ok(),
+            "{wire}"
+        );
+    }
+
+    /// The names of the downstream event files a traffic capture wrote
+    /// under `root`, in order, and the text of each.
+    fn synthetic_downstream_event_files(root: &std::path::Path) -> (Vec<String>, Vec<String>) {
+        let mut paths = std::fs::read_dir(root.join("events"))
+            .map(|dir| dir.map(|entry| entry.unwrap().path()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        paths.sort();
+        let mut names = Vec::new();
+        let mut texts = Vec::new();
+        for path in paths {
+            if !path
+                .to_string_lossy()
+                .ends_with("-050-downstream-event.json")
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            names.push(value["event"].as_str().unwrap().to_string());
+            texts.push(text);
+        }
+        (names, texts)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_capture_writes_downstream_events_only_for_released_output() {
+        let head = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_a\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"early\"}\n\n",
+        );
+        let rejected =
+            "data: {\"type\":\"response.refusal.delta\",\"output_index\":0,\"delta\":\"no\"}\n\n";
+        for (case, parts, accepted) in [
+            (
+                "a rejected frame in the same chunk as the delta",
+                vec![format!("{head}{rejected}")],
+                false,
+            ),
+            (
+                "the delta released, then a completion",
+                vec![head.to_string(), COMPLETION.to_string()],
+                true,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("traffic");
+            let parts = parts.iter().map(String::as_str).collect::<Vec<_>>();
+            let body = stream_body_with(
+                futures_util::stream::iter(chunks(&parts)),
+                "msg_strict".into(),
+                "synthetic-model".into(),
+                None,
+                "req".into(),
+                Some(Arc::new(crate::traffic::test_capture(root.clone()))),
+                strict_wiring(),
+            );
+            let text = body_text(body).await;
+            assert_eq!(text.contains("message_stop"), accepted, "{case}: {text}");
+            assert_eq!(text.contains(INVALID), !accepted, "{case}: {text}");
+            assert_eq!(text.contains("early"), accepted, "{case}: {text}");
+            let (names, texts) = synthetic_downstream_event_files(&root);
+            let sent: Vec<String> = events_of(&text)
+                .into_iter()
+                .map(|(name, _)| name.unwrap_or_else(|| "message".to_string()))
+                .collect();
+            // One file per event the client received, nothing for output it
+            // never got.
+            assert_eq!(names, sent, "{case}: {text}");
+            assert_eq!(
+                texts.iter().any(|text| text.contains("early")),
+                accepted,
+                "{case}: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn synthetic_observer_settles_and_fails_where_the_whole_body_check_does_in_any_split() {
+        let repaired_prefix = format!("{READ_CALL_ADDED}{}", synthetic_stalled_read_delta());
+        let repaired = format!("{repaired_prefix}{WHITESPACE_DELTA}");
+        let failed_prefix = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"synthetic failure\"}}}\n\n",
+        );
+        let failed = format!(
+            "{failed_prefix}data: {{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"x\"}}\n\n"
+        );
+        let unlisted = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{}}\n\n",
+            "data: {\"type\":\"response.audio.delta\",\"delta\":\"AA==\"}\n\n",
+            "data: {\"type\":\"response.created\",\"response\":{}}\n\n",
+        );
+        let tests = [
+            (
+                "repaired read",
+                repaired.as_str(),
+                Ok(repaired_prefix.len()),
+            ),
+            ("upstream failure", failed.as_str(), Ok(failed_prefix.len())),
+            (
+                "unlisted event type",
+                unlisted,
+                Err(format!("{INVALID}: unlisted_event_type")),
+            ),
+        ];
+        for (name, wire, expected) in tests {
+            let bytes = wire.as_bytes();
+            for split in 0..=bytes.len() {
+                let mut observer = StrictResponsesObserver::new(strict_wiring().labels);
+                let outcome = match observer.push(&bytes[..split]) {
+                    Ok(ObservedChunk::Settled { at }) => Ok(at),
+                    Ok(ObservedChunk::Reading) => match observer.push(&bytes[split..]) {
+                        Ok(ObservedChunk::Settled { at }) => Ok(split + at),
+                        Ok(ObservedChunk::Reading) => {
+                            panic!("{name}: split at {split} did not settle")
+                        }
+                        Err(error) => Err(error.to_string()),
+                    },
+                    Err(error) => Err(error.to_string()),
+                };
+                assert_eq!(outcome, expected, "{name}: split at {split}");
+            }
+            match expected {
+                Ok(at) => {
+                    // The whole-body check settles too, and the accumulator
+                    // gives the same answer over the body up to where the
+                    // observer settled as over all of it.
+                    assert!(
+                        check_buffered_frames(bytes, &strict_wiring().labels).is_ok(),
+                        "{name}"
+                    );
+                    let prefix =
+                        accumulate_response_with(&bytes[..at], "msg", "model", &strict_wiring());
+                    let whole = accumulate_response_with(bytes, "msg", "model", &strict_wiring());
+                    assert_eq!(
+                        prefix.map_err(|error| error.to_string()),
+                        whole.map_err(|error| error.to_string()),
+                        "{name}"
+                    );
+                }
+                Err(message) => {
+                    let error = check_buffered_frames(bytes, &strict_wiring().labels)
+                        .unwrap_err()
+                        .to_string();
+                    assert_eq!(error, message, "{name}");
+                }
             }
         }
     }
