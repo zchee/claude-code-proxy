@@ -1090,8 +1090,9 @@ where
 }
 
 /// [`stream_body`] whose traffic capture also applies `redact` to every
-/// string of every upstream and downstream event it records, after
-/// [`sanitize_capture`]. `redact` is meant to replace the request's
+/// string of every upstream and downstream event it records, object keys
+/// and the upstream SSE event name included, after [`sanitize_capture`].
+/// `redact` is meant to replace the request's
 /// secrets and leave the rest of the text whole.
 pub fn stream_body_redacted<S, E>(
     upstream: S,
@@ -1269,11 +1270,14 @@ impl<E> VertexStreamState<E> {
             match serde_json::from_str::<Value>(&event.data) {
                 Ok(value) => {
                     let captured = sanitize_capture(&value, &*sanitize);
-                    let captured = match redact.as_ref() {
-                        Some(redact) => redact_every_string(&captured, &**redact),
-                        None => captured,
+                    let (name, captured) = match redact.as_ref() {
+                        Some(redact) => (
+                            event.event.as_deref().map(|name| redact(name)),
+                            redact_every_string(&captured, &**redact),
+                        ),
+                        None => (event.event.clone(), captured),
                     };
-                    capture.upstream_event(event.event.as_deref(), &captured);
+                    capture.upstream_event(name.as_deref(), &captured);
                 }
                 Err(_) => capture.malformed("json", "malformed_event"),
             }
