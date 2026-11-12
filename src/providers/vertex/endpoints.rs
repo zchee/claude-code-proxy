@@ -9,7 +9,8 @@
 //!
 //! The request goes to the endpoint's dedicated host: the configured
 //! `host`, or else the `dedicatedEndpointDns` that `endpoints.get` reports,
-//! read once per endpoint and kept for the life of the process. A shared
+//! read once per endpoint and kept for the life of the process; requests
+//! that arrive while it is being read wait for that one read. A shared
 //! endpoint is refused, because it does not stream (no SSE) and limits a
 //! request to 60 seconds and 1.5 MB, and the upstream is always asked for a
 //! stream. The access token goes only to the configured Vertex base URL or
@@ -21,7 +22,7 @@
 //! writes them and an upstream refusal is returned as it comes.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use bytes::Bytes;
@@ -102,12 +103,23 @@ impl EndpointCall<'_> {
     }
 }
 
-/// The dedicated hosts `endpoints.get` reported, by endpoint name. Only a
-/// successful lookup is kept, so a lookup that failed is tried again by the
-/// next request.
+/// The dedicated hosts `endpoints.get` reported, by endpoint name, and the
+/// lookups in progress. Only a successful lookup is kept, so a lookup that
+/// failed is tried again by the next request.
 #[derive(Debug, Default)]
 pub(super) struct DedicatedHosts {
     hosts: Mutex<HashMap<String, reqwest::Url>>,
+    lookups: Mutex<HashMap<String, Arc<Lookup>>>,
+}
+
+/// One `endpoints.get` that the requests for a name arriving before it ends
+/// share. The request that holds `outcome` with nothing in it reads the
+/// endpoint; the others wait for the lock and take the outcome it leaves,
+/// a failure included. Only these requests wait for each other: the lock
+/// is per name and is released before the inference request is sent.
+#[derive(Debug)]
+struct Lookup {
+    outcome: futures_util::lock::Mutex<Option<Result<reqwest::Url, VertexError>>>,
 }
 
 impl DedicatedHosts {
@@ -115,14 +127,49 @@ impl DedicatedHosts {
         self.hosts.lock().ok()?.get(name).cloned()
     }
 
-    /// Keeps `host` for `name`. Concurrent first requests may each look the
-    /// endpoint up; the first answer kept is the one every later request
-    /// uses.
+    /// Keeps `host` for `name`. A host already kept is the one every later
+    /// request uses.
     fn insert(&self, name: &str, host: reqwest::Url) -> reqwest::Url {
         match self.hosts.lock() {
             Ok(mut hosts) => hosts.entry(name.to_string()).or_insert(host).clone(),
             Err(_) => host,
         }
+    }
+
+    /// The lookup in progress for `name`, or a new one that later requests
+    /// for `name` share until [`Self::finish`] removes it.
+    fn lookup(&self, name: &str) -> Arc<Lookup> {
+        let new = || {
+            Arc::new(Lookup {
+                outcome: futures_util::lock::Mutex::new(None),
+            })
+        };
+        match self.lookups.lock() {
+            Ok(mut lookups) => Arc::clone(lookups.entry(name.to_string()).or_insert_with(new)),
+            Err(_) => new(),
+        }
+    }
+
+    /// Stops sharing `lookup`, which has its outcome: the next request for
+    /// `name` finds the kept host, or after a failure starts a new lookup.
+    fn finish(&self, name: &str, lookup: &Arc<Lookup>) {
+        if let Ok(mut lookups) = self.lookups.lock()
+            && lookups
+                .get(name)
+                .is_some_and(|current| Arc::ptr_eq(current, lookup))
+        {
+            lookups.remove(name);
+        }
+    }
+
+    /// How many requests hold the lookup in progress for `name`.
+    #[cfg(test)]
+    pub(super) fn sharing(&self, name: &str) -> usize {
+        self.lookups
+            .lock()
+            .ok()
+            .and_then(|lookups| lookups.get(name).map(Arc::strong_count))
+            .map_or(0, |count| count - 1)
     }
 }
 
@@ -263,7 +310,10 @@ pub(super) async fn send(
 }
 
 /// The endpoint's dedicated host: the configured `host`, one reported
-/// earlier, or the one `endpoints.get` reports now.
+/// earlier, or the one `endpoints.get` reports now. Requests for one name
+/// that arrive while a lookup runs wait for it and take its outcome; if the
+/// request running it goes away first, the next waiting one reads the
+/// endpoint itself.
 ///
 /// # Errors
 ///
@@ -288,6 +338,36 @@ async fn dedicated_host(
     if let Some(host) = hosts.get(call.name) {
         return Ok(host);
     }
+    let lookup = hosts.lookup(call.name);
+    let mut outcome = lookup.outcome.lock().await;
+    if let Some(result) = outcome.as_ref() {
+        return result.clone();
+    }
+    // A lookup that ended between the check above and taking this one
+    // has already kept the host.
+    let result = match hosts.get(call.name) {
+        Some(host) => Ok(host),
+        None => read_dedicated_host(client, vertex, call, credentials, traffic)
+            .await
+            .map(|host| hosts.insert(call.name, host)),
+    };
+    *outcome = Some(result.clone());
+    hosts.finish(call.name, &lookup);
+    result
+}
+
+/// Reads the endpoint with `endpoints.get` and takes its dedicated host.
+///
+/// # Errors
+///
+/// As for [`dedicated_host`].
+async fn read_dedicated_host(
+    client: &VertexClient,
+    vertex: &ResolvedVertexConfig,
+    call: &EndpointCall<'_>,
+    credentials: &VertexCredentials,
+    traffic: Option<&TrafficCapture>,
+) -> Result<reqwest::Url, VertexError> {
     let (target, url) = lookup_url(vertex, call)?;
     let (metadata, token) = client
         .get_json_and_token(
@@ -315,8 +395,7 @@ async fn dedicated_host(
             ),
         );
     }
-    let host = host_from_metadata(&metadata, call)?;
-    Ok(hosts.insert(call.name, host))
+    host_from_metadata(&metadata, call)
 }
 
 /// Reads `dedicatedEndpointEnabled` and `dedicatedEndpointDns` from an

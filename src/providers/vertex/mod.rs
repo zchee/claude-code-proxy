@@ -1589,13 +1589,42 @@ mod tests {
         }
     }
 
-    /// Starts a [`SyntheticLookups`]. A GET answers `metadata` as it is,
-    /// except that a `metadata` without `dedicatedEndpointDns` gets one
-    /// pointing back at the server; every POST answers `sse`.
+    /// What a [`SyntheticLookups`] answers.
+    struct SyntheticLookupScript {
+        /// The GET answer, as it is, except that one without
+        /// `dedicatedEndpointDns` gets one pointing back at the server.
+        metadata: Value,
+        /// Every POST's answer.
+        sse: String,
+        /// The first this many GETs, of any path, answer 503.
+        failures: usize,
+        /// A GET whose path ends with the text waits until the lock is free
+        /// before it answers. It is recorded before it waits.
+        gate: Option<(&'static str, Arc<futures_util::lock::Mutex<()>>)>,
+    }
+
+    /// Starts a [`SyntheticLookups`] that answers every GET with `metadata`
+    /// and every POST with `sse` ([`SyntheticLookupScript`]).
     async fn synthetic_lookup_server(metadata: Value, sse: String) -> SyntheticLookups {
+        synthetic_scripted_lookup_server(SyntheticLookupScript {
+            metadata,
+            sse,
+            failures: 0,
+            gate: None,
+        })
+        .await
+    }
+
+    /// Starts a [`SyntheticLookups`] that answers as `script` says.
+    async fn synthetic_scripted_lookup_server(script: SyntheticLookupScript) -> SyntheticLookups {
+        let SyntheticLookupScript {
+            mut metadata,
+            sse,
+            failures,
+            gate,
+        } = script;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let mut metadata = metadata;
         if metadata.get("dedicatedEndpointDns").is_none() {
             metadata["dedicatedEndpointDns"] = json!(base);
         }
@@ -1606,12 +1635,29 @@ mod tests {
             axum::routing::get(move |uri: http::Uri| {
                 let metadata = metadata.clone();
                 let recorded = Arc::clone(&recorded);
+                let gate = gate.clone();
                 async move {
-                    recorded
-                        .lock()
-                        .expect("GET record")
-                        .push(uri.path().to_string());
-                    axum::Json(metadata)
+                    let path = uri.path().to_string();
+                    let nth = {
+                        let mut recorded = recorded.lock().expect("GET record");
+                        recorded.push(path.clone());
+                        recorded.len()
+                    };
+                    if let Some((suffix, gate)) = gate
+                        && path.ends_with(suffix)
+                    {
+                        drop(gate.lock().await);
+                    }
+                    if nth <= failures {
+                        let unavailable = json!({"error": {
+                            "code": 503,
+                            "message": "The service is currently unavailable.",
+                            "status": "UNAVAILABLE"
+                        }});
+                        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(unavailable))
+                            .into_response();
+                    }
+                    axum::Json(metadata).into_response()
                 }
             })
             .post(move || {
@@ -1754,6 +1800,165 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A complete Chat Completions stream that says `Hello`.
+    fn synthetic_hello_sse() -> String {
+        format!(
+            "{}data: [DONE]\n\n",
+            synthetic_sse(&[
+                json!({"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"}}]}),
+                json!({"object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+                json!({"object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}),
+            ])
+        )
+    }
+
+    /// Sends a non-streaming request for `model` and returns the status and
+    /// the body as JSON.
+    async fn synthetic_ask(provider: &VertexProvider, model: &str) -> (StatusCode, Value) {
+        let response = provider
+            .handle_messages(synthetic_endpoint_request(model), synthetic_context())
+            .await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Generous enough for a slow machine; it only turns a hang into a
+    /// failure.
+    const SYNTHETIC_WATCHDOG: Duration = Duration::from_secs(60);
+
+    #[tokio::test]
+    async fn deployed_endpoint_lookup_synthetic_concurrent_first_requests_share_one_get() {
+        let gate = Arc::new(futures_util::lock::Mutex::new(()));
+        let server = synthetic_scripted_lookup_server(SyntheticLookupScript {
+            metadata: json!({"dedicatedEndpointEnabled": true}),
+            sse: synthetic_hello_sse(),
+            failures: 0,
+            gate: Some((SYNTHETIC_LOOKUP_PATH, Arc::clone(&gate))),
+        })
+        .await;
+        let provider = synthetic_endpoint_provider(&server.base, SYNTHETIC_ENDPOINT_CONFIG);
+        let hosts = &provider.ready().unwrap().dedicated_hosts;
+        let held = gate.try_lock().expect("a new lock is free");
+        // Opens the gate only once the first GET is held at the stand-in and
+        // both requests hold the lookup, so the second cannot have found a
+        // kept host instead.
+        let opener = async {
+            while server.gets().is_empty() || hosts.sharing("my-llm") < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let gets_while_held = server.gets();
+            drop(held);
+            gets_while_held
+        };
+        let ((first, second), gets_while_held) = tokio::time::timeout(
+            SYNTHETIC_WATCHDOG,
+            futures_util::future::join(
+                futures_util::future::join(
+                    synthetic_ask(&provider, "vertex/endpoint/my-llm"),
+                    synthetic_ask(&provider, "vertex/endpoint/my-llm"),
+                ),
+                opener,
+            ),
+        )
+        .await
+        .expect("both requests answer once the lookup ends");
+        assert_eq!(gets_while_held, [SYNTHETIC_LOOKUP_PATH]);
+        for (status, body) in [first, second] {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["content"][0]["text"], "Hello", "{body}");
+        }
+        assert_eq!(server.gets(), [SYNTHETIC_LOOKUP_PATH]);
+        assert_eq!(hosts.sharing("my-llm"), 0);
+    }
+
+    #[tokio::test]
+    async fn deployed_endpoint_lookup_synthetic_a_failed_lookup_is_not_kept() {
+        let server = synthetic_scripted_lookup_server(SyntheticLookupScript {
+            metadata: json!({"dedicatedEndpointEnabled": true}),
+            sse: synthetic_hello_sse(),
+            failures: 1,
+            gate: None,
+        })
+        .await;
+        let provider = synthetic_endpoint_provider(&server.base, SYNTHETIC_ENDPOINT_CONFIG);
+        let (status, body) = tokio::time::timeout(
+            SYNTHETIC_WATCHDOG,
+            synthetic_ask(&provider, "vertex/endpoint/my-llm"),
+        )
+        .await
+        .expect("the failed lookup answers");
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["error"]["type"], "api_error", "{body}");
+        assert_eq!(
+            body["error"]["message"],
+            "UNAVAILABLE: The service is currently unavailable. (Vertex AI endpoint \
+             1234567890123456789 in project synthetic-project, location us-central1 \
+             (vertex.endpoints.my-llm in config.json)) (upstream HTTP 503)"
+        );
+        assert_eq!(server.gets(), [SYNTHETIC_LOOKUP_PATH]);
+
+        let (status, body) = tokio::time::timeout(
+            SYNTHETIC_WATCHDOG,
+            synthetic_ask(&provider, "vertex/endpoint/my-llm"),
+        )
+        .await
+        .expect("the second lookup answers");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["content"][0]["text"], "Hello", "{body}");
+        assert_eq!(
+            server.gets(),
+            [SYNTHETIC_LOOKUP_PATH, SYNTHETIC_LOOKUP_PATH]
+        );
+    }
+
+    #[tokio::test]
+    async fn deployed_endpoint_lookup_synthetic_different_names_do_not_wait_for_each_other() {
+        let other_path =
+            "/v1/projects/synthetic-project/locations/us-central1/endpoints/2222222222222222222";
+        let gate = Arc::new(futures_util::lock::Mutex::new(()));
+        let server = synthetic_scripted_lookup_server(SyntheticLookupScript {
+            metadata: json!({"dedicatedEndpointEnabled": true}),
+            sse: synthetic_hello_sse(),
+            failures: 0,
+            gate: Some((SYNTHETIC_LOOKUP_PATH, Arc::clone(&gate))),
+        })
+        .await;
+        let provider = synthetic_endpoint_provider(
+            &server.base,
+            r#"{"vertex":{"endpoints":{
+                "my-llm":{"endpoint":"1234567890123456789","location":"us-central1","model":"gemma-2-9b-it"},
+                "other-llm":{"endpoint":"2222222222222222222","location":"us-central1","model":"gemma-2-9b-it"}
+            }}}"#,
+        );
+        let held = gate.try_lock().expect("a new lock is free");
+        // The other name's request runs to its answer while the first
+        // name's GET is held; a lock shared across names would hang here.
+        let other = async {
+            while server.gets().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let answer = synthetic_ask(&provider, "vertex/endpoint/other-llm").await;
+            let gets_while_held = server.gets();
+            drop(held);
+            (answer, gets_while_held)
+        };
+        let (first, (other, gets_while_held)) = tokio::time::timeout(
+            SYNTHETIC_WATCHDOG,
+            futures_util::future::join(synthetic_ask(&provider, "vertex/endpoint/my-llm"), other),
+        )
+        .await
+        .expect("both names answer");
+        assert_eq!(gets_while_held, [SYNTHETIC_LOOKUP_PATH, other_path]);
+        for (status, body) in [first, other] {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["content"][0]["text"], "Hello", "{body}");
+        }
+        assert_eq!(server.gets(), [SYNTHETIC_LOOKUP_PATH, other_path]);
     }
 
     #[test]
