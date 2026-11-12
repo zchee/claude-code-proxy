@@ -12,7 +12,8 @@ use crate::providers::grok::translate::stream::SseDecoder;
 use crate::traffic::{StreamTrafficCapture, TrafficCapture};
 
 use super::chat::{
-    RawFrameEnds, ReceiveContext, StreamLabels, StreamWiring, UpstreamStream, box_upstream,
+    RawFrameEnds, ReceiveContext, RedactedWiring, StreamLabels, StreamWiring, UpstreamStream,
+    box_upstream,
 };
 use super::client::{OpenCodeError, OpenCodeResponse};
 
@@ -72,7 +73,28 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: Send + 'static,
 {
-    let stream = wired_stream(upstream, monitor, req_id, traffic, wiring);
+    wired_body(wired_stream(upstream, monitor, req_id, traffic, wiring))
+}
+
+/// [`stream_body_with`] for a strict stream whose traffic capture applies
+/// [`RedactedWiring::redact`] to every string of every event it records.
+pub fn stream_body_redacted<S, E>(
+    upstream: S,
+    monitor: Option<MonitorHandle>,
+    req_id: String,
+    traffic: Option<Arc<TrafficCapture>>,
+    wiring: RedactedWiring,
+) -> Body
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Send + 'static,
+{
+    let mut stream = wired_stream(upstream, monitor, req_id, traffic, wiring.wiring.clone());
+    stream.context = ReceiveContext::redacted(wiring);
+    wired_body(stream)
+}
+
+fn wired_body(stream: WiredMessagesStream) -> Body {
     let stream = futures_util::stream::unfold(stream, |mut stream| async move {
         stream
             .state
@@ -326,10 +348,8 @@ where
                 let value: serde_json::Value =
                     serde_json::from_str(&event.data).map_err(|_| ("json", "malformed_event"))?;
                 if let Some(capture) = self.stream_capture.as_mut() {
-                    capture.upstream_event(
-                        event.event.as_deref(),
-                        &context.wiring.receive.upstream_value(&value),
-                    );
+                    capture
+                        .upstream_event(event.event.as_deref(), &context.captured_upstream(&value));
                 }
                 let kind = value.get("type").and_then(serde_json::Value::as_str);
                 if event.event.as_deref() == Some("error") || kind == Some("error") {
@@ -394,7 +414,7 @@ where
             if let Some(capture) = self.stream_capture.as_mut() {
                 capture.downstream_event(
                     event.event.as_deref().unwrap_or("message"),
-                    context.wiring.receive.upstream_value(&value).into_owned(),
+                    context.captured_upstream(&value).into_owned(),
                 );
             }
         }
@@ -416,10 +436,7 @@ where
             self.stream_capture.as_mut(),
             serde_json::from_str::<serde_json::Value>(&event.data),
         ) {
-            capture.upstream_event(
-                event.event.as_deref(),
-                &context.wiring.receive.upstream_value(&value),
-            );
+            capture.upstream_event(event.event.as_deref(), &context.captured_upstream(&value));
         }
     }
 
@@ -1117,5 +1134,70 @@ mod tests {
         // the 1 MiB frame limit in the last of them, and nothing more was
         // read.
         assert_eq!(pulled.load(std::sync::atomic::Ordering::SeqCst), 18);
+    }
+
+    /// The texts of every file a traffic capture wrote under `root`.
+    fn synthetic_capture_texts(root: &std::path::Path) -> Vec<String> {
+        let mut texts = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    texts.push(std::fs::read_to_string(&path).unwrap());
+                }
+            }
+        }
+        texts
+    }
+
+    const SYNTHETIC_SECRET: &str = "synthetic-secret-0123";
+
+    fn synthetic_redactor() -> RedactedWiring {
+        RedactedWiring {
+            wiring: synthetic_strict_wiring(),
+            redact: Arc::new(|text: &str| text.replace(SYNTHETIC_SECRET, "[gone]")),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_redacted_capture_keeps_the_secret_out_of_every_file() {
+        let wire = MESSAGE.replace(
+            "\"text\":\"hi\"",
+            &format!("\"text\":\"echo {SYNTHETIC_SECRET}\""),
+        );
+        assert!(wire.contains(SYNTHETIC_SECRET));
+        for redacted in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("traffic");
+            let traffic = Some(Arc::new(crate::traffic::test_capture(root.clone())));
+            let upstream = futures_util::stream::iter(chunks(&[&wire]));
+            let body = if redacted {
+                stream_body_redacted(upstream, None, "req".into(), traffic, synthetic_redactor())
+            } else {
+                stream_body_with(
+                    upstream,
+                    None,
+                    "req".into(),
+                    traffic,
+                    synthetic_strict_wiring(),
+                )
+            };
+            // The client gets the bytes the upstream sent.
+            assert_eq!(body_text(body).await, wire);
+            let texts = synthetic_capture_texts(&root);
+            assert_eq!(
+                texts.iter().any(|text| text.contains(SYNTHETIC_SECRET)),
+                !redacted,
+                "redacted {redacted}: {texts:?}"
+            );
+            assert_eq!(
+                texts.iter().any(|text| text.contains("echo [gone]")),
+                redacted,
+                "redacted {redacted}: {texts:?}"
+            );
+        }
     }
 }

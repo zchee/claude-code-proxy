@@ -136,6 +136,40 @@ impl ReceivePolicy {
     }
 }
 
+/// [`StreamWiring`] for a strict stream whose traffic capture must not keep
+/// given secrets anywhere, in any field.
+#[derive(Clone)]
+pub struct RedactedWiring {
+    /// Labels and receive policy. `redact` is applied only when the
+    /// receive policy is [`TerminalPolicy::Strict`].
+    pub wiring: StreamWiring,
+    /// Applied to every string of every event a traffic capture records,
+    /// upstream and downstream, after [`ReceivePolicy::sanitize`]. It is
+    /// meant to replace secrets and leave the rest of the text whole.
+    pub redact: Sanitizer,
+}
+
+/// A copy of `value` with every string, at any depth, passed through
+/// `redact`. Object keys are kept as they are.
+pub fn redact_every_string(value: &Value, redact: &dyn Fn(&str) -> String) -> Value {
+    match value {
+        Value::String(text) => Value::String(redact(text)),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| redact_every_string(item, redact))
+                .collect(),
+        ),
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, item)| (key.clone(), redact_every_string(item, redact)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// A copy of `value` with every string under a `message` key, at any depth,
 /// passed through `sanitize`: the cleaning [`ReceivePolicy::sanitize`]
 /// applies to an upstream event before it is captured. Other strings are
@@ -202,6 +236,8 @@ pub(super) struct ReceiveContext {
     /// The terminal frame ended at the CR of a CRLF that was the last byte
     /// of its chunk, so the LF may still arrive as the next byte.
     terminal_lf_pending: bool,
+    /// [`RedactedWiring::redact`], for a strict stream that has one.
+    redact: Option<Sanitizer>,
 }
 
 impl ReceiveContext {
@@ -212,6 +248,42 @@ impl ReceiveContext {
             post_terminal_bytes: 0,
             frames: FrameScanner::default(),
             terminal_lf_pending: false,
+            redact: None,
+        }
+    }
+
+    /// A context whose captures also go through `wiring.redact`.
+    pub(super) fn redacted(wiring: RedactedWiring) -> Self {
+        Self {
+            redact: Some(wiring.redact),
+            ..Self::new(wiring.wiring)
+        }
+    }
+
+    /// Whether captures go through a redactor: a strict stream that has
+    /// one.
+    pub(super) fn redacts(&self) -> bool {
+        self.is_strict() && self.redact.is_some()
+    }
+
+    /// An upstream event as a traffic capture records it:
+    /// [`ReceivePolicy::sanitize`] on its `message` strings, then, for a
+    /// strict stream with a redactor, the redactor on every string.
+    pub(super) fn captured_upstream<'a>(&self, value: &'a Value) -> Cow<'a, Value> {
+        let value = self.wiring.receive.upstream_value(value);
+        match self.redact.as_ref() {
+            Some(redact) if self.redacts() => Cow::Owned(redact_every_string(&value, &**redact)),
+            _ => value,
+        }
+    }
+
+    /// A downstream event as a traffic capture records it: unchanged, or,
+    /// for a strict stream with a redactor, with the redactor on every
+    /// string.
+    pub(super) fn captured_downstream(&self, value: Value) -> Value {
+        match self.redact.as_ref() {
+            Some(redact) if self.redacts() => redact_every_string(&value, &**redact),
+            _ => value,
         }
     }
 
@@ -1742,6 +1814,38 @@ where
     let stream = wired_stream(
         upstream, message_id, model, monitor, req_id, traffic, wiring,
     );
+    wired_body(stream)
+}
+
+/// [`stream_body_with`] for a strict stream whose traffic capture applies
+/// [`RedactedWiring::redact`] to every string of every event it records.
+pub fn stream_body_redacted<S, E>(
+    upstream: S,
+    message_id: String,
+    model: String,
+    monitor: Option<MonitorHandle>,
+    req_id: String,
+    traffic: Option<Arc<TrafficCapture>>,
+    wiring: RedactedWiring,
+) -> Body
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Send + 'static,
+{
+    let mut stream = wired_stream(
+        upstream,
+        message_id,
+        model,
+        monitor,
+        req_id,
+        traffic,
+        wiring.wiring.clone(),
+    );
+    stream.context = ReceiveContext::redacted(wiring);
+    wired_body(stream)
+}
+
+fn wired_body(stream: WiredChatStream) -> Body {
     let stream = futures_util::stream::unfold(stream, |mut stream| async move {
         stream
             .state
@@ -1867,7 +1971,7 @@ where
                         return Some(self.fail_at("capture", "incomplete_stream", context));
                     }
                     self.terminal = true;
-                    self.capture_downstream(&output);
+                    self.capture_downstream(&output, context);
                     self.finish_capture(true, context);
                     return (!output.is_empty()).then_some(output);
                 }
@@ -1893,7 +1997,7 @@ where
             };
             if !output.is_empty() {
                 self.report_progress(&output);
-                self.capture_downstream(&output);
+                self.capture_downstream(&output, context);
             }
             if self.translator.is_finished() {
                 if self.translator.finish().is_err() || self.capture_decoder.finish().is_err() {
@@ -1963,7 +2067,7 @@ where
         self.terminal = true;
         if !output.is_empty() {
             self.report_progress(&output);
-            self.capture_downstream(&output);
+            self.capture_downstream(&output, context);
         }
         self.finish_capture(true, context);
         output
@@ -1997,10 +2101,10 @@ where
         };
         for event in events {
             match serde_json::from_str(&event.data) {
-                Ok(value) => capture.upstream_event(
-                    event.event.as_deref(),
-                    &context.wiring.receive.upstream_value(&value),
-                ),
+                Ok(value) => {
+                    capture
+                        .upstream_event(event.event.as_deref(), &context.captured_upstream(&value));
+                }
                 Err(_) if event.data.trim() == "[DONE]" => {
                     capture.upstream_event(event.event.as_deref(), &json!("[DONE]"));
                 }
@@ -2009,13 +2113,16 @@ where
         }
     }
 
-    fn capture_downstream(&mut self, bytes: &[u8]) {
+    fn capture_downstream(&mut self, bytes: &[u8], context: &ReceiveContext) {
         let Some(capture) = self.stream_capture.as_mut() else {
             return;
         };
         for event in parse_sse_events(bytes) {
             if let Ok(value) = serde_json::from_str(&event.data) {
-                capture.downstream_event(event.event.as_deref().unwrap_or("message"), value);
+                capture.downstream_event(
+                    event.event.as_deref().unwrap_or("message"),
+                    context.captured_downstream(value),
+                );
             }
         }
     }
@@ -2026,7 +2133,7 @@ where
         if let Some(capture) = self.stream_capture.as_mut() {
             capture.malformed(stage, kind);
         }
-        self.capture_downstream(&output);
+        self.capture_downstream(&output, context);
         self.finish_capture(false, context);
         output
     }
@@ -3388,6 +3495,80 @@ mod tests {
                     "{case}"
                 );
             }
+        }
+    }
+
+    /// The texts of every file a traffic capture wrote under `root`.
+    fn synthetic_capture_texts(root: &std::path::Path) -> Vec<String> {
+        let mut texts = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    texts.push(std::fs::read_to_string(&path).unwrap());
+                }
+            }
+        }
+        texts
+    }
+
+    const SYNTHETIC_SECRET: &str = "synthetic-secret-0123";
+
+    fn synthetic_redactor() -> RedactedWiring {
+        RedactedWiring {
+            wiring: strict_wiring(),
+            redact: Arc::new(|text: &str| text.replace(SYNTHETIC_SECRET, "[gone]")),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_redacted_capture_keeps_the_secret_out_of_every_file() {
+        let wire = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"echo {SYNTHETIC_SECRET}\"}}}}]}}\n\ndata: {{\"choices\":[{{\"finish_reason\":\"stop\"}}],\"param\":\"{SYNTHETIC_SECRET}\"}}\n\ndata: [DONE]\n\n"
+        );
+        for redacted in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("traffic");
+            let traffic = Some(Arc::new(crate::traffic::test_capture(root.clone())));
+            let upstream = futures_util::stream::iter(chunks(&[&wire]));
+            let body = if redacted {
+                stream_body_redacted(
+                    upstream,
+                    "msg_strict".into(),
+                    "synthetic-model".into(),
+                    None,
+                    "req".into(),
+                    traffic,
+                    synthetic_redactor(),
+                )
+            } else {
+                stream_body_with(
+                    upstream,
+                    "msg_strict".into(),
+                    "synthetic-model".into(),
+                    None,
+                    "req".into(),
+                    traffic,
+                    strict_wiring(),
+                )
+            };
+            let text = body_text(body).await;
+            // The client gets the model's text as it was.
+            assert!(text.contains(SYNTHETIC_SECRET), "{text}");
+            let texts = synthetic_capture_texts(&root);
+            assert_eq!(
+                texts.iter().any(|text| text.contains(SYNTHETIC_SECRET)),
+                !redacted,
+                "redacted {redacted}: {texts:?}"
+            );
+            assert_eq!(
+                texts.iter().any(|text| text.contains("echo [gone]")),
+                redacted,
+                "redacted {redacted}: {texts:?}"
+            );
         }
     }
 }

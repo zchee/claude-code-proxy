@@ -16,8 +16,8 @@ use crate::providers::grok::translate::stream::SseDecoder;
 use crate::traffic::{StreamTrafficCapture, TrafficCapture};
 
 use super::chat::{
-    RawFrameEnds, ReceiveContext, StreamLabels, StreamWiring, TerminalPolicy, UpstreamStream,
-    box_upstream,
+    RawFrameEnds, ReceiveContext, RedactedWiring, StreamLabels, StreamWiring, TerminalPolicy,
+    UpstreamStream, box_upstream,
 };
 use super::client::{OpenCodeError, OpenCodeResponse};
 
@@ -443,6 +443,39 @@ where
     let stream = wired_stream(
         upstream, message_id, model, monitor, req_id, traffic, wiring,
     );
+    wired_body(stream)
+}
+
+/// [`stream_body_with`] for a strict stream whose traffic capture applies
+/// [`RedactedWiring::redact`] to every string of every event it records,
+/// the downstream event files included.
+pub fn stream_body_redacted<S, E>(
+    upstream: S,
+    message_id: String,
+    model: String,
+    monitor: Option<MonitorHandle>,
+    req_id: String,
+    traffic: Option<Arc<TrafficCapture>>,
+    wiring: RedactedWiring,
+) -> Body
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Send + 'static,
+{
+    let mut stream = wired_stream(
+        upstream,
+        message_id,
+        model,
+        monitor,
+        req_id,
+        traffic,
+        wiring.wiring.clone(),
+    );
+    stream.context = ReceiveContext::redacted(wiring);
+    wired_body(stream)
+}
+
+fn wired_body(stream: WiredResponsesStream) -> Body {
     let stream = futures_util::stream::unfold(stream, |mut stream| async move {
         let output = stream
             .state
@@ -588,17 +621,17 @@ where
                 match self.strict_chunk(&chunk, context, strict) {
                     Ok(output) if self.translator.is_finished() => {
                         self.terminal = true;
-                        self.write_released_events(&output);
+                        self.write_released_events(&output, context);
                         self.record_progress(&output);
-                        self.capture_downstream(&output);
+                        self.capture_downstream(&output, context);
                         self.finish_capture(true, context);
                         return Some(output);
                     }
                     Ok(output) if output.is_empty() => continue,
                     Ok(output) => {
-                        self.write_released_events(&output);
+                        self.write_released_events(&output, context);
                         self.record_progress(&output);
-                        self.capture_downstream(&output);
+                        self.capture_downstream(&output, context);
                         return Some(output);
                     }
                     Err((stage, kind)) => return Some(self.fail_at(stage, kind, context)),
@@ -656,7 +689,7 @@ where
             }
             if !output.is_empty() {
                 self.record_progress(&output);
-                self.capture_downstream(&output);
+                self.capture_downstream(&output, context);
                 return Some(output);
             }
         }
@@ -731,10 +764,7 @@ where
         let value: serde_json::Value =
             serde_json::from_str(data).map_err(|_| ("json", "malformed_event"))?;
         if let Some(capture) = self.stream_capture.as_mut() {
-            capture.upstream_event(
-                event.event.as_deref(),
-                &context.wiring.receive.upstream_value(&value),
-            );
+            capture.upstream_event(event.event.as_deref(), &context.captured_upstream(&value));
         }
         if self.pending_completion.is_some() {
             return Err(("protocol", "event_after_completion"));
@@ -761,7 +791,7 @@ where
     /// Writes the downstream event files for output a strict stream
     /// releases, in the form the translator writes them on the default
     /// path.
-    fn write_released_events(&self, output: &[u8]) {
+    fn write_released_events(&self, output: &[u8], context: &ReceiveContext) {
         let Some(traffic) = self.traffic.as_ref() else {
             return;
         };
@@ -774,7 +804,7 @@ where
                     "050-downstream-event",
                     &serde_json::json!({
                         "event": event.event.as_deref().unwrap_or("message"),
-                        "data": data,
+                        "data": context.captured_downstream(data),
                     }),
                 );
             }
@@ -787,13 +817,23 @@ where
         let Some(completion) = self.pending_completion.take() else {
             return Some(self.fail_at("decoder", "incomplete_stream", context));
         };
-        let output = match self.translator.accept(&completion, self.traffic.as_deref()) {
+        // With a redactor the translator writes no event file; the files
+        // are written here, redacted.
+        let traffic = if context.redacts() {
+            None
+        } else {
+            self.traffic.as_deref()
+        };
+        let output = match self.translator.accept(&completion, traffic) {
             Ok(output) => output,
             Err(_) => return Some(self.fail_at("translation", "invalid_event", context)),
         };
+        if context.redacts() {
+            self.write_released_events(&output, context);
+        }
         self.terminal = true;
         self.record_progress(&output);
-        self.capture_downstream(&output);
+        self.capture_downstream(&output, context);
         self.finish_capture(true, context);
         (!output.is_empty()).then_some(output)
     }
@@ -834,12 +874,12 @@ where
             "api_error",
             self.traffic.as_deref(),
         );
-        self.capture_downstream(&output);
+        self.capture_downstream(&output, context);
         self.finish_capture(false, context);
         output
     }
 
-    fn capture_downstream(&mut self, bytes: &[u8]) {
+    fn capture_downstream(&mut self, bytes: &[u8], context: &ReceiveContext) {
         let Some(capture) = self.stream_capture.as_mut() else {
             return;
         };
@@ -847,7 +887,10 @@ where
         if let Ok(events) = decoder.push(bytes) {
             for event in events {
                 if let Ok(value) = serde_json::from_str(&event.data) {
-                    capture.downstream_event(event.event.as_deref().unwrap_or("message"), value);
+                    capture.downstream_event(
+                        event.event.as_deref().unwrap_or("message"),
+                        context.captured_downstream(value),
+                    );
                 }
             }
         }
@@ -1923,6 +1966,86 @@ mod tests {
                     assert_eq!(error, message, "{name}");
                 }
             }
+        }
+    }
+
+    /// The texts of every file a traffic capture wrote under `root`.
+    fn synthetic_capture_texts(root: &std::path::Path) -> Vec<String> {
+        let mut texts = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    texts.push(std::fs::read_to_string(&path).unwrap());
+                }
+            }
+        }
+        texts
+    }
+
+    const SYNTHETIC_SECRET: &str = "synthetic-secret-0123";
+
+    fn synthetic_redactor() -> RedactedWiring {
+        RedactedWiring {
+            wiring: strict_wiring(),
+            redact: Arc::new(|text: &str| text.replace(SYNTHETIC_SECRET, "[gone]")),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_redacted_capture_keeps_the_secret_out_of_every_file() {
+        let wire = format!(
+            "{}data: {{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"echo {SYNTHETIC_SECRET}\"}}\n\n{}",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_a\"}}\n\n",
+            COMPLETION,
+        );
+        for redacted in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("traffic");
+            let traffic = Some(Arc::new(crate::traffic::test_capture(root.clone())));
+            let upstream = futures_util::stream::iter(chunks(&[&wire]));
+            let body = if redacted {
+                stream_body_redacted(
+                    upstream,
+                    "msg_strict".into(),
+                    "synthetic-model".into(),
+                    None,
+                    "req".into(),
+                    traffic,
+                    synthetic_redactor(),
+                )
+            } else {
+                stream_body_with(
+                    upstream,
+                    "msg_strict".into(),
+                    "synthetic-model".into(),
+                    None,
+                    "req".into(),
+                    traffic,
+                    strict_wiring(),
+                )
+            };
+            let text = body_text(body).await;
+            assert!(text.contains(SYNTHETIC_SECRET), "{text}");
+            assert!(text.contains("message_stop"), "{text}");
+            let texts = synthetic_capture_texts(&root);
+            assert_eq!(
+                texts.iter().any(|text| text.contains(SYNTHETIC_SECRET)),
+                !redacted,
+                "redacted {redacted}: {texts:?}"
+            );
+            assert_eq!(
+                texts.iter().any(|text| text.contains("echo [gone]")),
+                redacted,
+                "redacted {redacted}: {texts:?}"
+            );
+            // Upstream and downstream event files, the translator's included.
+            let (names, _) = synthetic_downstream_event_files(&root);
+            let sent = events_of(&text).len();
+            assert_eq!(names.len(), 2 * sent, "redacted {redacted}: {names:?}");
         }
     }
 }
