@@ -93,7 +93,7 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 - For Gemini, tool schemas are sent unchanged; a schema Gemini rejects fails the request with HTTP 400. Anthropic server tools, Gemini's built-in tools, structured output, document blocks, and image URLs are not supported.
 - Claude requests are passed through. Only `anthropic-beta` values on the list Claude Code uses for Vertex AI are sent, others are dropped without an error, and thinking blocks from other providers are removed. Features Vertex AI does not accept are not checked; the upstream error is returned.
 - Grok, OpenAI, Muse, Mistral, and the managed open models do not carry reasoning across turns, and their streams end with an error on any event the proxy does not recognise. Grok, OpenAI, and Muse refuse the hosted web search tool with HTTP 400.
-- Among the managed open models, only gpt-oss takes Claude Code's effort and only GLM and Gemma its thinking setting. gpt-oss refuses a forced tool choice with HTTP 400.
+- Among the managed open models, only gpt-oss takes Claude Code's effort as a level, and only GLM and Gemma take a thinking switch: their thinking setting, or without one, whether an effort is set. gpt-oss refuses a forced tool choice with HTTP 400.
 - Requests are not retried and there is no model fallback.
 
 ## Cursor Agent

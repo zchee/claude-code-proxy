@@ -40,7 +40,8 @@ description: Release notes for claude-code-proxy.
   `vertex/deepseek-ai/deepseek-v4.1-flash-maas`, through Vertex AI's OpenAI
   Chat Completions endpoint. gpt-oss takes Claude Code's effort and refuses a
   forced tool choice with HTTP 400; GLM and Gemma think only when Claude Code
-  turns thinking on. The Llama 4 models use `us-east5` unless a location
+  turns thinking on, or when a request without a thinking setting, such as one
+  on the OpenAI-compatible routes, sets a reasoning effort. The Llama 4 models use `us-east5` unless a location
   override names the model. Reasoning does not carry across turns.
   See the [Vertex AI provider page](https://claude-code-proxy.raine.dev/providers/vertex/#managed-open-models).
 

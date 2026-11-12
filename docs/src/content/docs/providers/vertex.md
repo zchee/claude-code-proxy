@@ -603,6 +603,8 @@ Google documents function calling for `mistral-medium-3`. The proxy sends tools 
 
 A `finish_reason` completes the message, with or without `data: [DONE]`. After it the proxy reads until Vertex AI closes the stream or 2 seconds pass, and a late `[DONE]` starts the 2 seconds again. Content after `finish_reason` and any event after `[DONE]` are errors. A streaming client gets an `api_error` event with `Vertex AI Mistral stream is invalid`; a non-streaming client gets a 502 with the reason, such as `Vertex AI Mistral event after [DONE]`. A single event is limited to 1 MiB.
 
+A non-streaming read stops at an event the stream would end on, without waiting for Vertex AI to close the stream: an upstream error event, a malformed event, content after `finish_reason`, or an event after `[DONE]`. The `finish_reason` itself is followed by the same 2-second read as on a stream.
+
 ## Managed open models
 
 Model Garden's managed open models need no deployment. Their requests are sent as OpenAI Chat Completions, always as a stream:
@@ -628,7 +630,7 @@ Any other `vertex/<publisher>/<model-id>-maas` name is sent as `<publisher>/<mod
 
 ### Open-model thinking
 
-Claude Code's `/effort` reaches gpt-oss, and its thinking setting reaches GLM and Gemma:
+Claude Code's `/effort` reaches gpt-oss. Its thinking setting reaches GLM and Gemma, and when a request has no thinking setting, any effort turns their thinking on:
 
 | Model | Claude Code | Sent |
 | --- | --- | --- |
@@ -636,10 +638,11 @@ Claude Code's `/effort` reaches gpt-oss, and its thinking setting reaches GLM an
 | gpt-oss | effort `high`, `xhigh`, or `max` | `reasoning_effort: "high"` |
 | gpt-oss | no effort | no `reasoning_effort` |
 | GLM, Gemma | thinking on: any thinking type other than `disabled` | `"chat_template_kwargs": {"enable_thinking": true}` |
-| GLM, Gemma | thinking `disabled`, or no thinking setting | `"chat_template_kwargs": {"enable_thinking": false}` |
+| GLM, Gemma | no thinking setting, and any effort | `"chat_template_kwargs": {"enable_thinking": true}` |
+| GLM, Gemma | thinking `disabled`, or no thinking setting and no effort | `"chat_template_kwargs": {"enable_thinking": false}` |
 | Llama 4, DeepSeek, unlisted `-maas` names | any | neither field |
 
-The thinking setting has no effect on gpt-oss, and the effort has no effect on the other models. For gpt-oss, an effort value other than the five above is rejected with HTTP 400. According to Google's thinking page, GLM thinks by default and Gemma does not; the proxy always sends the switch, so GLM thinks only when Claude Code turns thinking on.
+The thinking setting has no effect on gpt-oss. On GLM and Gemma the effort's value is not sent, and a thinking setting, when present, decides alone. The effort has no effect on Llama 4, DeepSeek, or unlisted `-maas` names. An effort value other than the five above is rejected with HTTP 400 for gpt-oss, and for GLM and Gemma when the request has no thinking setting. According to Google's thinking page, GLM thinks by default and Gemma does not; the proxy always sends the switch, so GLM thinks only when the request turns thinking on, with a thinking setting or, without one, an effort.
 
 Reasoning that a stream sends as `reasoning_content` becomes a Claude Code thinking block. Reasoning from earlier turns is not sent back: no thinking or `redacted_thinking` block from the history is sent, because Google documents `reasoning_content` only in responses, and the thinking in a history may come from another provider. Visible text, tool calls, and tool results are sent.
 
@@ -682,6 +685,8 @@ The system prompt, messages, images, function tools, `tool_choice`, and `paralle
 
 A `finish_reason` completes the message, with or without `data: [DONE]`. After it the proxy reads until Vertex AI closes the stream or 2 seconds pass, and a late `[DONE]` starts the 2 seconds again. Content after `finish_reason` and any event after `[DONE]` are errors. A streaming client gets an `api_error` event with `Vertex AI open model stream is invalid`; a non-streaming client gets a 502 with the reason, `Vertex AI open model stream sent content after finish_reason` or `Vertex AI open model event after [DONE]`. A single event is limited to 1 MiB.
 
+A non-streaming read stops at an event the stream would end on, without waiting for Vertex AI to close the stream: an upstream error event, a malformed event, content after `finish_reason`, or an event after `[DONE]`. The `finish_reason` itself is followed by the same 2-second read as on a stream.
+
 ## OpenAI-compatible APIs
 
 When the OpenAI routes are enabled, every Vertex AI model works with both `POST /v1/chat/completions` and `POST /v1/responses`. Text, images, function tools, tool results, token limits, streaming, and usage use the standard shape for the chosen route. `reasoning_effort` and `reasoning.effort` accept `low`, `medium`, `high`, `xhigh`, and `max` for every family. `parallel_tool_calls` is accepted.
@@ -693,7 +698,7 @@ When the OpenAI routes are enabled, every Vertex AI model works with both `POST 
 | xAI Grok, Meta Muse | Effort is not sent. |
 | OpenAI | Effort is sent as `reasoning.effort`. |
 | Mistral | Effort is not sent. |
-| Managed open models | gpt-oss gets `reasoning_effort` as in [Open-model thinking](#open-model-thinking). GLM and Gemma always get `enable_thinking: false`, because these routes carry an effort but no thinking setting. Llama 4 and DeepSeek get neither. On gpt-oss, `tool_choice` `required` or a named function is the [400 above](#forced-tool-choice-on-gpt-oss). |
+| Managed open models | gpt-oss gets `reasoning_effort` as in [Open-model thinking](#open-model-thinking). GLM and Gemma get `enable_thinking: true` when the request sets an effort and `false` when it does not, because these routes carry an effort but no thinking setting. Llama 4 and DeepSeek get neither. On gpt-oss, `tool_choice` `required` or a named function is the [400 above](#forced-tool-choice-on-gpt-oss). |
 
 ## Errors
 
