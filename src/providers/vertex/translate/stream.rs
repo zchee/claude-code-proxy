@@ -2,7 +2,8 @@
 //!
 //! One [`LiveStreamTranslator`] state drives both the streaming response
 //! ([`stream_body`]) and the non-streaming one ([`accumulate_response`]), so
-//! the two decide termination the same way.
+//! the two decide termination the same way. Both count the response content
+//! against [`MAX_CONTENT_BYTES`]; only the non-streaming one keeps it.
 //!
 //! Termination is decided in this order; the first matching row wins:
 //!
@@ -46,6 +47,39 @@ pub const MAX_SSE_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// usage-only chunk; an upstream that neither sends it nor closes must not
 /// hold the response open.
 pub const POST_TERMINAL_READ_LIMIT: Duration = Duration::from_secs(2);
+
+/// Most response content one translator accepts: text, forwarded thinking
+/// text, signature envelopes and tool-call arguments, counted in bytes. The
+/// frame limit bounds one chunk, not how many arrive, and the non-streaming
+/// translator keeps all of it until the response is built. Both modes count
+/// the same bytes, so they fail at the same point.
+pub const MAX_CONTENT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Top-level fields of a documented `GenerateContentResponse` (an `error`
+/// object is handled before the shape is checked). An event with none of
+/// them is not a response chunk.
+const RESPONSE_FIELDS: [&str; 5] = [
+    "candidates",
+    "usageMetadata",
+    "promptFeedback",
+    "modelVersion",
+    "responseId",
+];
+
+/// Fields of a documented response `Part` that the translator knows: the
+/// ones it translates and the ones it rejects as untranslated. A part with
+/// none of them is not a part it can account for.
+const PART_FIELDS: [&str; 9] = [
+    "text",
+    "thought",
+    "thoughtSignature",
+    "functionCall",
+    "inlineData",
+    "fileData",
+    "functionResponse",
+    "executableCode",
+    "codeExecutionResult",
+];
 
 const SUMMARY_NAME: &str = "061-vertex-stream-summary";
 
@@ -363,6 +397,11 @@ enum Open {
 
 struct TranslationState {
     config: TranslatorConfig,
+    /// Whether block content is kept for [`TranslationState::response`].
+    /// The streaming translator emits content and forgets it.
+    keep_content: bool,
+    /// Content bytes seen so far, counted against [`MAX_CONTENT_BYTES`].
+    content_bytes: usize,
     message_started: bool,
     finished: bool,
     blocks: Vec<Block>,
@@ -373,9 +412,11 @@ struct TranslationState {
 }
 
 impl TranslationState {
-    fn new(config: TranslatorConfig) -> Self {
+    fn new(config: TranslatorConfig, keep_content: bool) -> Self {
         Self {
             config,
+            keep_content,
+            content_bytes: 0,
             message_started: false,
             finished: false,
             blocks: Vec::new(),
@@ -473,8 +514,7 @@ impl TranslationState {
                 return Err(StreamError::Malformed("functionCall args is not an object"));
             }
             let signature = part.thought_signature.filter(|value| !value.is_empty());
-            self.function_call(name, input, signature.as_deref(), out);
-            return Ok(());
+            return self.function_call(name, input, signature.as_deref(), out);
         }
         // Signatures on parts other than functionCall are not validated
         // upstream and are dropped.
@@ -484,15 +524,32 @@ impl TranslationState {
         }
         if part.thought == Some(true) {
             if self.config.emit_thinking {
-                self.thinking_delta(&text, out);
+                self.thinking_delta(&text, out)?;
             }
+            Ok(())
         } else {
-            self.text_delta(&text, out);
+            self.text_delta(&text, out)
+        }
+    }
+
+    /// Adds `len` content bytes to the count.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError::Malformed`] once the count passes
+    /// [`MAX_CONTENT_BYTES`].
+    fn count_content(&mut self, len: usize) -> Result<(), StreamError> {
+        self.content_bytes = self.content_bytes.saturating_add(len);
+        if self.content_bytes > MAX_CONTENT_BYTES {
+            return Err(StreamError::Malformed(
+                "the response content exceeds the 16 MiB limit",
+            ));
         }
         Ok(())
     }
 
-    fn thinking_delta(&mut self, text: &str, out: &mut Vec<u8>) {
+    fn thinking_delta(&mut self, text: &str, out: &mut Vec<u8>) -> Result<(), StreamError> {
+        self.count_content(text.len())?;
         let index = match self.open {
             Some(Open::Thinking(index)) => index,
             _ => {
@@ -508,7 +565,9 @@ impl TranslationState {
             }
         };
         self.open = Some(Open::Thinking(index));
-        if let Some(Block::Thinking { text: stored, .. }) = self.blocks.get_mut(index) {
+        if self.keep_content
+            && let Some(Block::Thinking { text: stored, .. }) = self.blocks.get_mut(index)
+        {
             stored.push_str(text);
         }
         emit(
@@ -516,9 +575,11 @@ impl TranslationState {
             "content_block_delta",
             json!({"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":text}}),
         );
+        Ok(())
     }
 
-    fn text_delta(&mut self, text: &str, out: &mut Vec<u8>) {
+    fn text_delta(&mut self, text: &str, out: &mut Vec<u8>) -> Result<(), StreamError> {
+        self.count_content(text.len())?;
         let index = match self.open {
             Some(Open::Text(index)) => index,
             _ => {
@@ -533,7 +594,9 @@ impl TranslationState {
             }
         };
         self.open = Some(Open::Text(index));
-        if let Some(Block::Text { text: stored }) = self.blocks.get_mut(index) {
+        if self.keep_content
+            && let Some(Block::Text { text: stored }) = self.blocks.get_mut(index)
+        {
             stored.push_str(text);
         }
         emit(
@@ -541,6 +604,7 @@ impl TranslationState {
             "content_block_delta",
             json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}),
         );
+        Ok(())
     }
 
     /// Emits a complete tool_use block. A signature on the call goes into
@@ -552,9 +616,15 @@ impl TranslationState {
         input: Value,
         signature: Option<&str>,
         out: &mut Vec<u8>,
-    ) {
+    ) -> Result<(), StreamError> {
         let envelope = signature
             .and_then(|signature| encode_envelope(&self.config.signature_model, signature));
+        let arguments = input.to_string();
+        self.count_content(
+            arguments
+                .len()
+                .saturating_add(envelope.as_ref().map_or(0, String::len)),
+        )?;
         match (self.open, envelope) {
             (Some(Open::Thinking(index)), Some(envelope)) => {
                 self.open = None;
@@ -576,7 +646,11 @@ impl TranslationState {
         }
         let id = format!("toolu_{}_{}", self.config.message_id, self.tool_count);
         self.tool_count += 1;
-        let arguments = input.to_string();
+        let input = if self.keep_content {
+            input
+        } else {
+            Value::Null
+        };
         let index = self.start_block(
             out,
             Block::Tool {
@@ -596,6 +670,7 @@ impl TranslationState {
             "content_block_stop",
             json!({"type":"content_block_stop","index":index}),
         );
+        Ok(())
     }
 
     fn start_block(&mut self, out: &mut Vec<u8>, block: Block, content_block: Value) -> usize {
@@ -621,7 +696,9 @@ impl TranslationState {
             "content_block_stop",
             json!({"type":"content_block_stop","index":index}),
         );
-        if let Some(Block::Thinking { signature, .. }) = self.blocks.get_mut(index) {
+        if self.keep_content
+            && let Some(Block::Thinking { signature, .. }) = self.blocks.get_mut(index)
+        {
             *signature = envelope;
         }
     }
@@ -695,6 +772,11 @@ impl TranslationState {
     }
 
     fn response(&self) -> Result<Value, StreamError> {
+        if !self.keep_content {
+            return Err(StreamError::Malformed(
+                "the streaming translator keeps no content to build a message from",
+            ));
+        }
         if !self.finished {
             return Err(StreamError::Incomplete);
         }
@@ -792,9 +874,46 @@ fn parse_chunk(data: &str) -> Result<Chunk, StreamError> {
     if let Some(error) = value.get("error") {
         return Err(upstream_error(error));
     }
+    check_known_shape(&value)?;
     serde_json::from_value(value).map_err(|_| {
         StreamError::Malformed("an event does not have the GenerateContentResponse shape")
     })
+}
+
+/// Rejects an event object, or a part inside it, that has none of the
+/// documented fields. Every field is optional and serde ignores unknown
+/// ones, so without this an error-shaped or otherwise foreign object would
+/// read as an empty chunk and the stream could end as a success. Objects
+/// that have a documented field and unknown ones as well are accepted.
+fn check_known_shape(value: &Value) -> Result<(), StreamError> {
+    let has_any = |object: &Map<String, Value>, fields: &[&str]| {
+        fields.iter().any(|field| object.contains_key(*field))
+    };
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    if !has_any(object, &RESPONSE_FIELDS) {
+        return Err(StreamError::Malformed(
+            "an event has none of the GenerateContentResponse fields",
+        ));
+    }
+    let parts = object
+        .get("candidates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|candidate| candidate.pointer("/content/parts")?.as_array())
+        .flatten();
+    for part in parts {
+        if let Some(part) = part.as_object()
+            && !has_any(part, &PART_FIELDS)
+        {
+            return Err(StreamError::Malformed(
+                "a part has none of the documented Part fields",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn emit(out: &mut Vec<u8>, event: &str, value: Value) {
@@ -808,11 +927,23 @@ pub struct LiveStreamTranslator {
 }
 
 impl LiveStreamTranslator {
-    /// A translator for one response.
+    /// A translator for one non-streaming response: it keeps the content
+    /// for [`Self::response`].
     pub fn new(config: TranslatorConfig) -> Self {
+        Self::with_content(config, true)
+    }
+
+    /// A translator for one streaming response. It emits the same events
+    /// as [`Self::new`] and stops at the same content limit, but keeps no
+    /// content, so [`Self::response`] is an error.
+    pub fn streaming(config: TranslatorConfig) -> Self {
+        Self::with_content(config, false)
+    }
+
+    fn with_content(config: TranslatorConfig, keep_content: bool) -> Self {
         Self {
             decoder: SseDecoder::with_max_frame_bytes(MAX_SSE_FRAME_BYTES),
-            state: TranslationState::new(config),
+            state: TranslationState::new(config, keep_content),
         }
     }
 
@@ -883,7 +1014,9 @@ impl LiveStreamTranslator {
     ///
     /// # Errors
     ///
-    /// [`StreamError::Incomplete`] before completion.
+    /// [`StreamError::Incomplete`] before completion, and
+    /// [`StreamError::Malformed`] for a translator made with
+    /// [`Self::streaming`].
     pub fn response(&self) -> Result<Value, StreamError> {
         self.state.response()
     }
@@ -931,7 +1064,7 @@ where
 {
     let state = VertexStreamState {
         upstream: Box::pin(upstream),
-        translator: LiveStreamTranslator::new(config),
+        translator: LiveStreamTranslator::streaming(config),
         capture_decoder: SseDecoder::with_max_frame_bytes(MAX_SSE_FRAME_BYTES),
         read_deadline: None,
         done: false,
@@ -1244,10 +1377,10 @@ mod tests {
         .to_string()
     }
 
-    /// Runs the live translator over `input` and returns the events, or the
-    /// first error.
+    /// Runs the streaming translator over `input` and returns the events, or
+    /// the first error.
     fn live(input: &str, emit_thinking: bool) -> Result<Vec<(String, Value)>, StreamError> {
-        let mut translator = LiveStreamTranslator::new(config(emit_thinking));
+        let mut translator = LiveStreamTranslator::streaming(config(emit_thinking));
         let mut out = translator.push(input.as_bytes())?;
         out.extend(translator.finish()?);
         Ok(parse_sse_events(&out)
@@ -1745,6 +1878,131 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_events_and_parts_without_a_documented_field_are_errors() {
+        let foreign_event = json!({"type":"error","message":"backend failed"}).to_string();
+        let empty_event = json!({}).to_string();
+        let foreign_part =
+            json!({"candidates":[{"content":{"role":"model","parts":[{"unknownData":{"bytes":"AAAA"}}]}}]})
+                .to_string();
+        let empty_part =
+            json!({"candidates":[{"content":{"role":"model","parts":[{}]}}]}).to_string();
+        let event_error =
+            StreamError::Malformed("an event has none of the GenerateContentResponse fields");
+        let part_error = StreamError::Malformed("a part has none of the documented Part fields");
+        let cases = [
+            ("foreign event", &foreign_event, &event_error),
+            ("empty event", &empty_event, &event_error),
+            ("foreign part", &foreign_part, &part_error),
+            ("empty part", &empty_part, &part_error),
+        ];
+        for (name, chunk, expected) in cases {
+            let before = frames(&[&text_chunk("partial"), chunk, &finish_chunk("STOP")]);
+            assert_eq!(
+                &both_fail(&before),
+                expected,
+                "{name} before the finish reason"
+            );
+            let after = frames(&[&text_chunk("partial"), &finish_chunk("STOP"), chunk]);
+            assert_eq!(
+                &both_fail(&after),
+                expected,
+                "{name} after the finish reason"
+            );
+        }
+    }
+
+    #[test]
+    fn synthetic_documented_fields_beside_unknown_ones_are_accepted() {
+        let input = frames(&[
+            &json!({
+                "candidates":[{"content":{"role":"model","parts":[{"text":"Hi","partMetadata":{"synthetic":1}}]}}],
+                "sdkHttpResponse":{"headers":{}}
+            })
+            .to_string(),
+            &json!({
+                "candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],
+                "modelVersion":MODEL,
+                "createTime":"2026-11-12T00:00:00Z"
+            })
+            .to_string(),
+            // A metadata-only event after the finish reason.
+            &json!({"responseId":"synthetic-response-id"}).to_string(),
+        ]);
+        let message = both_succeed(&input, false);
+        assert_eq!(message["content"], json!([{"type":"text","text":"Hi"}]));
+        assert_eq!(message["stop_reason"], "end_turn");
+    }
+
+    /// The content limit, written out rather than taken from the code.
+    const CONTENT_LIMIT: usize = 16 * 1024 * 1024;
+
+    #[test]
+    fn synthetic_many_small_text_frames_past_the_content_limit_fail_in_both_modes() {
+        let piece = "x".repeat(4096);
+        let mut chunks: Vec<String> = (0..=CONTENT_LIMIT / piece.len())
+            .map(|_| text_chunk(&piece))
+            .collect();
+        chunks.push(finish_chunk("STOP"));
+        let chunks: Vec<&str> = chunks.iter().map(String::as_str).collect();
+        assert_eq!(
+            both_fail(&frames(&chunks)),
+            StreamError::Malformed("the response content exceeds the 16 MiB limit")
+        );
+    }
+
+    #[test]
+    fn synthetic_tool_call_arguments_count_against_the_content_limit_in_both_modes() {
+        // Each frame stays far below the 16 MiB frame limit; together the
+        // arguments pass the content limit.
+        let content = "y".repeat(5 * 1024 * 1024);
+        let call = json!({"candidates":[{"content":{"role":"model","parts":[
+            {"functionCall":{"name":"Write","args":{"content":content}}}
+        ]}}]})
+        .to_string();
+        let input = frames(&[&call, &call, &call, &call, &finish_chunk("STOP")]);
+        assert_eq!(
+            both_fail(&input),
+            StreamError::Malformed("the response content exceeds the 16 MiB limit")
+        );
+        let input = frames(&[&call, &call, &call, &finish_chunk("STOP")]);
+        let message = both_succeed(&input, false);
+        assert_eq!(message["content"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn synthetic_content_exactly_at_the_limit_is_accepted_in_both_modes() {
+        let piece = "z".repeat(4096);
+        let mut chunks: Vec<String> = (0..CONTENT_LIMIT / piece.len())
+            .map(|_| text_chunk(&piece))
+            .collect();
+        chunks.push(finish_chunk("STOP"));
+        let chunks: Vec<&str> = chunks.iter().map(String::as_str).collect();
+        let input = frames(&chunks);
+        let mut streaming = LiveStreamTranslator::streaming(config(false));
+        streaming
+            .push(input.as_bytes())
+            .expect("content at the limit streams");
+        streaming.finish().expect("content at the limit completes");
+        let message = accumulated(&input, false).expect("content at the limit is a message");
+        assert_eq!(
+            message["content"][0]["text"].as_str().unwrap().len(),
+            CONTENT_LIMIT
+        );
+    }
+
+    #[test]
+    fn streaming_translator_keeps_no_message_to_return() {
+        let mut translator = LiveStreamTranslator::streaming(config(false));
+        let input = frames(&[&text_chunk("x"), &finish_chunk("STOP")]);
+        translator.push(input.as_bytes()).unwrap();
+        translator.finish().unwrap();
+        assert!(
+            matches!(translator.response(), Err(StreamError::Malformed(_))),
+            "a streaming translator built a message"
+        );
+    }
+
+    #[test]
     fn synthetic_error_chunk_in_array_form_is_an_upstream_error() {
         let input = frames(&[
             &text_chunk("x"),
@@ -1981,6 +2239,32 @@ mod tests {
             outcome.failure().as_deref(),
             Some("Vertex AI stopped the response: finishReason SAFETY: leaked [redacted]")
         );
+    }
+
+    #[tokio::test]
+    async fn synthetic_stream_body_past_the_content_limit_ends_with_an_error_event() {
+        let piece = "x".repeat(64 * 1024);
+        let chunks: Vec<Result<Bytes, std::io::Error>> = (0..=CONTENT_LIMIT / piece.len())
+            .map(|_| Ok(Bytes::from(frame(&text_chunk(&piece)))))
+            .chain([Ok(Bytes::from(frame(&finish_chunk("STOP"))))])
+            .collect();
+        let outcome = NativeResponseOutcome::default();
+        let text = body_text(stream_body(
+            futures_util::stream::iter(chunks),
+            config(false),
+            sinks(&outcome),
+        ))
+        .await;
+        let events = parse_sse_events(text.as_bytes());
+        let last = events.last().unwrap();
+        assert_eq!(last.event.as_deref(), Some("error"));
+        let data: Value = serde_json::from_str(&last.data).unwrap();
+        assert_eq!(
+            data["error"]["message"],
+            "Vertex AI stream is invalid: the response content exceeds the 16 MiB limit"
+        );
+        assert!(!text.contains("message_stop"));
+        assert!(outcome.failure().is_some());
     }
 
     #[tokio::test]
