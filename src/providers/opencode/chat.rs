@@ -136,6 +136,16 @@ impl ReceivePolicy {
     }
 }
 
+/// A copy of `value` with every string under a `message` key, at any depth,
+/// passed through `sanitize`: the cleaning [`ReceivePolicy::sanitize`]
+/// applies to an upstream event before it is captured. Other strings are
+/// kept as they are.
+pub fn sanitize_upstream_messages(value: &Value, sanitize: &dyn Fn(&str) -> String) -> Value {
+    let mut value = value.clone();
+    sanitize_messages(&mut value, sanitize);
+    value
+}
+
 fn sanitize_messages(value: &mut Value, sanitize: &dyn Fn(&str) -> String) {
     match value {
         Value::Object(object) => {

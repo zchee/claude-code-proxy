@@ -27,13 +27,15 @@ use crate::provider::{
     Generation, GenerationBody, ProviderError, ProviderErrorKind, RequestContext,
 };
 use crate::providers::codex::native::NativeResponseOutcome;
-use crate::providers::opencode::chat::{ReceivePolicy, StreamLabels, StreamWiring, TerminalPolicy};
+use crate::providers::opencode::chat::{
+    ReceivePolicy, StreamLabels, StreamWiring, TerminalPolicy, sanitize_upstream_messages,
+};
 use crate::providers::opencode::messages;
 
 use super::client::{EVENT_STREAM, UpstreamCall, VertexError, VertexResponse, VertexTarget};
 use super::models::ResolvedModel;
 use super::sanitize::sanitize_vertex_text;
-use super::translate::stream::{Sanitizer, sanitize_capture};
+use super::translate::stream::Sanitizer;
 use super::{
     MAX_BUFFERED_RESPONSE_BYTES, VertexProvider, error_response, invalid_request,
     report_error_events, sse_response,
@@ -344,7 +346,9 @@ fn stream_body(started: Started, ctx: &RequestContext) -> Body {
 }
 
 /// Returns the upstream JSON message unchanged once it is read whole and
-/// parses as JSON. The capture records it after the sanitiser.
+/// parses as JSON. The capture records it after the sanitiser, which
+/// cleans every string under a `message` key, at any depth, as the
+/// streaming path cleans the events it captures.
 async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
     let Started { upstream, sanitize } = started;
     let bytes = match read_body(upstream.into_byte_stream()).await {
@@ -359,7 +363,7 @@ async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
         ));
     };
     if let Some(traffic) = ctx.traffic.as_ref() {
-        let captured = sanitize_capture(&value, &*sanitize);
+        let captured = sanitize_upstream_messages(&value, &*sanitize);
         traffic.write_json("032-upstream-response-body", &captured);
         traffic.write_json("051-downstream-response", &captured);
     }

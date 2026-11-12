@@ -47,6 +47,7 @@ use crate::provider::{
 use crate::providers::codex::native::NativeResponseOutcome;
 use crate::providers::grok::translate::stream::SseDecoder;
 use crate::providers::kimi::count_tokens;
+use crate::providers::opencode::chat::sanitize_upstream_messages;
 use crate::traffic::{StreamTrafficCapture, TrafficCapture};
 
 use self::auth::{VertexAuthError, VertexCredentials};
@@ -501,7 +502,10 @@ async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
         sanitize,
         ..
     } = started;
-    let mut capture = ctx.traffic.as_ref().map(|_| BufferedCapture::new());
+    let mut capture = ctx
+        .traffic
+        .as_ref()
+        .map(|_| BufferedCapture::for_reception(&reception));
     let upstream = upstream.into_byte_stream();
     let result = match reception {
         Reception::Gemini(config) => read_message(upstream, config, &sanitize, capture.as_mut())
@@ -608,15 +612,38 @@ struct BufferedCapture {
     events: StreamTrafficCapture,
     bytes: u64,
     chunks: u64,
+    /// Cleans one decoded upstream event with the sanitiser.
+    clean: CleanEvent,
 }
 
+/// Cleans one decoded upstream event: the value and the sanitiser.
+type CleanEvent = fn(&Value, &dyn Fn(&str) -> String) -> Value;
+
 impl BufferedCapture {
+    /// The capture of a Gemini response: [`sanitize_capture`] cleans the
+    /// places Gemini puts upstream prose.
     fn new() -> Self {
         Self {
             decoder: SseDecoder::with_max_frame_bytes(MAX_SSE_FRAME_BYTES),
             events: StreamTrafficCapture::default(),
             bytes: 0,
             chunks: 0,
+            clean: sanitize_capture,
+        }
+    }
+
+    /// The capture for `reception`. A partner model's events put upstream
+    /// prose under a `message` key at any depth (`response.error.message`
+    /// of a failed Responses event, a Mistral error's top-level `message`),
+    /// so every such string is cleaned, as the shared translators clean the
+    /// events they capture.
+    fn for_reception(reception: &Reception) -> Self {
+        match reception {
+            Reception::Gemini(_) => Self::new(),
+            Reception::Responses { .. } | Reception::Mistral { .. } => Self {
+                clean: sanitize_upstream_messages,
+                ..Self::new()
+            },
         }
     }
 
@@ -629,10 +656,9 @@ impl BufferedCapture {
         };
         for event in events {
             match serde_json::from_str::<Value>(&event.data) {
-                Ok(value) => self.events.upstream_event(
-                    event.event.as_deref(),
-                    &sanitize_capture(&value, &**sanitize),
-                ),
+                Ok(value) => self
+                    .events
+                    .upstream_event(event.event.as_deref(), &(self.clean)(&value, &**sanitize)),
                 Err(_) => self.events.malformed("json", "malformed_event"),
             }
         }
@@ -1349,5 +1375,147 @@ mod tests {
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert!(provider.ready.get().is_none());
+    }
+
+    /// Every file under `root`, with its text.
+    fn synthetic_files_under(root: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("capture directory is readable") {
+                let path = entry.expect("capture entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let text = std::fs::read_to_string(&path).expect("capture file is text");
+                    files.push((path, text));
+                }
+            }
+        }
+        files
+    }
+
+    /// A provider whose requests go to `base_url` with `SYNTHETIC_TOKEN`
+    /// as the bearer token.
+    fn synthetic_local_provider(base_url: &str, location: &str) -> VertexProvider {
+        use crate::config::{VertexSetting, VertexSettingSource};
+        let setting = |value: &str, source| VertexSetting {
+            value: value.to_string(),
+            source,
+        };
+        let config = ResolvedVertexConfig {
+            project_setting: Some(setting(
+                "synthetic-project",
+                VertexSettingSource::Env("CCP_VERTEX_PROJECT"),
+            )),
+            location_setting: setting(location, VertexSettingSource::Env("CCP_VERTEX_LOCATION")),
+            base_url_setting: Some(setting(
+                base_url,
+                VertexSettingSource::Env("CCP_VERTEX_BASE_URL"),
+            )),
+            location_overrides_setting: None,
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            format!("Bearer {SYNTHETIC_TOKEN}").parse().unwrap(),
+        );
+        VertexProvider::with_client(
+            VertexClient::with_client(client::client_builder().no_proxy().build().unwrap()),
+            VertexCredentials::fixed(headers),
+            config,
+        )
+    }
+
+    /// A local server that answers every request with `sse`.
+    async fn synthetic_sse_server(sse: String) -> String {
+        let app = axum::Router::new().route(
+            "/{*path}",
+            axum::routing::post(move || {
+                let sse = sse.clone();
+                async move { ([(http::header::CONTENT_TYPE, "text/event-stream")], sse) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn partner_buffered_capture_synthetic_keeps_nested_echoed_secrets_out_of_every_file() {
+        let echoed = format!("the request carried {SYNTHETIC_TOKEN}");
+        let cases = [
+            (
+                "Responses failure with the error under response",
+                "vertex/openai/gpt-6.1-sol",
+                "global",
+                format!(
+                    "data: {}\n\n",
+                    json!({
+                        "type":"response.failed",
+                        "response":{"status":"failed","error":{"code":"server_error","message":echoed}}
+                    })
+                ),
+            ),
+            (
+                "Mistral error with a top-level message",
+                "vertex/mistralai/mistral-medium-3",
+                "us-central1",
+                format!(
+                    "data: {}\n\n",
+                    json!({"object":"error","type":"invalid_request_error","message":echoed})
+                ),
+            ),
+        ];
+        for (case, model, location, sse) in cases {
+            let base = synthetic_sse_server(sse).await;
+            let provider = synthetic_local_provider(&base, location);
+            let root = tempfile::tempdir().expect("temporary capture directory");
+            let mut ctx = synthetic_context();
+            ctx.traffic = Some(Arc::new(crate::traffic::test_capture(
+                root.path().to_path_buf(),
+            )));
+            let body: MessagesRequest = serde_json::from_value(json!({
+                "model": model,
+                "max_tokens": 64,
+                "stream": false,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap();
+            let response = provider.handle_messages(body, ctx).await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{case}");
+            let answer = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let answer = String::from_utf8_lossy(&answer);
+            assert!(!answer.contains(SYNTHETIC_TOKEN), "{case}: {answer}");
+
+            let files = synthetic_files_under(root.path());
+            let upstream_events: Vec<_> = files
+                .iter()
+                .filter(|(path, _)| path.to_string_lossy().contains("-040-upstream-event"))
+                .collect();
+            assert!(!upstream_events.is_empty(), "{case}: {files:?}");
+            assert!(
+                upstream_events
+                    .iter()
+                    .any(|(_, text)| text.contains("the request carried [redacted]")),
+                "{case}: {upstream_events:?}"
+            );
+            assert!(
+                files.iter().any(|(path, _)| path
+                    .to_string_lossy()
+                    .ends_with(&format!("{BUFFERED_SUMMARY_NAME}.json"))),
+                "{case}: {files:?}"
+            );
+            for (path, text) in &files {
+                assert!(
+                    !text.contains(SYNTHETIC_TOKEN),
+                    "{case}: {} leaked the token: {text}",
+                    path.display()
+                );
+            }
+        }
     }
 }
