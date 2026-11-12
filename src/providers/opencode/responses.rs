@@ -551,10 +551,7 @@ impl StrictResponses {
     /// Notes which message and block events of `output` the client now
     /// has. Called with every output a strict stream releases.
     fn note_released(&mut self, output: &[u8]) {
-        let Ok(events) = SseDecoder::default().push(output) else {
-            return;
-        };
-        for event in events {
+        for event in generated_events(output) {
             match event.event.as_deref() {
                 Some("message_start") => self.message_started = true,
                 Some("content_block_start") => {
@@ -579,37 +576,27 @@ impl StrictResponses {
     /// never saw start, or presuppose a `message_start` the client never
     /// got. The result is a sequence the client can read: the
     /// `message_start` from `discarded` when the client has none yet, the
-    /// events of `closing` except block events for blocks the client does
-    /// not have open, and a `content_block_stop` for each block the client
-    /// still has open, before the final `error` event.
+    /// events of `closing` except its block events, and a
+    /// `content_block_stop` for each block the client still has open, in
+    /// index order, before the final `error` event. The translator closes
+    /// its blocks in no fixed order, so its own stops are not used.
     fn error_sequence(&self, closing: &[u8], discarded: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         if !self.message_started
-            && let Ok(events) = SseDecoder::default().push(discarded)
-            && let Some(start) = events
-                .iter()
+            && let Some(start) = generated_events(discarded)
+                .into_iter()
                 .find(|event| event.event.as_deref() == Some("message_start"))
         {
             out.extend(encode_sse_event(Some("message_start"), &start.data));
         }
-        let Ok(events) = SseDecoder::default().push(closing) else {
-            return out;
-        };
-        let mut open = self.open_blocks.clone();
-        for event in events {
+        for event in generated_events(closing) {
             let name = event.event.as_deref();
             match name {
                 Some("content_block_start" | "content_block_delta" | "content_block_stop") => {
-                    let Some(index) = block_index(&event).filter(|index| open.contains(index))
-                    else {
-                        continue;
-                    };
-                    if name == Some("content_block_stop") {
-                        open.remove(&index);
-                    }
+                    continue;
                 }
                 Some("error") => {
-                    for index in std::mem::take(&mut open) {
+                    for index in &self.open_blocks {
                         out.extend(encode_sse_event(
                             Some("content_block_stop"),
                             &serde_json::json!({"type": "content_block_stop", "index": index})
@@ -623,6 +610,16 @@ impl StrictResponses {
         }
         out
     }
+}
+
+/// The events of output the translator generated. Its frames are not held
+/// to the upstream frame limit: a delta just under that limit becomes a
+/// larger Anthropic frame, and the output is already bounded by what the
+/// upstream decoder accepted.
+fn generated_events(output: &[u8]) -> Vec<SseEvent> {
+    SseDecoder::with_max_frame_bytes(usize::MAX)
+        .push(output)
+        .unwrap_or_default()
 }
 
 /// The `index` of an Anthropic block event.
@@ -1101,6 +1098,7 @@ fn count_sse_events(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::grok::translate::stream::MAX_SSE_FRAME_BYTES;
     use serde_json::json;
 
     const COMPLETION: &str = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
@@ -1551,7 +1549,7 @@ mod tests {
     /// The events of a client body, with the error event last when there is
     /// one.
     fn events_of(text: &str) -> Vec<(Option<String>, serde_json::Value)> {
-        let mut decoder = SseDecoder::default();
+        let mut decoder = SseDecoder::with_max_frame_bytes(usize::MAX);
         let events = decoder.push(text.as_bytes()).unwrap();
         assert!(decoder.finish().is_ok(), "{text}");
         events
@@ -2305,5 +2303,109 @@ mod tests {
             ["message_start", "error", "message_start", "error"],
             "{text}"
         );
+    }
+
+    /// One upstream frame carrying a text delta of `len` ASCII `x` bytes
+    /// for `output_index`.
+    fn synthetic_text_delta(output_index: u64, len: usize) -> String {
+        format!(
+            "data: {{\"type\":\"response.output_text.delta\",\"output_index\":{output_index},\"delta\":\"{}\"}}\n\n",
+            "x".repeat(len)
+        )
+    }
+
+    /// Whether the client event `value` named `name`, re-encoded the way
+    /// the translator writes it, is larger than the upstream frame limit.
+    fn synthetic_exceeds_frame_limit(name: &str, value: &serde_json::Value) -> bool {
+        encode_sse_event(Some(name), &value.to_string()).len() - 1 > MAX_SSE_FRAME_BYTES
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_large_released_delta_keeps_every_open_block_for_the_error() {
+        let rejected =
+            "data: {\"type\":\"response.refusal.delta\",\"output_index\":0,\"delta\":\"no\"}\n\n";
+        let first = "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"early\"}\n\n";
+        let added = "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_b\"}}\n\n";
+        let event = |name: &str, index: Option<u64>| (name.to_string(), index);
+        let expected = vec![
+            event("message_start", None),
+            event("content_block_start", Some(0)),
+            event("content_block_delta", Some(0)),
+            event("content_block_start", Some(1)),
+            event("content_block_delta", Some(1)),
+            event("content_block_stop", Some(0)),
+            event("content_block_stop", Some(1)),
+            event("error", None),
+        ];
+        let tests = [
+            (
+                "a delta whose client frame exceeds the upstream limit",
+                1_048_480,
+                true,
+            ),
+            (
+                "a delta whose client frame stays under the upstream limit",
+                1_048_400,
+                false,
+            ),
+        ];
+        for (name, len, exceeds) in tests {
+            let large = synthetic_text_delta(1, len);
+            // The upstream frame itself is within the limit, without its
+            // final blank line.
+            assert!(large.len() - 1 <= MAX_SSE_FRAME_BYTES, "{name}");
+            let second = format!("{added}{large}");
+            let parts = [first, second.as_str(), rejected];
+            let text = body_text(strict_body(futures_util::stream::iter(chunks(&parts)))).await;
+            assert_eq!(synthetic_event_sequence(&text), expected, "{name}");
+            let events = events_of(&text);
+            assert_eq!(events[0].1["message"]["id"], "msg_strict", "{name}");
+            assert_eq!(events[2].1["delta"]["text"], "early", "{name}");
+            let delta = &events[4].1;
+            assert_eq!(
+                delta["delta"]["text"].as_str().map(str::len),
+                Some(len),
+                "{name}"
+            );
+            assert_eq!(
+                synthetic_exceeds_frame_limit("content_block_delta", delta),
+                exceeds,
+                "{name}"
+            );
+            assert_eq!(
+                events[events.len() - 1].1,
+                json!({"type":"error","error":{"type":"api_error","message":INVALID}}),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_large_discarded_delta_still_sends_the_message_start() {
+        let rejected =
+            "data: {\"type\":\"response.refusal.delta\",\"output_index\":0,\"delta\":\"no\"}\n\n";
+        let large = synthetic_text_delta(0, 1_048_480);
+        assert!(large.len() - 1 <= MAX_SSE_FRAME_BYTES);
+        let chunk = format!("{large}{rejected}");
+        let text = body_text(strict_body(futures_util::stream::iter(chunks(&[
+            chunk.as_str()
+        ]))))
+        .await;
+        assert_eq!(
+            synthetic_event_sequence(&text),
+            [
+                ("message_start".to_string(), None),
+                ("error".to_string(), None),
+            ],
+            "{text}"
+        );
+        let events = events_of(&text);
+        assert_eq!(events[0].1["message"]["id"], "msg_strict", "{text}");
+        assert_eq!(
+            events[1].1,
+            json!({"type":"error","error":{"type":"api_error","message":INVALID}}),
+            "{text}"
+        );
+        assert!(!text.contains("xxxx"), "{text}");
     }
 }
