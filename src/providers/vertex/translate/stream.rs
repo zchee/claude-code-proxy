@@ -3,7 +3,8 @@
 //! One [`LiveStreamTranslator`] state drives both the streaming response
 //! ([`stream_body`]) and the non-streaming one ([`accumulate_response`]), so
 //! the two decide termination the same way. Both count the response content
-//! against [`MAX_CONTENT_BYTES`]; only the non-streaming one keeps it.
+//! against [`MAX_CONTENT_BYTES`]; only the non-streaming one keeps it, and
+//! the streaming one keeps no record of a block once it is emitted.
 //!
 //! Termination is decided in this order; the first matching row wins:
 //!
@@ -48,21 +49,29 @@ pub const MAX_SSE_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// hold the response open.
 pub const POST_TERMINAL_READ_LIMIT: Duration = Duration::from_secs(2);
 
-/// Most response content one translator accepts: text, forwarded thinking
-/// text, signature envelopes and tool-call arguments, counted in bytes. The
-/// frame limit bounds one chunk, not how many arrive, and the non-streaming
-/// translator keeps all of it until the response is built. Both modes count
-/// the same bytes, so they fail at the same point.
+/// Most response content one translator accepts, counted in bytes: text,
+/// forwarded thinking text, every signature envelope (the empty one too),
+/// tool-call arguments, tool names and tool-use IDs, plus [`BLOCK_CHARGE`]
+/// for each content block. The frame limit bounds one chunk, not how many
+/// arrive, and the non-streaming translator keeps all of it until the
+/// response is built. Both modes count the same bytes, so they fail at the
+/// same point.
 pub const MAX_CONTENT_BYTES: usize = 16 * 1024 * 1024;
+
+/// What one content block costs beyond its strings: the block record and
+/// the JSON object the non-streaming response builds from it. Charged so
+/// that many tiny or empty blocks also reach [`MAX_CONTENT_BYTES`].
+pub const BLOCK_CHARGE: usize = 256;
 
 /// Top-level fields of a documented `GenerateContentResponse` (an `error`
 /// object is handled before the shape is checked). An event with none of
 /// them is not a response chunk.
-const RESPONSE_FIELDS: [&str; 5] = [
+const RESPONSE_FIELDS: [&str; 6] = [
     "candidates",
     "usageMetadata",
     "promptFeedback",
     "modelVersion",
+    "createTime",
     "responseId",
 ];
 
@@ -404,7 +413,10 @@ struct TranslationState {
     content_bytes: usize,
     message_started: bool,
     finished: bool,
+    /// The blocks of the response; empty unless `keep_content`.
     blocks: Vec<Block>,
+    /// How many blocks were started, which is the index of the next one.
+    block_count: usize,
     open: Option<Open>,
     tool_count: usize,
     finish: Option<Finish>,
@@ -420,6 +432,7 @@ impl TranslationState {
             message_started: false,
             finished: false,
             blocks: Vec::new(),
+            block_count: 0,
             open: None,
             tool_count: 0,
             finish: None,
@@ -553,7 +566,7 @@ impl TranslationState {
         let index = match self.open {
             Some(Open::Thinking(index)) => index,
             _ => {
-                self.close_open(out);
+                self.close_open(out)?;
                 self.start_block(
                     out,
                     Block::Thinking {
@@ -561,7 +574,7 @@ impl TranslationState {
                         signature: String::new(),
                     },
                     json!({"type":"thinking","thinking":"","signature":""}),
-                )
+                )?
             }
         };
         self.open = Some(Open::Thinking(index));
@@ -583,14 +596,14 @@ impl TranslationState {
         let index = match self.open {
             Some(Open::Text(index)) => index,
             _ => {
-                self.close_open(out);
+                self.close_open(out)?;
                 self.start_block(
                     out,
                     Block::Text {
                         text: String::new(),
                     },
                     json!({"type":"text","text":""}),
-                )
+                )?
             }
         };
         self.open = Some(Open::Text(index));
@@ -620,18 +633,20 @@ impl TranslationState {
         let envelope = signature
             .and_then(|signature| encode_envelope(&self.config.signature_model, signature));
         let arguments = input.to_string();
+        let id = format!("toolu_{}_{}", self.config.message_id, self.tool_count);
         self.count_content(
             arguments
                 .len()
-                .saturating_add(envelope.as_ref().map_or(0, String::len)),
+                .saturating_add(name.len())
+                .saturating_add(id.len()),
         )?;
         match (self.open, envelope) {
             (Some(Open::Thinking(index)), Some(envelope)) => {
                 self.open = None;
-                self.close_thinking(index, envelope, out);
+                self.close_thinking(index, envelope, out)?;
             }
             (_, Some(envelope)) => {
-                self.close_open(out);
+                self.close_open(out)?;
                 let index = self.start_block(
                     out,
                     Block::Thinking {
@@ -639,27 +654,14 @@ impl TranslationState {
                         signature: String::new(),
                     },
                     json!({"type":"thinking","thinking":"","signature":""}),
-                );
-                self.close_thinking(index, envelope, out);
+                )?;
+                self.close_thinking(index, envelope, out)?;
             }
-            (_, None) => self.close_open(out),
+            (_, None) => self.close_open(out)?,
         }
-        let id = format!("toolu_{}_{}", self.config.message_id, self.tool_count);
         self.tool_count += 1;
-        let input = if self.keep_content {
-            input
-        } else {
-            Value::Null
-        };
-        let index = self.start_block(
-            out,
-            Block::Tool {
-                id: id.clone(),
-                name: name.clone(),
-                input,
-            },
-            json!({"type":"tool_use","id":id,"name":name,"input":{}}),
-        );
+        let content_block = json!({"type":"tool_use","id":id,"name":name,"input":{}});
+        let index = self.start_block(out, Block::Tool { id, name, input }, content_block)?;
         emit(
             out,
             "content_block_delta",
@@ -673,19 +675,38 @@ impl TranslationState {
         Ok(())
     }
 
-    fn start_block(&mut self, out: &mut Vec<u8>, block: Block, content_block: Value) -> usize {
+    /// Starts the next block and charges [`BLOCK_CHARGE`] for it. `block`
+    /// is kept only by the non-streaming translator.
+    fn start_block(
+        &mut self,
+        out: &mut Vec<u8>,
+        block: Block,
+        content_block: Value,
+    ) -> Result<usize, StreamError> {
+        self.count_content(BLOCK_CHARGE)?;
         self.ensure_message_start(out);
-        let index = self.blocks.len();
-        self.blocks.push(block);
+        let index = self.block_count;
+        self.block_count += 1;
+        if self.keep_content {
+            self.blocks.push(block);
+        }
         emit(
             out,
             "content_block_start",
             json!({"type":"content_block_start","index":index,"content_block":content_block}),
         );
-        index
+        Ok(index)
     }
 
-    fn close_thinking(&mut self, index: usize, envelope: String, out: &mut Vec<u8>) {
+    /// Ends a thinking block with `envelope` as its signature, which is
+    /// counted as content.
+    fn close_thinking(
+        &mut self,
+        index: usize,
+        envelope: String,
+        out: &mut Vec<u8>,
+    ) -> Result<(), StreamError> {
+        self.count_content(envelope.len())?;
         emit(
             out,
             "content_block_delta",
@@ -701,16 +722,17 @@ impl TranslationState {
         {
             *signature = envelope;
         }
+        Ok(())
     }
 
     /// Closes the open thinking or text block. A thinking block closed here
     /// had no signature and gets the empty envelope.
-    fn close_open(&mut self, out: &mut Vec<u8>) {
+    fn close_open(&mut self, out: &mut Vec<u8>) -> Result<(), StreamError> {
         match self.open.take() {
             Some(Open::Thinking(index)) => {
                 let envelope =
                     encode_envelope(&self.config.signature_model, "").unwrap_or_default();
-                self.close_thinking(index, envelope, out);
+                self.close_thinking(index, envelope, out)?;
             }
             Some(Open::Text(index)) => emit(
                 out,
@@ -719,6 +741,7 @@ impl TranslationState {
             ),
             None => {}
         }
+        Ok(())
     }
 
     fn ensure_message_start(&mut self, out: &mut Vec<u8>) {
@@ -748,7 +771,7 @@ impl TranslationState {
         }
         let stop_reason = self.stop_reason()?;
         let mut out = Vec::new();
-        self.close_open(&mut out);
+        self.close_open(&mut out)?;
         self.ensure_message_start(&mut out);
         // Input usage is published only when the upstream reported it, so the
         // client keeps the seeded estimate otherwise.
@@ -1999,15 +2022,23 @@ mod tests {
         assert_eq!(message["content"].as_array().unwrap().len(), 3);
     }
 
+    /// The charge for one block, written out rather than taken from the
+    /// code.
+    const ONE_BLOCK: usize = 256;
+
+    /// One text block of `len` bytes, sent in 4 KiB frames.
+    fn text_frames(len: usize) -> String {
+        let piece = "z".repeat(4096);
+        let mut chunks: Vec<String> = (0..len / piece.len()).map(|_| text_chunk(&piece)).collect();
+        chunks.push(text_chunk(&"z".repeat(len % piece.len())));
+        chunks.push(finish_chunk("STOP"));
+        chunks.iter().map(|chunk| frame(chunk)).collect()
+    }
+
     #[test]
     fn synthetic_content_exactly_at_the_limit_is_accepted_in_both_modes() {
-        let piece = "z".repeat(4096);
-        let mut chunks: Vec<String> = (0..CONTENT_LIMIT / piece.len())
-            .map(|_| text_chunk(&piece))
-            .collect();
-        chunks.push(finish_chunk("STOP"));
-        let chunks: Vec<&str> = chunks.iter().map(String::as_str).collect();
-        let input = frames(&chunks);
+        // One text block: its text and the block charge fill the limit.
+        let input = text_frames(CONTENT_LIMIT - ONE_BLOCK);
         let mut streaming = LiveStreamTranslator::streaming(config(false));
         streaming
             .push(input.as_bytes())
@@ -2016,8 +2047,97 @@ mod tests {
         let message = accumulated(&input, false).expect("content at the limit is a message");
         assert_eq!(
             message["content"][0]["text"].as_str().unwrap().len(),
-            CONTENT_LIMIT
+            CONTENT_LIMIT - ONE_BLOCK
         );
+        // One byte more fails.
+        let input = text_frames(CONTENT_LIMIT - ONE_BLOCK + 1);
+        assert_eq!(
+            both_fail(&input),
+            StreamError::Malformed("the response content exceeds the 16 MiB limit")
+        );
+    }
+
+    #[test]
+    fn synthetic_large_function_names_count_against_the_content_limit_in_both_modes() {
+        // Each frame carries a 1 MiB name and `{}` arguments, far below the
+        // frame limit; the names alone pass the content limit.
+        let name = "n".repeat(1024 * 1024);
+        let call = json!({"candidates":[{"content":{"role":"model","parts":[
+            {"functionCall":{"name":name,"args":{}}}
+        ]}}]})
+        .to_string();
+        let mut chunks: Vec<&str> = vec![call.as_str(); 17];
+        let finish = finish_chunk("STOP");
+        chunks.push(&finish);
+        assert_eq!(
+            both_fail(&frames(&chunks)),
+            StreamError::Malformed("the response content exceeds the 16 MiB limit")
+        );
+        // Fifteen of them fit.
+        let mut chunks: Vec<&str> = vec![call.as_str(); 15];
+        chunks.push(&finish);
+        let message = both_succeed(&frames(&chunks), false);
+        assert_eq!(message["content"].as_array().unwrap().len(), 15);
+        assert_eq!(
+            message["content"][14]["name"].as_str().unwrap().len(),
+            1024 * 1024
+        );
+        assert_eq!(message["content"][14]["id"], "toolu_msg_1_14");
+    }
+
+    #[test]
+    fn synthetic_many_tiny_blocks_reach_the_content_limit_in_both_modes() {
+        // Alternating one-byte thought and text parts start a new block each
+        // time; their text is under 100 KiB, the blocks are what count.
+        let pair = [json!({"text":"t","thought":true}), json!({"text":"x"})];
+        let blocks = |pairs: usize| {
+            let parts: Vec<Value> = pair.iter().cloned().cycle().take(2 * pairs).collect();
+            frames(&[
+                &json!({"candidates":[{"content":{"role":"model","parts":parts}}]}).to_string(),
+                &finish_chunk("STOP"),
+            ])
+        };
+        assert_eq!(
+            both_fail(&blocks(32 * 1024)),
+            StreamError::Malformed("the response content exceeds the 16 MiB limit")
+        );
+        let message = both_succeed(&blocks(1024), true);
+        assert_eq!(message["content"].as_array().unwrap().len(), 2048);
+    }
+
+    #[test]
+    fn synthetic_streaming_translator_keeps_no_block_records() {
+        let input = frames(&[
+            &json!({"candidates":[{"content":{"role":"model","parts":[{"text":"plan","thought":true}]}}]}).to_string(),
+            &text_chunk("Reading"),
+            &call_chunk("read_file", Some(SIG_A)),
+            &finish_chunk("STOP"),
+        ]);
+        let mut streaming = LiveStreamTranslator::streaming(config(true));
+        streaming.push(input.as_bytes()).unwrap();
+        streaming.finish().unwrap();
+        assert!(streaming.state.blocks.is_empty());
+        assert_eq!(streaming.state.block_count, 4);
+        let mut buffered = LiveStreamTranslator::new(config(true));
+        buffered.push(input.as_bytes()).unwrap();
+        buffered.finish().unwrap();
+        assert_eq!(buffered.state.blocks.len(), 4);
+        assert_eq!(streaming.state.content_bytes, buffered.state.content_bytes);
+    }
+
+    #[test]
+    fn synthetic_create_time_only_events_are_accepted_in_both_modes() {
+        let create_time = json!({"createTime":"2026-11-12T00:00:00.000000Z"}).to_string();
+        let input = frames(&[
+            &create_time,
+            &text_chunk("Hi"),
+            &create_time,
+            &finish_chunk("STOP"),
+            &create_time,
+        ]);
+        let message = both_succeed(&input, false);
+        assert_eq!(message["content"], json!([{"type":"text","text":"Hi"}]));
+        assert_eq!(message["stop_reason"], "end_turn");
     }
 
     #[test]
