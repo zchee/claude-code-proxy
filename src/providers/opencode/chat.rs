@@ -83,8 +83,10 @@ pub enum TerminalPolicy {
     /// and the terminal output reaches the client only after the window.
     /// When the upstream stays open, the response completes at the read
     /// limit. A partial frame still buffered then is discarded by the Chat
-    /// Completions and Responses translators; the Messages pass-through
-    /// forwards upstream bytes as received and fails instead. Responses
+    /// Completions and Responses translators; the Messages pass-through,
+    /// which forwards only complete frames exactly as received, fails
+    /// instead. Bytes are counted from the end of the terminal frame,
+    /// whichever chunk they arrive in. Responses
     /// frames must also carry a `type` listed in
     /// [`super::responses::RESPONSES_HANDLED_EVENT_TYPES`] or
     /// [`super::responses::RESPONSES_HARMLESS_EVENT_TYPES`], a snapshot

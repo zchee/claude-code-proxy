@@ -6,7 +6,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 
 use crate::anthropic::schema::MessagesRequest;
-use crate::anthropic::sse::encode_sse_event;
+use crate::anthropic::sse::{SseEvent, encode_sse_event};
 use crate::monitor::MonitorHandle;
 use crate::providers::grok::translate::stream::SseDecoder;
 use crate::traffic::{StreamTrafficCapture, TrafficCapture};
@@ -49,9 +49,16 @@ pub fn stream_body(
 }
 
 /// The Anthropic SSE body passed through from any Messages upstream byte
-/// stream, with the labels and receive policy of `wiring`. Under
-/// [`super::chat::TerminalPolicy::Strict`] the chunk that carries
-/// `message_stop` is held until the read window after it has passed.
+/// stream, with the labels and receive policy of `wiring`.
+///
+/// Under [`super::chat::TerminalPolicy::Strict`] only complete SSE frames
+/// reach the client, as the upstream sent them: the bytes of a frame that
+/// has not ended wait for the rest of it. What arrived with `message_stop`,
+/// up to the end of its frame, is held until the read window after it has
+/// passed; bytes after that frame are read and checked, never forwarded.
+/// Traffic capture records a downstream event, and the monitor its
+/// progress, only when its bytes are released; upstream events are
+/// captured, sanitised, as they arrive.
 pub fn stream_body_with<S, E>(
     upstream: S,
     monitor: Option<MonitorHandle>,
@@ -67,7 +74,7 @@ where
     let stream = futures_util::stream::unfold(stream, |mut stream| async move {
         stream
             .state
-            .next_output_with(&mut stream.context, &mut stream.held)
+            .next_output_with(&mut stream.context, &mut stream.strict)
             .await
             .map(|bytes| (Ok::<Bytes, Infallible>(bytes), stream))
     });
@@ -100,7 +107,7 @@ where
     WiredMessagesStream {
         state,
         context: ReceiveContext::new(wiring),
-        held: None,
+        strict: StrictPassThrough::default(),
     }
 }
 
@@ -109,8 +116,16 @@ where
 struct WiredMessagesStream {
     state: MessagesStreamState<UpstreamStream>,
     context: ReceiveContext,
-    /// The chunk that carried `message_stop`, held by a strict stream until
-    /// the read window after it has passed.
+    strict: StrictPassThrough,
+}
+
+/// The bytes a strict stream has read and not yet forwarded.
+#[derive(Debug, Default)]
+struct StrictPassThrough {
+    /// The start of a frame that has not ended yet.
+    partial: Vec<u8>,
+    /// Everything not yet forwarded up to the end of the `message_stop`
+    /// frame, held until the read window after it has passed.
     held: Option<Bytes>,
 }
 
@@ -139,14 +154,17 @@ where
 {
     #[cfg(test)]
     async fn next_output(&mut self) -> Option<Bytes> {
-        self.next_output_with(&mut ReceiveContext::default(), &mut None)
-            .await
+        self.next_output_with(
+            &mut ReceiveContext::default(),
+            &mut StrictPassThrough::default(),
+        )
+        .await
     }
 
     async fn next_output_with(
         &mut self,
         context: &mut ReceiveContext,
-        held: &mut Option<Bytes>,
+        strict: &mut StrictPassThrough,
     ) -> Option<Bytes> {
         if self.terminal {
             return None;
@@ -155,8 +173,8 @@ where
             self.terminal = true;
             return None;
         }
-        if held.is_some() {
-            return self.settle_held(context, held).await;
+        if context.is_strict() {
+            return self.next_output_strict(context, strict).await;
         }
 
         let chunk = match self.upstream.next().await {
@@ -227,10 +245,6 @@ where
                 output_tokens,
             );
         }
-        if terminal && context.is_strict() {
-            *held = Some(chunk);
-            return self.settle_held(context, held).await;
-        }
         if terminal {
             if self.decoder.finish().is_err() {
                 return Some(self.fail_at("decoder", "trailing_incomplete_frame", context));
@@ -241,13 +255,174 @@ where
         Some(chunk)
     }
 
+    /// The next bytes a strict stream releases: complete frames before
+    /// `message_stop`, then what [`Self::settle_held`] releases.
+    async fn next_output_strict(
+        &mut self,
+        context: &mut ReceiveContext,
+        strict: &mut StrictPassThrough,
+    ) -> Option<Bytes> {
+        loop {
+            if strict.held.is_some() {
+                return self.settle_held(context, strict).await;
+            }
+            let chunk = match self.upstream.next().await {
+                Some(Ok(chunk)) => chunk,
+                Some(Err(_)) => return Some(self.fail_at("transport", "upstream_stream", context)),
+                None => {
+                    if self.decoder.finish().is_err() {
+                        return Some(self.fail_at("decoder", "incomplete_stream", context));
+                    }
+                    return Some(self.fail_at("protocol", "missing_message_stop", context));
+                }
+            };
+            if self.bytes == 0
+                && let Some(monitor) = self.monitor.as_ref()
+            {
+                monitor.generation_started(&self.req_id);
+            }
+            self.bytes = self.bytes.saturating_add(chunk.len() as u64);
+            self.chunks = self.chunks.saturating_add(1);
+            match self.strict_chunk(&chunk, context, strict) {
+                Ok(Some(released)) => {
+                    self.record_released(&released, context);
+                    return Some(released);
+                }
+                Ok(None) => {}
+                Err((stage, kind)) => return Some(self.fail_at(stage, kind, context)),
+            }
+        }
+    }
+
+    /// Reads one chunk of a strict stream a frame at a time. Returns the
+    /// complete frames to release, or holds everything up to the end of the
+    /// `message_stop` frame in `strict.held`. The bytes after that frame are
+    /// charged to [`super::chat::POST_TERMINAL_MAX_BYTES`] and decoded, and
+    /// any event among them is an error.
+    fn strict_chunk(
+        &mut self,
+        chunk: &Bytes,
+        context: &mut ReceiveContext,
+        strict: &mut StrictPassThrough,
+    ) -> Result<Option<Bytes>, (&'static str, &'static str)> {
+        let ends = context.frame_ends(chunk);
+        let last_end = ends.last().copied().unwrap_or(0);
+        let mut start = 0;
+        for end in ends {
+            let events = self
+                .decoder
+                .push(&chunk[start..end])
+                .map_err(|_| ("decoder", "malformed_sse"))?;
+            start = end;
+            let mut terminal = false;
+            for event in events {
+                let value: serde_json::Value =
+                    serde_json::from_str(&event.data).map_err(|_| ("json", "malformed_event"))?;
+                if let Some(capture) = self.stream_capture.as_mut() {
+                    capture.upstream_event(
+                        event.event.as_deref(),
+                        &context.wiring.receive.upstream_value(&value),
+                    );
+                }
+                let kind = value.get("type").and_then(serde_json::Value::as_str);
+                if event.event.as_deref() == Some("error") || kind == Some("error") {
+                    return Err(("upstream", "error_event"));
+                }
+                terminal |=
+                    event.event.as_deref() == Some("message_stop") || kind == Some("message_stop");
+            }
+            if !terminal {
+                continue;
+            }
+            if context.exceeds_post_terminal_bytes(chunk.len() - end) {
+                return Err(("protocol", "post_terminal_limit"));
+            }
+            let events = self
+                .decoder
+                .push(&chunk[end..])
+                .map_err(|_| ("decoder", "malformed_sse"))?;
+            if let Some(event) = events.first() {
+                self.capture_late_event(event, context);
+                return Err(("protocol", "event_after_message_stop"));
+            }
+            let mut held = std::mem::take(&mut strict.partial);
+            held.extend_from_slice(&chunk[..end]);
+            strict.held = Some(Bytes::from(held));
+            return Ok(None);
+        }
+        self.decoder
+            .push(&chunk[start..])
+            .map_err(|_| ("decoder", "malformed_sse"))?;
+        if last_end == 0 {
+            strict.partial.extend_from_slice(chunk);
+            return Ok(None);
+        }
+        let mut released = std::mem::take(&mut strict.partial);
+        released.extend_from_slice(&chunk[..last_end]);
+        strict.partial.extend_from_slice(&chunk[last_end..]);
+        Ok(Some(Bytes::from(released)))
+    }
+
+    /// Records bytes a strict stream releases to the client: their events
+    /// as downstream capture, sanitised, and their size and usage as
+    /// progress.
+    fn record_released(&mut self, released: &[u8], context: &ReceiveContext) {
+        let mut input_tokens = None;
+        let mut output_tokens = None;
+        let events = SseDecoder::default().push(released).unwrap_or_default();
+        for event in events {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&event.data) else {
+                continue;
+            };
+            input_tokens = value
+                .pointer("/message/usage/input_tokens")
+                .or_else(|| value.pointer("/usage/input_tokens"))
+                .and_then(serde_json::Value::as_u64)
+                .or(input_tokens);
+            output_tokens = value
+                .pointer("/message/usage/output_tokens")
+                .or_else(|| value.pointer("/usage/output_tokens"))
+                .and_then(serde_json::Value::as_u64)
+                .or(output_tokens);
+            if let Some(capture) = self.stream_capture.as_mut() {
+                capture.downstream_event(
+                    event.event.as_deref().unwrap_or("message"),
+                    context.wiring.receive.upstream_value(&value).into_owned(),
+                );
+            }
+        }
+        if let Some(monitor) = self.monitor.as_ref() {
+            monitor.stream_progress(
+                &self.req_id,
+                released.len() as u64,
+                1,
+                input_tokens,
+                output_tokens,
+            );
+        }
+    }
+
+    /// Captures the first event read after `message_stop`, which ends a
+    /// strict stream with an error.
+    fn capture_late_event(&mut self, event: &SseEvent, context: &ReceiveContext) {
+        if let (Some(capture), Ok(value)) = (
+            self.stream_capture.as_mut(),
+            serde_json::from_str::<serde_json::Value>(&event.data),
+        ) {
+            capture.upstream_event(
+                event.event.as_deref(),
+                &context.wiring.receive.upstream_value(&value),
+            );
+        }
+    }
+
     /// Reads a strict stream after `message_stop` until the upstream closes
-    /// or the read window ends, then releases the held chunk. Any event in
+    /// or the read window ends, then releases the held bytes. Any event in
     /// that window is an error.
     async fn settle_held(
         &mut self,
         context: &mut ReceiveContext,
-        held: &mut Option<Bytes>,
+        strict: &mut StrictPassThrough,
     ) -> Option<Bytes> {
         loop {
             let chunk = match context.read_after_terminal(&mut self.upstream).await {
@@ -255,8 +430,8 @@ where
                 Some(Some(Err(_))) => {
                     return Some(self.fail_at("transport", "upstream_stream", context));
                 }
-                // The upstream closed or the read window ended. The held chunk
-                // reaches the client as received, so a partial frame still
+                // The upstream closed or the read window ended. The held bytes
+                // reach the client as received, so a partial frame still
                 // buffered is an error in both cases.
                 Some(None) | None => {
                     if self.decoder.finish().is_err() {
@@ -275,21 +450,15 @@ where
                 Err(_) => return Some(self.fail_at("decoder", "malformed_sse", context)),
             };
             if let Some(event) = events.first() {
-                if let (Some(capture), Ok(value)) = (
-                    self.stream_capture.as_mut(),
-                    serde_json::from_str::<serde_json::Value>(&event.data),
-                ) {
-                    capture.upstream_event(
-                        event.event.as_deref(),
-                        &context.wiring.receive.upstream_value(&value),
-                    );
-                }
+                self.capture_late_event(event, context);
                 return Some(self.fail_at("protocol", "event_after_message_stop", context));
             }
         }
+        let held = strict.held.take()?;
+        self.record_released(&held, context);
         self.terminal = true;
         self.finish_capture(true, context);
-        held.take()
+        Some(held)
     }
 
     fn fail_at(&mut self, stage: &str, kind: &str, context: &ReceiveContext) -> Bytes {
@@ -610,5 +779,227 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("message_stop"), "{text}");
+    }
+
+    const INVALID: &str = "Synthetic Gateway Messages stream is invalid";
+
+    fn synthetic_strict_wiring() -> StreamWiring {
+        StreamWiring {
+            labels: StreamLabels {
+                provider: "Synthetic Gateway",
+                capture_stem: "synthetic",
+            },
+            receive: ReceivePolicy {
+                terminal: TerminalPolicy::Strict,
+                sanitize: None,
+            },
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_never_forwards_part_of_a_frame() {
+        let late = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+        for split in 0..=MESSAGE.len() {
+            for follow in ["late event", "transport error", "clean close"] {
+                let mut items = vec![
+                    Ok(Bytes::copy_from_slice(&MESSAGE.as_bytes()[..split])),
+                    Ok(Bytes::copy_from_slice(&MESSAGE.as_bytes()[split..])),
+                ];
+                match follow {
+                    "late event" => items.push(Ok(Bytes::from_static(late.as_bytes()))),
+                    "transport error" => items.push(Err(std::io::Error::other("connection reset"))),
+                    _ => {}
+                }
+                let case = format!("split at {split}, then {follow}");
+                let mut body = strict_body(futures_util::stream::iter(items)).into_data_stream();
+                let mut text = String::new();
+                while let Some(item) = body.next().await {
+                    let item = item.unwrap();
+                    let mut decoder = SseDecoder::default();
+                    decoder.push(&item).unwrap();
+                    assert!(
+                        decoder.finish().is_ok(),
+                        "{case}: {item:?} ends inside a frame"
+                    );
+                    text.push_str(std::str::from_utf8(&item).unwrap());
+                }
+                if follow == "clean close" {
+                    assert_eq!(text, MESSAGE, "{case}");
+                    continue;
+                }
+                let events = SseDecoder::default().push(text.as_bytes()).unwrap();
+                for event in &events {
+                    assert!(
+                        serde_json::from_str::<serde_json::Value>(&event.data).is_ok(),
+                        "{case}: {text}"
+                    );
+                    assert_ne!(
+                        event.event.as_deref(),
+                        Some("message_stop"),
+                        "{case}: {text}"
+                    );
+                }
+                let last = events.last().unwrap_or_else(|| panic!("{case}: {text}"));
+                assert_eq!(last.event.as_deref(), Some("error"), "{case}: {text}");
+                let error: serde_json::Value = serde_json::from_str(&last.data).unwrap();
+                assert_eq!(error["error"]["message"], INVALID, "{case}: {text}");
+            }
+        }
+    }
+
+    /// Exactly `16 * 1024 * 1024` bytes of 1024-byte comment frames. They
+    /// carry no event, so only the byte limit can stop them.
+    fn synthetic_comment_tail_of_sixteen_mib() -> String {
+        let frame = format!(": {}\n\n", "x".repeat(1020));
+        assert_eq!(frame.len(), 1024);
+        let tail = frame.repeat(16 * 1024);
+        assert_eq!(tail.len(), 16 * 1024 * 1024);
+        tail
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_charges_the_tail_after_message_stop_by_position() {
+        let at_limit = synthetic_comment_tail_of_sixteen_mib();
+        let over_limit = format!("{at_limit}\n");
+        for (tail, accepted) in [(at_limit.as_str(), true), (over_limit.as_str(), false)] {
+            let wire = format!("{MESSAGE}{tail}");
+            let inside_tail = MESSAGE.len() + 4096 + 7;
+            for parts in [
+                vec![wire.as_str()],
+                vec![MESSAGE, tail],
+                vec![&wire[..inside_tail], &wire[inside_tail..]],
+            ] {
+                let upstream = futures_util::stream::iter(chunks(&parts));
+                let text = body_text(strict_body(upstream)).await;
+                let case = format!("{} tail bytes in {} items", tail.len(), parts.len());
+                if accepted {
+                    assert_eq!(text, MESSAGE, "{case}");
+                } else {
+                    assert!(text.contains(INVALID), "{case}");
+                    assert!(!text.contains("message_stop"), "{case}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_waits_exactly_two_seconds_after_message_stop() {
+        let upstream =
+            futures_util::stream::iter(chunks(&[MESSAGE])).chain(futures_util::stream::pending());
+        let started = tokio::time::Instant::now();
+        let text = body_text(strict_body(upstream)).await;
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(2));
+        assert_eq!(text, MESSAGE);
+    }
+
+    /// The events a finished traffic capture wrote under `root`, upstream
+    /// and downstream, by event name, and the stream summary.
+    fn synthetic_captured(root: &std::path::Path) -> (Vec<String>, Vec<String>, serde_json::Value) {
+        let read = |path: &std::path::Path| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        };
+        let mut events = std::fs::read_dir(root.join("events"))
+            .map(|dir| dir.map(|entry| entry.unwrap().path()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        events.sort();
+        let mut upstream = Vec::new();
+        let mut downstream = Vec::new();
+        for path in events {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let event = read(&path)["event"].as_str().unwrap().to_string();
+            if name.ends_with("-040-upstream-event.json") {
+                upstream.push(event);
+            } else if name.ends_with("-050-downstream-event.json") {
+                downstream.push(event);
+            }
+        }
+        let summary = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.to_string_lossy()
+                    .ends_with("-061-synthetic-messages-stream-summary.json")
+            })
+            .map(|path| read(&path))
+            .unwrap_or_else(|| panic!("no stream summary under {}", root.display()));
+        (upstream, downstream, summary)
+    }
+
+    fn synthetic_traffic_body<S>(upstream: S, root: &std::path::Path) -> Body
+    where
+        S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    {
+        stream_body_with(
+            upstream,
+            None,
+            "req".into(),
+            Some(Arc::new(crate::traffic::test_capture(root.to_path_buf()))),
+            synthetic_strict_wiring(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_capture_records_only_released_output() {
+        let late = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"late\"}}\n\n";
+        let whole = format!("{MESSAGE}{late}");
+        for parts in [vec![whole.as_str()], vec![MESSAGE, late]] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("traffic");
+            let upstream = futures_util::stream::iter(chunks(&parts));
+            let text = body_text(synthetic_traffic_body(upstream, &root)).await;
+            assert!(text.contains(INVALID), "{parts:?}: {text}");
+            let (upstream, downstream, summary) = synthetic_captured(&root);
+            assert_eq!(
+                upstream,
+                [
+                    "message_start",
+                    "content_block_delta",
+                    "message_stop",
+                    "content_block_delta"
+                ],
+                "{parts:?}"
+            );
+            assert_eq!(downstream, ["error"], "{parts:?}");
+            assert_eq!(summary["completion"]["kind"], "stream_error", "{parts:?}");
+            assert_eq!(summary["downstream_events"]["captured"], 1, "{parts:?}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("traffic");
+        let upstream = futures_util::stream::iter(chunks(&[MESSAGE]));
+        let text = body_text(synthetic_traffic_body(upstream, &root)).await;
+        assert_eq!(text, MESSAGE);
+        let (upstream, downstream, summary) = synthetic_captured(&root);
+        let expected = ["message_start", "content_block_delta", "message_stop"];
+        assert_eq!(upstream, expected);
+        assert_eq!(downstream, expected);
+        assert_eq!(summary["completion"]["kind"], "stream_completion");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_capture_records_no_held_output_when_the_body_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("traffic");
+        let head = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n";
+        let rest = &MESSAGE[head.len()..];
+        let upstream = futures_util::stream::iter(chunks(&[head, rest]))
+            .chain(futures_util::stream::pending());
+        let mut body = synthetic_traffic_body(upstream, &root).into_data_stream();
+        let first = body.next().await.unwrap().unwrap();
+        assert_eq!(first, head.as_bytes());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), body.next())
+                .await
+                .is_err()
+        );
+        drop(body);
+        let (upstream, downstream, summary) = synthetic_captured(&root);
+        assert_eq!(
+            upstream,
+            ["message_start", "content_block_delta", "message_stop"]
+        );
+        assert_eq!(downstream, ["message_start"]);
+        assert_eq!(summary["completion"]["kind"], "stream_abandoned");
+        assert_eq!(summary["downstream_events"]["captured"], 1);
     }
 }
