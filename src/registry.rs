@@ -579,7 +579,7 @@ mod tests {
     fn vertex_models_route_to_vertex_without_stealing_existing_provider_ids() {
         let registry = Registry::new(AliasProvider::Codex);
         let advertised = registry.supported_models_for("vertex");
-        assert_eq!(advertised.len(), 18, "{advertised:?}");
+        assert_eq!(advertised.len(), 32, "{advertised:?}");
         for model in &advertised {
             assert_eq!(
                 registry.provider_for_model(model, None).unwrap().name(),
@@ -609,6 +609,19 @@ mod tests {
                 .provider_for_model("gemini-9-unreleased", None)
                 .is_none()
         );
+        // Vertex lists Claude only as `vertex/anthropic/<model-id>`: no bare
+        // Claude ID routes to Vertex.
+        for model in advertised
+            .iter()
+            .filter_map(|name| name.strip_prefix("vertex/anthropic/"))
+        {
+            assert!(
+                registry
+                    .provider_for_model(model, None)
+                    .is_none_or(|provider| provider.name() != "vertex"),
+                "{model}"
+            );
+        }
         // Cursor's Gemini entries keep their prefix.
         assert_eq!(
             registry
@@ -626,6 +639,8 @@ mod tests {
             ("opencode-go/kimi-k2.6", "opencode"),
             ("cursor:gpt-5.5", "cursor"),
             ("haiku", "codex"),
+            ("claude-opus-5-5", "codex"),
+            ("claude-sonnet-5", "codex"),
         ] {
             assert_eq!(
                 registry.provider_for_model(model, None).unwrap().name(),

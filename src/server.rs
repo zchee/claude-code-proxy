@@ -1327,6 +1327,21 @@ async fn handler_chat_completions(
     monitor_response_body(response, request_guard)
 }
 
+/// Every value of every `anthropic-beta` header, split on commas and
+/// trimmed, empty ones dropped, in the order received. A value that is not
+/// visible ASCII is skipped. Only the Vertex Claude path reads the result.
+fn anthropic_beta_values(headers: &http::HeaderMap) -> Vec<String> {
+    headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn native_session_id(headers: &http::HeaderMap) -> Option<String> {
     [
         "x-claude-code-session-id",
@@ -1718,6 +1733,7 @@ async fn dispatch_request(
     };
 
     body.bypass_provider_model_override = auto_review_route.is_some() && provider.name() == "codex";
+    body.anthropic_beta = anthropic_beta_values(&headers);
 
     if let Some(route) = auto_review_route.as_ref() {
         log.info(
@@ -2497,5 +2513,58 @@ mod auto_review_tests {
             apply_auto_review_model(&mut classifier, true, Some("grok-4.5"), "codex").is_none()
         );
         assert_eq!(classifier.model.as_deref(), Some("gpt-5.6-sol"));
+    }
+}
+
+#[cfg(test)]
+mod anthropic_beta_header_tests {
+    use http::{HeaderMap, HeaderValue};
+
+    use super::anthropic_beta_values;
+
+    #[test]
+    fn synthetic_anthropic_beta_headers_are_all_split_trimmed_and_kept_in_order() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static("claude-code-20250219, oauth-2025-04-20,,  "),
+        );
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static(" effort-2025-11-24 ,claude-code-20250219"),
+        );
+        headers.append("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        assert_eq!(
+            anthropic_beta_values(&headers),
+            vec![
+                "claude-code-20250219",
+                "oauth-2025-04-20",
+                "effort-2025-11-24",
+                "claude-code-20250219",
+            ]
+        );
+    }
+
+    #[test]
+    fn synthetic_missing_or_blank_anthropic_beta_header_gives_no_values() {
+        assert!(anthropic_beta_values(&HeaderMap::new()).is_empty());
+        let mut headers = HeaderMap::new();
+        headers.append("anthropic-beta", HeaderValue::from_static(" , ,"));
+        headers.append("anthropic-beta", HeaderValue::from_static(""));
+        assert!(anthropic_beta_values(&headers).is_empty());
+    }
+
+    #[test]
+    fn synthetic_non_ascii_anthropic_beta_value_is_skipped() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_bytes(b"synthetic-\xffbeta").expect("opaque header bytes"),
+        );
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static("effort-2025-11-24"),
+        );
+        assert_eq!(anthropic_beta_values(&headers), vec!["effort-2025-11-24"]);
     }
 }

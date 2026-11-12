@@ -1129,7 +1129,7 @@ fn help_lists_the_vertex_command_and_its_auth_actions() -> Result<(), Box<dyn st
 }
 
 #[test]
-fn models_lists_vertex_after_opencode_with_its_eighteen_models()
+fn models_lists_vertex_after_opencode_with_its_gemini_and_claude_models()
 -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::cargo_bin("claude-code-proxy")?
         .args(["models"])
@@ -1155,7 +1155,7 @@ fn models_lists_vertex_after_opencode_with_its_eighteen_models()
         .split(',')
         .map(str::trim)
         .collect();
-    assert_eq!(models.len(), 18, "{vertex}");
+    assert_eq!(models.len(), 32, "{vertex}");
     for model in [
         "gemini-4-argon",
         "gemini-4-carbon",
@@ -1174,6 +1174,18 @@ fn models_lists_vertex_after_opencode_with_its_eighteen_models()
             "missing {prefixed}: {vertex}"
         );
     }
+    for model in [
+        "vertex/anthropic/claude-opus-5-5",
+        "vertex/anthropic/claude-opus-4-5@20251101",
+        "vertex/anthropic/claude-haiku-4-5@20251001",
+    ] {
+        assert!(models.contains(&model), "missing {model}: {vertex}");
+    }
+    // Claude appears only with its prefix.
+    assert!(
+        !models.iter().any(|model| model.starts_with("claude-")),
+        "{vertex}"
+    );
     Ok(())
 }
 

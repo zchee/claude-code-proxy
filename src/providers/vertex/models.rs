@@ -144,7 +144,7 @@ impl Family {
     /// is answered with a 400 that says so. The commit that adds a family's
     /// handler turns this on for it.
     pub const fn is_served(self) -> bool {
-        matches!(self, Family::Gemini)
+        matches!(self, Family::Gemini | Family::Claude)
     }
 
     /// The location rule of a model of the family that is not in the table.
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     fn advertised_models_are_the_nine_ids_bare_and_prefixed() {
         let advertised = advertised_models();
-        assert_eq!(advertised.len(), 18);
+        assert_eq!(advertised.len(), 32);
         for (id, _) in EXPECTED {
             assert!(advertised.contains(&id.to_string()), "{id}");
             assert!(advertised.contains(&format!("vertex/{id}")), "{id}");
@@ -1140,7 +1140,10 @@ mod tests {
                 message.starts_with("this version of claude-code-proxy does not support the "),
                 "{message}"
             );
-            assert!(message.ends_with("supported families: Gemini"), "{message}");
+            assert!(
+                message.ends_with("supported families: Gemini, Anthropic Claude"),
+                "{message}"
+            );
         }
         // An open-model ID that cannot go into the request is still invalid.
         assert_eq!(
@@ -1337,18 +1340,40 @@ mod tests {
         );
     }
 
+    /// The Claude names of the Vertex AI model list, each under
+    /// `vertex/anthropic/`.
+    const CLAUDE_NAMES: [&str; 14] = [
+        "vertex/anthropic/claude-fable-5-2",
+        "vertex/anthropic/claude-fable-5-1",
+        "vertex/anthropic/claude-fable-5",
+        "vertex/anthropic/claude-opus-5-5",
+        "vertex/anthropic/claude-opus-5",
+        "vertex/anthropic/claude-opus-4-8",
+        "vertex/anthropic/claude-opus-4-7",
+        "vertex/anthropic/claude-sonnet-5-5",
+        "vertex/anthropic/claude-sonnet-5",
+        "vertex/anthropic/claude-haiku-5-5",
+        "vertex/anthropic/claude-opus-4-6",
+        "vertex/anthropic/claude-sonnet-4-6",
+        "vertex/anthropic/claude-opus-4-5@20251101",
+        "vertex/anthropic/claude-haiku-4-5@20251001",
+    ];
+
     #[test]
-    fn advertised_models_are_exactly_the_gemini_names() {
+    fn advertised_models_are_exactly_the_gemini_and_claude_names() {
         let mut expected: Vec<String> = EXPECTED
             .iter()
             .flat_map(|(id, _)| [id.to_string(), format!("vertex/{id}")])
+            .chain(CLAUDE_NAMES.iter().map(|name| name.to_string()))
             .collect();
         expected.sort_unstable();
         assert_eq!(advertised_models(), expected);
+        // Claude is listed only under the prefix: the bare `claude-*` IDs
+        // stay with the providers that own them.
         assert!(
-            advertised_models()
-                .iter()
-                .all(|name| name.contains("gemini-")),
+            advertised_models().iter().all(
+                |name| name.contains("gemini-") || name.starts_with("vertex/anthropic/claude-")
+            ),
             "{:?}",
             advertised_models()
         );
@@ -1357,8 +1382,13 @@ mod tests {
                 .into_iter()
                 .filter(|family| family.is_served())
                 .collect::<Vec<_>>(),
-            vec![Family::Gemini]
+            vec![Family::Gemini, Family::Claude]
         );
+        let mut claude = Family::Claude.model_names();
+        claude.sort_unstable();
+        let mut listed = CLAUDE_NAMES.map(str::to_string).to_vec();
+        listed.sort_unstable();
+        assert_eq!(claude, listed);
     }
 
     #[test]

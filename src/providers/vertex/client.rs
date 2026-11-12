@@ -603,6 +603,23 @@ impl OpenApiPath {
     }
 }
 
+/// The `accept` value of a streaming request.
+pub const EVENT_STREAM: &str = "text/event-stream";
+
+/// The parts of a request that differ between model families.
+#[derive(Debug, Clone)]
+pub struct UpstreamCall {
+    /// Where the request goes.
+    pub url: reqwest::Url,
+    /// The `accept` header: [`EVENT_STREAM`] for a stream,
+    /// `application/json` for one JSON answer.
+    pub accept: &'static str,
+    /// Headers sent besides the credential headers, `content-type`,
+    /// `accept` and `user-agent`, and never one of those names. A capture
+    /// records them as sent, so they must not carry a secret.
+    pub headers: http::HeaderMap,
+}
+
 fn check_segment(name: &str, value: &str) -> Result<(), VertexError> {
     if value.is_empty() || value == "." || value == ".." {
         return Err(VertexError::invalid_request(format!(
@@ -729,6 +746,35 @@ impl VertexClient {
         credentials: &VertexCredentials,
         traffic: Option<&TrafficCapture>,
     ) -> Result<VertexResponse, VertexError> {
+        let call = UpstreamCall {
+            url,
+            accept: EVENT_STREAM,
+            headers: http::HeaderMap::new(),
+        };
+        self.post(target, model, call, body, credentials, traffic)
+            .await
+    }
+
+    /// POSTs `body` as JSON as `call` describes. `target` and `model` only
+    /// shape error messages.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::post_sse`].
+    pub async fn post<B: Serialize + ?Sized>(
+        &self,
+        target: &VertexTarget,
+        model: &str,
+        call: UpstreamCall,
+        body: &B,
+        credentials: &VertexCredentials,
+        traffic: Option<&TrafficCapture>,
+    ) -> Result<VertexResponse, VertexError> {
+        let UpstreamCall {
+            url,
+            accept,
+            headers: extra_headers,
+        } = call;
         let bytes = serde_json::to_vec(body).map_err(|_| {
             VertexError::new(
                 ProviderErrorKind::Api,
@@ -751,7 +797,7 @@ impl VertexClient {
                     "url": url.as_str(),
                     "provider": "vertex",
                     "transport": "http",
-                    "headers": request_headers_for_capture(&auth_headers),
+                    "headers": request_headers_for_capture(&auth_headers, accept, &extra_headers),
                     "body_bytes": bytes.len(),
                 }),
             );
@@ -760,9 +806,10 @@ impl VertexClient {
         let request = self
             .client
             .post(url)
+            .headers(extra_headers)
             .headers(auth_headers)
             .header(http::header::CONTENT_TYPE, "application/json")
-            .header(http::header::ACCEPT, "text/event-stream")
+            .header(http::header::ACCEPT, accept)
             .header(http::header::USER_AGENT, USER_AGENT)
             .body(bytes);
         let response =
@@ -846,9 +893,20 @@ async fn read_bounded(response: reqwest::Response, limit: usize) -> (Vec<u8>, bo
 }
 
 /// The request headers as a capture shows them: every credential header is
-/// `[redacted]` except the quota project, which is a project ID.
-fn request_headers_for_capture(auth_headers: &http::HeaderMap) -> serde_json::Value {
+/// `[redacted]` except the quota project, which is a project ID. The extra
+/// headers of an [`UpstreamCall`] carry no secret and are shown as sent.
+fn request_headers_for_capture(
+    auth_headers: &http::HeaderMap,
+    accept: &str,
+    extra_headers: &http::HeaderMap,
+) -> serde_json::Value {
     let mut headers = serde_json::Map::new();
+    for (name, value) in extra_headers {
+        headers.insert(
+            name.as_str().to_string(),
+            value.to_str().unwrap_or("[invalid]").into(),
+        );
+    }
     for (name, value) in auth_headers {
         let shown = if name.as_str() == "x-goog-user-project" {
             value.to_str().unwrap_or("[invalid]").to_string()
@@ -857,7 +915,7 @@ fn request_headers_for_capture(auth_headers: &http::HeaderMap) -> serde_json::Va
         };
         headers.insert(name.as_str().to_string(), shown.into());
     }
-    headers.insert("accept".to_string(), "text/event-stream".into());
+    headers.insert("accept".to_string(), accept.into());
     headers.insert("content-type".to_string(), "application/json".into());
     headers.insert("user-agent".to_string(), USER_AGENT.into());
     serde_json::Value::Object(headers)
@@ -1723,6 +1781,90 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&seen.body).unwrap(),
             serde_json::json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]})
+        );
+    }
+
+    #[tokio::test]
+    async fn post_synthetic_sends_the_accept_and_extra_headers_of_the_call() {
+        let (base, seen) = spawn_upstream(|| {
+            (
+                [(http::header::CONTENT_TYPE, "application/json")],
+                "{\"type\":\"message\"}",
+            )
+                .into_response()
+        })
+        .await;
+        let config = local_config(&base);
+        let model =
+            crate::providers::vertex::models::resolve("vertex/anthropic/claude-opus-5-5").unwrap();
+        let target = VertexTarget::for_model(&config, &model).unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            http::HeaderValue::from_static("claude-code-20250219,effort-2025-11-24"),
+        );
+        let call = UpstreamCall {
+            url: target.model_method_url(&model, "rawPredict").unwrap(),
+            accept: "application/json",
+            headers,
+        };
+        local_client()
+            .post(
+                &target,
+                &model.upstream_model,
+                call,
+                &serde_json::json!({"anthropic_version": "vertex-2023-10-16"}),
+                &fixed_credentials(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let seen = seen.lock().unwrap().take().unwrap();
+        assert_eq!(
+            seen.path_and_query,
+            "/v1/projects/synthetic-project/locations/global/publishers/anthropic/models/claude-opus-5-5:rawPredict"
+        );
+        let header = |name: &str| {
+            seen.headers
+                .iter()
+                .filter(|(seen_name, _)| seen_name == name)
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            header("anthropic-beta"),
+            vec!["claude-code-20250219,effort-2025-11-24"]
+        );
+        assert_eq!(header("accept"), vec!["application/json"]);
+        assert_eq!(header("content-type"), vec!["application/json"]);
+        assert_eq!(
+            header("authorization"),
+            vec![format!("Bearer {SYNTHETIC_TOKEN}").as_str()]
+        );
+    }
+
+    #[test]
+    fn capture_synthetic_shows_the_call_accept_and_extra_headers_but_no_credential() {
+        let mut auth = http::HeaderMap::new();
+        auth.insert(
+            http::header::AUTHORIZATION,
+            format!("Bearer {SYNTHETIC_TOKEN}").parse().unwrap(),
+        );
+        let mut extra = http::HeaderMap::new();
+        extra.insert(
+            "anthropic-beta",
+            http::HeaderValue::from_static("claude-code-20250219"),
+        );
+        assert_eq!(
+            request_headers_for_capture(&auth, "application/json", &extra),
+            serde_json::json!({
+                "anthropic-beta": "claude-code-20250219",
+                "authorization": "[redacted]",
+                "accept": "application/json",
+                "content-type": "application/json",
+                "user-agent": USER_AGENT,
+            })
         );
     }
 

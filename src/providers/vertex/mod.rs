@@ -5,8 +5,12 @@
 //! The upstream is always asked for a stream. A non-streaming client gets a
 //! message built from the same translation state, so both modes decide the
 //! stop reason and content the same way.
+//!
+//! Anthropic Claude models (`vertex/anthropic/<model-id>`) are passed
+//! through as Anthropic Messages instead; see [`claude`].
 
 pub mod auth;
+pub mod claude;
 pub mod cli;
 pub mod client;
 pub mod models;
@@ -232,6 +236,11 @@ impl Provider for VertexProvider {
     }
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+        if let Ok(model) = models::resolve(body.model.as_deref().unwrap_or_default())
+            && model.wire == WireFormat::AnthropicMessages
+        {
+            return claude::handle_messages(self, body, model, ctx).await;
+        }
         let started = match self.start(&body, &ctx).await {
             Ok(started) => started,
             Err(error) => return error_response(error),
@@ -290,6 +299,11 @@ impl Provider for VertexProvider {
         mut body: MessagesRequest,
         ctx: RequestContext,
     ) -> Result<Generation, ProviderError> {
+        if let Ok(model) = models::resolve(body.model.as_deref().unwrap_or_default())
+            && model.wire == WireFormat::AnthropicMessages
+        {
+            return claude::generate_anthropic_stream(self, body, model, ctx).await;
+        }
         body.stream = true;
         let started = self.start(&body, &ctx).await?;
         let body = stream_body(
@@ -506,12 +520,12 @@ fn check_settings(config: &ResolvedVertexConfig) -> Result<(), ProviderError> {
 }
 
 /// Refuses a model this version cannot send: every wire format but
-/// Gemini's, until the handler for that family exists. The 400 comes before
-/// any setting or credential is read.
+/// Gemini's and Claude's, until the handler for that family exists. The 400
+/// comes before any setting or credential is read.
 fn require_served(requested: &str, model: &ResolvedModel) -> Result<(), ProviderError> {
     match model.wire {
-        WireFormat::GenerateContent => Ok(()),
-        WireFormat::AnthropicMessages | WireFormat::Responses { .. } | WireFormat::MistralChat => {
+        WireFormat::GenerateContent | WireFormat::AnthropicMessages => Ok(()),
+        WireFormat::Responses { .. } | WireFormat::MistralChat => {
             Err(invalid_request(ModelError::FamilyNotSupported {
                 requested: requested.to_string(),
                 family: model.family.label(),
@@ -595,7 +609,7 @@ mod tests {
         assert!(provider.ready.get().is_none());
         assert_eq!(provider.name(), "vertex");
         let models = provider.supported_models();
-        assert_eq!(models.len(), 18, "{models:?}");
+        assert_eq!(models.len(), 32, "{models:?}");
         assert!(
             models
                 .iter()
@@ -876,7 +890,7 @@ mod tests {
             monitor: None,
         };
         let body: MessagesRequest = serde_json::from_value(json!({
-            "model": "vertex/anthropic/claude-sonnet-5",
+            "model": "vertex/xai/grok-4.7",
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .expect("valid request");
@@ -905,8 +919,6 @@ mod tests {
             monitor: None,
         };
         for (model, family) in [
-            ("vertex/anthropic/claude-opus-5-5", "Anthropic Claude"),
-            ("vertex/anthropic/claude-synthetic-9", "Anthropic Claude"),
             ("vertex/xai/grok-4.7", "xAI Grok"),
             ("vertex/openai/gpt-6.1-sol", "OpenAI"),
             ("vertex/meta/muse-spark-1.3", "Meta Muse"),
@@ -939,7 +951,7 @@ mod tests {
                 assert_eq!(
                     message,
                     format!(
-                        "this version of claude-code-proxy does not support the {family} model family on Vertex AI (requested {model:?}); supported families: Gemini"
+                        "this version of claude-code-proxy does not support the {family} model family on Vertex AI (requested {model:?}); supported families: Gemini, Anthropic Claude"
                     ),
                     "{model}"
                 );
