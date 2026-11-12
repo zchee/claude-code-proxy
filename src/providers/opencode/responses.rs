@@ -1839,9 +1839,11 @@ mod tests {
                 .into_iter()
                 .map(|(name, _)| name.unwrap_or_else(|| "message".to_string()))
                 .collect();
-            // One file per event the client received, nothing for output it
-            // never got.
-            assert_eq!(names, sent, "{case}: {text}");
+            // The translator's file for each event the client received,
+            // written when it was released, then the stream capture's copy
+            // of the same events when the capture finishes; nothing for
+            // output the client never got.
+            assert_eq!(names, [sent.clone(), sent].concat(), "{case}: {text}");
             assert_eq!(
                 texts.iter().any(|text| text.contains("early")),
                 accepted,
