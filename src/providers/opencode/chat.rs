@@ -90,9 +90,14 @@ pub enum TerminalPolicy {
     /// frames must also carry a `type` listed in
     /// [`super::responses::RESPONSES_HANDLED_EVENT_TYPES`] or
     /// [`super::responses::RESPONSES_HARMLESS_EVENT_TYPES`], a snapshot
-    /// must not carry text that no delta delivered, and a closing the
-    /// Responses translator produces by itself is a terminal event as well
-    /// (see [`super::responses::stream_body_with`]).
+    /// must not carry text that no delta delivered. When the Responses
+    /// translator closes the message by itself (it repairs a `Read` call
+    /// whose arguments stalled on whitespace), the stream ends there: the
+    /// closing is sent at once, the upstream is not read again and is
+    /// dropped, and what it would have sent afterwards is neither waited for
+    /// nor checked. The read window and the byte limit apply only to a
+    /// completion the upstream sends (see
+    /// [`super::responses::stream_body_with`]).
     Strict,
 }
 

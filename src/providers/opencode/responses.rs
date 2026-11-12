@@ -17,7 +17,7 @@ use crate::traffic::{StreamTrafficCapture, TrafficCapture};
 
 use super::chat::{
     FrameScanner, POST_TERMINAL_MAX_BYTES, ReceiveContext, StreamLabels, StreamWiring,
-    TerminalPolicy, UpstreamStream, box_upstream, stream_error,
+    TerminalPolicy, UpstreamStream, box_upstream,
 };
 use super::client::{OpenCodeError, OpenCodeResponse};
 
@@ -199,10 +199,15 @@ pub fn accumulate_response_with(
         .map_err(|error| wiring.receive.upstream_error(error))
 }
 
-/// The strict frame rules over a whole buffered body.
+/// The strict frame rules over a whole buffered body. The frames are also
+/// run through the live translator: when it closes the message by itself,
+/// the body is settled there, as on the streaming path, and what follows is
+/// not checked. The accumulator stops at the same point.
 fn check_buffered_frames(upstream: &[u8], labels: &StreamLabels) -> anyhow::Result<()> {
     let invalid =
         |kind: &str| anyhow::anyhow!("{} Responses stream is invalid: {kind}", labels.provider);
+    let mut translator = LiveStreamTranslator::new("", "")
+        .with_incomplete_response_policy(IncompleteResponsePolicy::AllowMaxOutputTokens);
     let mut decoder = SseDecoder::default();
     let mut frames = FrameScanner::default();
     let mut deltas = DeltasSeen::default();
@@ -245,6 +250,15 @@ fn check_buffered_frames(upstream: &[u8], labels: &StreamLabels) -> anyhow::Resu
             if completed && upstream.len() - end > POST_TERMINAL_MAX_BYTES {
                 return Err(invalid("post_terminal_limit"));
             }
+            // An upstream failure is reported by the accumulator, so a
+            // translation error ends the frame check without one of its own.
+            if !completed
+                && translator
+                    .accept(&value, None)
+                    .map_or(true, |_| translator.is_finished())
+            {
+                return Ok(());
+            }
         }
     }
     decoder.finish().map_err(|_| invalid("incomplete_stream"))?;
@@ -277,11 +291,15 @@ pub fn stream_body(
 /// `response.incomplete` or `response.done`) is the only terminal event the
 /// upstream sends: it is held, and the read window of
 /// [`super::chat::POST_TERMINAL_READ_LIMIT`] starts after it. One `[DONE]`
-/// after it is accepted and does not start the window again. A closing the
-/// translator produces by itself, before the upstream's completion (the
-/// repair of a `Read` call whose arguments stalled on whitespace), is held
-/// the same way and also starts the window; any event after it, the
-/// upstream's own completion included, is an error.
+/// after it is accepted and does not start the window again.
+///
+/// The translator can also close the message by itself, before the
+/// upstream's completion: it repairs a `Read` call whose arguments stalled
+/// on whitespace. The stream is settled there, as the Codex provider settles
+/// it: the closing goes to the client at once, the upstream is not read
+/// again and is dropped, and whatever it would have sent afterwards is
+/// neither waited for nor checked. The read window and the byte limit apply
+/// only to a completion the upstream sends.
 pub fn stream_body_with<S, E>(
     upstream: S,
     message_id: String,
@@ -299,11 +317,16 @@ where
         upstream, message_id, model, monitor, req_id, traffic, wiring,
     );
     let stream = futures_util::stream::unfold(stream, |mut stream| async move {
-        stream
+        let output = stream
             .state
             .next_output_with(&mut stream.context, &mut stream.strict)
-            .await
-            .map(|bytes| (Ok::<Bytes, Infallible>(Bytes::from(bytes)), stream))
+            .await;
+        if stream.context.is_strict() && stream.state.terminal {
+            // A settled strict stream reads nothing more, so the upstream
+            // connection is let go now rather than with the body.
+            stream.state.upstream = Box::pin(futures_util::stream::empty());
+        }
+        output.map(|bytes| (Ok::<Bytes, Infallible>(Bytes::from(bytes)), stream))
     });
     Body::from_stream(stream)
 }
@@ -355,9 +378,6 @@ struct WiredResponsesStream {
 /// What a strict stream remembers besides its receive context.
 #[derive(Debug, Default)]
 struct StrictResponses {
-    /// The closing output the translator produced before the upstream's
-    /// completion, held until the read window after it has passed.
-    held: Option<Vec<u8>>,
     deltas: DeltasSeen,
 }
 
@@ -410,12 +430,11 @@ where
         }
 
         loop {
-            let after_terminal =
-                context.is_strict() && (self.pending_completion.is_some() || strict.held.is_some());
+            let after_terminal = context.is_strict() && self.pending_completion.is_some();
             let next = if after_terminal {
                 match context.read_after_terminal(&mut self.upstream).await {
                     Some(next) => next,
-                    None => return self.complete_strict(context, strict),
+                    None => return self.complete(context),
                 }
             } else {
                 self.upstream.next().await
@@ -426,9 +445,6 @@ where
                 None => {
                     if self.decoder.finish().is_err() {
                         return Some(self.fail_at("decoder", "incomplete_stream", context));
-                    }
-                    if strict.held.is_some() {
-                        return self.complete_strict(context, strict);
                     }
                     return self.complete(context);
                 }
@@ -443,6 +459,13 @@ where
             self.chunks = self.chunks.saturating_add(1);
             if context.is_strict() {
                 match self.strict_chunk(&chunk, context, strict) {
+                    Ok(output) if self.translator.is_finished() => {
+                        self.terminal = true;
+                        self.record_progress(&output);
+                        self.capture_downstream(&output);
+                        self.finish_capture(true, context);
+                        return Some(output);
+                    }
                     Ok(output) if output.is_empty() => continue,
                     Ok(output) => {
                         self.record_progress(&output);
@@ -513,14 +536,16 @@ where
     /// Handles one chunk of a strict stream a frame at a time. The bytes after
     /// the completion's frame are charged to [`POST_TERMINAL_MAX_BYTES`] by
     /// position, so a tail counts the same in the completion's chunk as in
-    /// later ones.
+    /// later ones. When the translator closes the message by itself, the
+    /// rest of the chunk is left unread and the output ends with that
+    /// closing.
     fn strict_chunk(
         &mut self,
         chunk: &[u8],
         context: &mut ReceiveContext,
         strict: &mut StrictResponses,
     ) -> Result<Vec<u8>, (&'static str, &'static str)> {
-        let mut terminal = self.pending_completion.is_some() || strict.held.is_some();
+        let mut terminal = self.pending_completion.is_some();
         if terminal && context.exceeds_post_terminal_bytes(chunk.len()) {
             return Err(("protocol", "post_terminal_limit"));
         }
@@ -538,7 +563,10 @@ where
             for event in events {
                 self.strict_event(&event, context, strict, &mut output)?;
             }
-            if !terminal && (self.pending_completion.is_some() || strict.held.is_some()) {
+            if self.translator.is_finished() {
+                return Ok(output);
+            }
+            if !terminal && self.pending_completion.is_some() {
                 terminal = true;
                 if context.exceeds_post_terminal_bytes(chunk.len() - end) {
                     return Err(("protocol", "post_terminal_limit"));
@@ -550,8 +578,7 @@ where
 
     /// One frame of a strict stream: a `type` from neither list is an error,
     /// so is a snapshot whose text no delta delivered, and after the
-    /// completion only one `[DONE]` is accepted. A closing the translator
-    /// produces by itself is held in `strict`.
+    /// completion only one `[DONE]` is accepted.
     fn strict_event(
         &mut self,
         event: &SseEvent,
@@ -578,7 +605,7 @@ where
                 &context.wiring.receive.upstream_value(&value),
             );
         }
-        if self.pending_completion.is_some() || strict.held.is_some() {
+        if self.pending_completion.is_some() {
             return Err(("protocol", "event_after_completion"));
         }
         if let Some(kind) = unlisted_frame(&value).or_else(|| strict.deltas.check(&value)) {
@@ -589,35 +616,12 @@ where
             self.pending_completion = Some(value);
             return Ok(());
         }
-        let finished_before = self.translator.is_finished();
         let translated = self
             .translator
             .accept(&value, self.traffic.as_deref())
             .map_err(|_| ("translation", "invalid_event"))?;
-        if !finished_before && self.translator.is_finished() {
-            strict.held = Some(translated);
-        } else {
-            output.extend(translated);
-        }
+        output.extend(translated);
         Ok(())
-    }
-
-    /// Ends a strict stream once the upstream closed or the read window
-    /// passed: releases a closing the translator produced by itself, or
-    /// translates the upstream's held completion.
-    fn complete_strict(
-        &mut self,
-        context: &ReceiveContext,
-        strict: &mut StrictResponses,
-    ) -> Option<Vec<u8>> {
-        let Some(output) = strict.held.take() else {
-            return self.complete(context);
-        };
-        self.terminal = true;
-        self.record_progress(&output);
-        self.capture_downstream(&output);
-        self.finish_capture(true, context);
-        Some(output)
     }
 
     /// Translates the held completion once the upstream closed or, for a
@@ -668,16 +672,11 @@ where
                 }),
             );
         }
-        let message = format!("{} Responses stream is invalid", labels.provider);
-        // A strict stream may have finished the translator with a closing it
-        // still holds; the translator then has no error to give, so the error
-        // event is written here and the held closing is never sent.
-        let output = if context.is_strict() && self.translator.is_finished() {
-            stream_error(&message)
-        } else {
-            self.translator
-                .error_chunk(&message, "api_error", self.traffic.as_deref())
-        };
+        let output = self.translator.error_chunk(
+            &format!("{} Responses stream is invalid", labels.provider),
+            "api_error",
+            self.traffic.as_deref(),
+        );
         self.capture_downstream(&output);
         self.finish_capture(false, context);
         output
@@ -1214,82 +1213,163 @@ mod tests {
             .collect()
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn synthetic_strict_stream_holds_a_repaired_read_call_until_the_read_window_ends() {
-        let wire = format!("{READ_CALL_ADDED}{}", synthetic_stalled_read_delta());
-        let upstream =
-            futures_util::stream::iter(chunks(&[&wire])).chain(futures_util::stream::pending());
-        let mut body = strict_body(upstream).into_data_stream();
-        let started = tokio::time::Instant::now();
-        let first = body.next().await.unwrap().unwrap();
-        let first = String::from_utf8(first.to_vec()).unwrap();
-        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
-        assert!(first.contains("content_block_start"), "{first}");
-        assert!(!first.contains("message_stop"), "{first}");
-        let last = body.next().await.unwrap().unwrap();
-        let last = String::from_utf8(last.to_vec()).unwrap();
-        assert_eq!(started.elapsed(), std::time::Duration::from_secs(2));
-        assert!(
-            last.contains(r#""partial_json":"{\"file_path\":\"/tmp/a\"}""#),
-            "{last}"
-        );
-        assert!(last.contains(r#""stop_reason":"tool_use""#), "{last}");
-        assert!(
-            last.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
-            "{last}"
-        );
-        assert!(body.next().await.is_none());
-
-        let started = tokio::time::Instant::now();
-        let text = body_text(strict_body(futures_util::stream::iter(chunks(&[&wire])))).await;
-        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
-        assert!(text.contains(r#""stop_reason":"tool_use""#), "{text}");
-        assert!(!text.contains("api_error"), "{text}");
+    /// `items`, then `forever` without end when it is set (otherwise an
+    /// upstream that stays open), and the count of items handed out.
+    fn synthetic_counted_upstream(
+        items: Vec<Result<Bytes, std::io::Error>>,
+        forever: Option<&'static str>,
+    ) -> (
+        impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&pulled);
+        let tail: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+            match forever {
+                Some(frame) => Box::pin(futures_util::stream::repeat_with(move || {
+                    Ok(Bytes::from_static(frame.as_bytes()))
+                })),
+                None => Box::pin(futures_util::stream::pending()),
+            };
+        let upstream = futures_util::stream::iter(items)
+            .chain(tail)
+            .inspect(move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        (upstream, pulled)
     }
 
+    /// The body ends with the repaired `Read` call, delivered once, and no
+    /// error.
+    fn assert_repaired_read_delivered_once(text: &str, case: &str) {
+        let events = events_of(text);
+        assert!(
+            events
+                .iter()
+                .all(|(name, _)| name.as_deref() != Some("error")),
+            "{case}: {text}"
+        );
+        assert_eq!(
+            text.matches(r#""partial_json":"{\"file_path\":\"/tmp/a\"}""#)
+                .count(),
+            1,
+            "{case}: {text}"
+        );
+        assert_eq!(
+            text.matches(r#""stop_reason":"tool_use""#).count(),
+            1,
+            "{case}: {text}"
+        );
+        assert_eq!(
+            text.matches("event: message_stop").count(),
+            1,
+            "{case}: {text}"
+        );
+        assert!(
+            text.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+            "{case}: {text}"
+        );
+    }
+
+    const WHITESPACE_DELTA: &str = "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"    \"}\n\n";
+
     #[tokio::test(start_paused = true)]
-    async fn synthetic_strict_stream_reports_a_tail_after_a_repaired_read_call() {
-        let repaired = format!("{READ_CALL_ADDED}{}", synthetic_stalled_read_delta());
-        let late = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n";
-        for tail in [
-            format!("{COMPLETION}{late}"),
-            "data: not-json\n\n".to_string(),
-            late.to_string(),
-            PING.to_string(),
-            "data: [DONE]\n\n".to_string(),
-            // The upstream's own completion after a repair is a second
-            // terminal event, so it is rejected as well.
-            COMPLETION.to_string(),
+    async fn synthetic_strict_stream_settles_at_a_repaired_read_call_while_the_upstream_keeps_sending()
+     {
+        let stalled = synthetic_stalled_read_delta();
+        let repaired = format!("{READ_CALL_ADDED}{stalled}");
+        for (case, parts) in [
+            ("repair in one item", vec![repaired.as_str()]),
+            (
+                "repair over two items",
+                vec![READ_CALL_ADDED, stalled.as_str()],
+            ),
         ] {
-            let wire = format!("{repaired}{tail}");
-            for parts in [
-                vec![wire.as_str()],
-                vec![&wire[..repaired.len()], tail.as_str()],
-            ] {
-                let text = body_text(strict_body(futures_util::stream::iter(chunks(&parts)))).await;
-                let case = format!("tail {tail:?} in {} items", parts.len());
-                assert!(!text.contains("message_stop"), "{case}: {text}");
-                let events = events_of(&text);
-                let (name, value) = events.last().unwrap_or_else(|| panic!("{case}: {text}"));
-                assert_eq!(name.as_deref(), Some("error"), "{case}: {text}");
-                assert_eq!(value["error"]["message"], INVALID, "{case}: {text}");
-            }
+            let items = chunks(&parts);
+            let (upstream, pulled) = synthetic_counted_upstream(items, Some(WHITESPACE_DELTA));
+            let started = tokio::time::Instant::now();
+            let text = body_text(strict_body(upstream)).await;
+            assert_eq!(started.elapsed(), std::time::Duration::ZERO, "{case}");
+            assert_repaired_read_delivered_once(&text, case);
+            assert_eq!(
+                pulled.load(std::sync::atomic::Ordering::SeqCst),
+                parts.len(),
+                "{case}: the upstream was read after the repair"
+            );
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn synthetic_strict_stream_reports_a_transport_error_after_a_repaired_read_call() {
+    async fn synthetic_strict_stream_ignores_a_completion_and_late_delta_after_a_repaired_read_call()
+     {
+        let repaired = format!("{READ_CALL_ADDED}{}", synthetic_stalled_read_delta());
+        let late = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n";
+        let tail = format!("{COMPLETION}{late}");
+        let wire = format!("{repaired}{tail}");
+        for (case, parts) in [
+            ("tail in the repair's item", vec![wire.as_str()]),
+            (
+                "tail in a later item",
+                vec![repaired.as_str(), tail.as_str()],
+            ),
+        ] {
+            let (upstream, pulled) = synthetic_counted_upstream(chunks(&parts), None);
+            let started = tokio::time::Instant::now();
+            let text = body_text(strict_body(upstream)).await;
+            assert_eq!(started.elapsed(), std::time::Duration::ZERO, "{case}");
+            assert_repaired_read_delivered_once(&text, case);
+            assert!(!text.contains("late"), "{case}: {text}");
+            assert_eq!(
+                pulled.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_ignores_a_transport_error_after_a_repaired_read_call() {
         let wire = format!("{READ_CALL_ADDED}{}", synthetic_stalled_read_delta());
-        let upstream = futures_util::stream::iter([
+        let items = vec![
             Ok(Bytes::from(wire)),
             Err(std::io::Error::other("connection reset")),
-        ]);
+        ];
+        let (upstream, pulled) = synthetic_counted_upstream(items, None);
         let text = body_text(strict_body(upstream)).await;
-        assert!(!text.contains("message_stop"), "{text}");
-        let events = events_of(&text);
-        let (name, value) = events.last().unwrap();
-        assert_eq!(name.as_deref(), Some("error"), "{text}");
-        assert_eq!(value["error"]["message"], INVALID, "{text}");
+        assert_repaired_read_delivered_once(&text, "transport error after the repair");
+        assert_eq!(pulled.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn synthetic_strict_buffered_response_settles_at_a_repaired_read_call() {
+        let repaired = format!("{READ_CALL_ADDED}{}", synthetic_stalled_read_delta());
+        let late = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n";
+        for (case, wire) in [
+            (
+                "whitespace keeps coming",
+                format!("{repaired}{}", WHITESPACE_DELTA.repeat(3)),
+            ),
+            (
+                "completion and a late delta",
+                format!("{repaired}{COMPLETION}{late}"),
+            ),
+        ] {
+            let strict =
+                accumulate_response_with(wire.as_bytes(), "msg", "model", &strict_wiring())
+                    .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+            assert_eq!(strict["stop_reason"], "tool_use", "{case}: {strict}");
+            let tool_use = strict["content"]
+                .as_array()
+                .and_then(|blocks| blocks.iter().find(|block| block["type"] == "tool_use"))
+                .unwrap_or_else(|| panic!("{case}: {strict}"));
+            assert_eq!(
+                tool_use["input"],
+                serde_json::json!({"file_path": "/tmp/a"}),
+                "{case}"
+            );
+            let default = accumulate_response(wire.as_bytes(), "msg", "model").unwrap();
+            assert_eq!(strict, default, "{case}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
