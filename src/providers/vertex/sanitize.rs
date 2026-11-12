@@ -101,6 +101,16 @@ pub fn sanitize_vertex_text(text: &str, secrets: &[&str]) -> String {
     sanitize_upstream_text(&without_data, secrets)
 }
 
+/// `text` with every occurrence of each non-empty secret replaced by
+/// `[redacted]`, verbatim or with any of its bytes percent-encoded once, as
+/// [`sanitize_vertex_text`] finds them. Nothing else changes: there is no
+/// length bound, and access-token shapes, encoded runs and e-mail addresses
+/// are left alone. This is for traffic captures, which must keep upstream
+/// content whole but never the credential of the request.
+pub fn redact_secrets(text: &str, secrets: &[&str]) -> String {
+    redact_secrets_in_any_encoding(text, secrets)
+}
+
 /// A character that the secret, token and run rules can match as part of a
 /// longer value.
 fn is_run_char(c: char) -> bool {
@@ -662,5 +672,29 @@ mod tests {
             sanitize_vertex_text(&text, &[secret]),
             "[redacted len=65519] "
         );
+    }
+
+    #[test]
+    fn redact_secrets_synthetic_replaces_only_the_secret_and_keeps_long_text_whole() {
+        let encoded = SYNTHETIC_ACCESS_TOKEN
+            .replace('.', "%2E")
+            .replace('_', "%5f")
+            .replace('-', "%2D");
+        let long_prose = "plain words that are not a secret ".repeat(3_000);
+        let image = synthetic_image_base64();
+        let other_token = "ya29.a0Another0Token0Shape0That0Is0Not0Listed0abcdefghijklmn";
+        let text = format!(
+            "{long_prose}|{SYNTHETIC_ACCESS_TOKEN}|{encoded}|{image}|{other_token}|someone@example.com"
+        );
+        let redacted = redact_secrets(&text, &[SYNTHETIC_ACCESS_TOKEN]);
+        assert_eq!(
+            redacted,
+            format!("{long_prose}|[redacted]|[redacted]|{image}|{other_token}|someone@example.com")
+        );
+        // More than the prose sanitiser keeps, and longer than its scan bound.
+        assert!(long_prose.len() > MAX_SCANNED_BYTES, "{}", long_prose.len());
+        // Nothing to redact leaves the text as it is.
+        assert_eq!(redact_secrets(&text, &[]), text);
+        assert_eq!(redact_secrets(&text, &[""]), text);
     }
 }

@@ -47,7 +47,7 @@ use crate::provider::{
 use crate::providers::codex::native::NativeResponseOutcome;
 use crate::providers::grok::translate::stream::SseDecoder;
 use crate::providers::kimi::count_tokens;
-use crate::providers::opencode::chat::sanitize_upstream_messages;
+use crate::providers::opencode::chat::{redact_every_string, sanitize_upstream_messages};
 use crate::traffic::{StreamTrafficCapture, TrafficCapture};
 
 use self::auth::{VertexAuthError, VertexCredentials};
@@ -55,11 +55,11 @@ use self::buffered::{BufferedFailure, BufferedSink, ReadEnd, read_upstream};
 use self::cli::VERTEX_CLI;
 use self::client::{VertexClient, VertexError, VertexResponse, VertexTarget};
 use self::models::{ModelError, ResolvedModel, WireFormat};
-use self::sanitize::sanitize_vertex_text;
+use self::sanitize::{redact_secrets, sanitize_vertex_text};
 use self::translate::request::prepare_request;
 use self::translate::stream::{
     LiveStreamTranslator, MAX_SSE_FRAME_BYTES, Sanitizer, StreamError, StreamSinks,
-    TranslatorConfig, sanitize_capture, stream_body,
+    TranslatorConfig, sanitize_capture, stream_body_redacted,
 };
 
 /// Largest upstream body read for a non-streaming response. The body is
@@ -87,6 +87,8 @@ struct Started {
     upstream: VertexResponse,
     reception: Reception,
     sanitize: Sanitizer,
+    /// Takes the request's secrets out of every string a capture records.
+    redact: Sanitizer,
     model_id: String,
 }
 
@@ -209,6 +211,7 @@ impl VertexProvider {
                     .await?;
                 Ok(Started {
                     sanitize: sanitizer(&upstream),
+                    redact: redactor(&upstream),
                     upstream,
                     reception: Reception::Responses {
                         message_id: new_message_id(),
@@ -229,6 +232,7 @@ impl VertexProvider {
                     .await?;
                 Ok(Started {
                     sanitize: sanitizer(&upstream),
+                    redact: redactor(&upstream),
                     upstream,
                     reception: Reception::Mistral {
                         message_id: new_message_id(),
@@ -277,6 +281,7 @@ impl VertexProvider {
         };
         Ok(Started {
             sanitize: sanitizer(&upstream),
+            redact: redactor(&upstream),
             upstream,
             reception: Reception::Gemini(config),
             model_id: model.upstream_model,
@@ -335,6 +340,17 @@ fn sanitizer(upstream: &VertexResponse) -> Sanitizer {
     Arc::new(move |text: &str| {
         let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
         sanitize_vertex_text(text, &secrets)
+    })
+}
+
+/// The capture redactor for `upstream`: the access token the request
+/// carried, verbatim or percent-encoded once, becomes `[redacted]` in any
+/// string, and nothing else changes ([`redact_secrets`]).
+pub(super) fn redactor(upstream: &VertexResponse) -> Sanitizer {
+    let secrets: Vec<String> = upstream.access_token.iter().cloned().collect();
+    Arc::new(move |text: &str| {
+        let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
+        redact_secrets(text, &secrets)
     })
 }
 
@@ -439,11 +455,12 @@ fn stream_response_body(
         upstream,
         reception,
         sanitize,
+        redact,
         ..
     } = started;
     let upstream = upstream.into_byte_stream();
     match reception {
-        Reception::Gemini(config) => stream_body(
+        Reception::Gemini(config) => stream_body_redacted(
             upstream,
             config,
             StreamSinks {
@@ -453,13 +470,14 @@ fn stream_response_body(
                 outcome,
                 sanitize,
             },
+            redact,
         ),
         Reception::Responses { message_id, model } => report_error_events(
-            responses::stream_body(upstream, message_id, model, ctx, sanitize),
+            responses::stream_body_redacted(upstream, message_id, model, ctx, sanitize, redact),
             outcome,
         ),
         Reception::Mistral { message_id, model } => report_error_events(
-            mistral::stream_body(upstream, message_id, model, ctx, sanitize),
+            mistral::stream_body_redacted(upstream, message_id, model, ctx, sanitize, redact),
             outcome,
         ),
     }
@@ -505,12 +523,13 @@ async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
         upstream,
         reception,
         sanitize,
+        redact,
         ..
     } = started;
     let mut capture = ctx
         .traffic
         .as_ref()
-        .map(|_| BufferedCapture::for_reception(&reception));
+        .map(|_| BufferedCapture::for_reception(&reception).with_redactor(redact.clone()));
     let upstream = upstream.into_byte_stream();
     let result = match reception {
         Reception::Gemini(config) => read_message(upstream, config, &sanitize, capture.as_mut())
@@ -527,7 +546,10 @@ async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
     match result {
         Ok(message) => {
             if let (Some(traffic), Some(capture)) = (ctx.traffic.as_ref(), capture) {
-                traffic.write_json("051-downstream-response", &message);
+                traffic.write_json(
+                    "051-downstream-response",
+                    &redact_every_string(&message, &*redact),
+                );
                 capture.finish(traffic, None);
             }
             if let Some(monitor) = ctx.monitor.as_ref() {
@@ -548,10 +570,13 @@ async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
             if let (Some(traffic), Some(capture)) = (ctx.traffic.as_ref(), capture) {
                 traffic.write_json(
                     "051-downstream-response",
-                    &json!({
-                        "type": "error",
-                        "error": {"type": mapped.error_type(), "message": &mapped.message},
-                    }),
+                    &redact_every_string(
+                        &json!({
+                            "type": "error",
+                            "error": {"type": mapped.error_type(), "message": &mapped.message},
+                        }),
+                        &*redact,
+                    ),
                 );
                 capture.finish_with_kind(traffic, Some(failure.kind()));
             }
@@ -619,6 +644,8 @@ struct BufferedCapture {
     chunks: u64,
     /// Cleans one decoded upstream event with the sanitiser.
     clean: CleanEvent,
+    /// Applied to every string of an event after `clean`, when set.
+    redact: Option<Sanitizer>,
 }
 
 /// Cleans one decoded upstream event: the value and the sanitiser.
@@ -634,6 +661,16 @@ impl BufferedCapture {
             bytes: 0,
             chunks: 0,
             clean: sanitize_capture,
+            redact: None,
+        }
+    }
+
+    /// The same capture, applying `redact` to every string of every event
+    /// after the sanitiser.
+    fn with_redactor(self, redact: Sanitizer) -> Self {
+        Self {
+            redact: Some(redact),
+            ..self
         }
     }
 
@@ -661,9 +698,14 @@ impl BufferedCapture {
         };
         for event in events {
             match serde_json::from_str::<Value>(&event.data) {
-                Ok(value) => self
-                    .events
-                    .upstream_event(event.event.as_deref(), &(self.clean)(&value, &**sanitize)),
+                Ok(value) => {
+                    let cleaned = (self.clean)(&value, &**sanitize);
+                    let cleaned = match self.redact.as_ref() {
+                        Some(redact) => redact_every_string(&cleaned, &**redact),
+                        None => cleaned,
+                    };
+                    self.events.upstream_event(event.event.as_deref(), &cleaned);
+                }
                 Err(_) => self.events.malformed("json", "malformed_event"),
             }
         }
@@ -1529,6 +1571,220 @@ mod tests {
                     !text.contains(SYNTHETIC_TOKEN),
                     "{case}: {} leaked the token: {text}",
                     path.display()
+                );
+            }
+        }
+    }
+
+    /// A local server that answers every request with `body` as
+    /// `content_type`.
+    async fn synthetic_server(content_type: &'static str, body: String) -> String {
+        let app = axum::Router::new().route(
+            "/{*path}",
+            axum::routing::post(move || {
+                let body = body.clone();
+                async move { ([(http::header::CONTENT_TYPE, content_type)], body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    fn synthetic_sse(events: &[Value]) -> String {
+        events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn capture_synthetic_keeps_the_token_out_of_every_field_of_every_file() {
+        // Words, not a secret: no rule of the prose sanitiser may shorten
+        // them in a capture.
+        let long = "long synthetic answer text ".repeat(150);
+        let echoed = format!("echo {SYNTHETIC_TOKEN} {long}");
+        let gemini = synthetic_sse(&[
+            json!({"candidates":[{"content":{"role":"model","parts":[{"text":echoed}]}}]}),
+            json!({
+                "candidates":[{"content":{"role":"model","parts":[{"text":"!"}]},"finishReason":"STOP"}],
+                "usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":3}
+            }),
+        ]);
+        let responses_text = synthetic_sse(&[
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up"}}),
+            json!({"type":"response.output_text.delta","output_index":0,"delta":echoed}),
+            json!({"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":1}}}),
+        ]);
+        let responses_error = synthetic_sse(&[json!({
+            "type":"error","code":"invalid_value","message":"bad value","param":SYNTHETIC_TOKEN
+        })]);
+        let mistral_text = synthetic_sse(&[
+            json!({"choices":[{"index":0,"delta":{"role":"assistant","content":echoed}}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}),
+        ]);
+        let mistral_error = synthetic_sse(&[json!({
+            "object":"error","message":"bad request","type":"invalid_request_error","detail":SYNTHETIC_TOKEN
+        })]);
+        let claude_stream = format!(
+            "event: message_start\ndata: {}\n\nevent: content_block_start\ndata: {}\n\nevent: content_block_delta\ndata: {}\n\nevent: content_block_stop\ndata: {}\n\nevent: message_delta\ndata: {}\n\nevent: message_stop\ndata: {}\n\n",
+            json!({"type":"message_start","message":{"id":"msg_vrtx","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"usage":{"input_tokens":7,"output_tokens":1}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":echoed}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}),
+            json!({"type":"message_stop"}),
+        );
+        let claude_message = json!({
+            "id":"msg_vrtx","type":"message","role":"assistant","model":"claude-opus-5-5",
+            "content":[{"type":"text","text":echoed}],"stop_reason":"end_turn",
+            "usage":{"input_tokens":7,"output_tokens":2}
+        })
+        .to_string();
+        let sse = "text/event-stream";
+        let cases = [
+            (
+                "Gemini",
+                "vertex/gemini-3.5-flash",
+                "global",
+                sse,
+                gemini.clone(),
+                true,
+            ),
+            (
+                "Gemini",
+                "vertex/gemini-3.5-flash",
+                "global",
+                sse,
+                gemini,
+                false,
+            ),
+            (
+                "Responses text",
+                "vertex/xai/grok-4.7",
+                "global",
+                sse,
+                responses_text.clone(),
+                true,
+            ),
+            (
+                "Responses text",
+                "vertex/xai/grok-4.7",
+                "global",
+                sse,
+                responses_text,
+                false,
+            ),
+            (
+                "Responses error param",
+                "vertex/openai/gpt-6.1-sol",
+                "global",
+                sse,
+                responses_error.clone(),
+                true,
+            ),
+            (
+                "Responses error param",
+                "vertex/openai/gpt-6.1-sol",
+                "global",
+                sse,
+                responses_error,
+                false,
+            ),
+            (
+                "Mistral text",
+                "vertex/mistralai/mistral-medium-3",
+                "us-central1",
+                sse,
+                mistral_text.clone(),
+                true,
+            ),
+            (
+                "Mistral text",
+                "vertex/mistralai/mistral-medium-3",
+                "us-central1",
+                sse,
+                mistral_text,
+                false,
+            ),
+            (
+                "Mistral error detail",
+                "vertex/mistralai/mistral-medium-3",
+                "us-central1",
+                sse,
+                mistral_error.clone(),
+                true,
+            ),
+            (
+                "Mistral error detail",
+                "vertex/mistralai/mistral-medium-3",
+                "us-central1",
+                sse,
+                mistral_error,
+                false,
+            ),
+            (
+                "Claude",
+                "vertex/anthropic/claude-opus-5-5",
+                "global",
+                sse,
+                claude_stream,
+                true,
+            ),
+            (
+                "Claude",
+                "vertex/anthropic/claude-opus-5-5",
+                "global",
+                "application/json",
+                claude_message,
+                false,
+            ),
+        ];
+        for (family, model, location, content_type, answer, stream) in cases {
+            let case = format!("{family}, stream {stream}");
+            let carries_text = answer.contains(&long);
+            let base = synthetic_server(content_type, answer).await;
+            let provider = synthetic_local_provider(&base, location);
+            let root = tempfile::tempdir().expect("temporary capture directory");
+            let mut ctx = synthetic_context();
+            ctx.traffic = Some(Arc::new(crate::traffic::test_capture(
+                root.path().to_path_buf(),
+            )));
+            let body: MessagesRequest = serde_json::from_value(json!({
+                "model": model,
+                "max_tokens": 64,
+                "stream": stream,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap();
+            let response = provider.handle_messages(body, ctx).await;
+            // Read the whole body, so a stream finishes its capture.
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+
+            let files = synthetic_files_under(root.path());
+            assert!(
+                files
+                    .iter()
+                    .any(|(path, _)| path.to_string_lossy().contains("-upstream-")),
+                "{case}: {files:?}"
+            );
+            for (path, text) in &files {
+                assert!(
+                    !text.contains(SYNTHETIC_TOKEN),
+                    "{case}: {} kept the token: {text}",
+                    path.display()
+                );
+            }
+            if carries_text {
+                // The model's text is captured whole, with the token taken
+                // out.
+                let kept = format!("echo [redacted] {long}");
+                assert!(
+                    files.iter().any(|(_, text)| text.contains(&kept)),
+                    "{case}: no file kept the text whole"
                 );
             }
         }

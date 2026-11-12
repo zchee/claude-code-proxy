@@ -37,6 +37,7 @@ use crate::anthropic::sse::{encode_sse_event, parse_sse_events};
 use crate::monitor::{MonitorHandle, usage_from_anthropic_sse};
 use crate::providers::codex::native::NativeResponseOutcome;
 use crate::providers::grok::translate::stream::SseDecoder;
+use crate::providers::opencode::chat::redact_every_string;
 use crate::traffic::{StreamTrafficCapture, TrafficCapture};
 
 /// Largest SSE frame accepted. A `functionCall` arrives whole in one chunk,
@@ -1085,6 +1086,36 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: Send + 'static,
 {
+    body_of(upstream, config, sinks, None)
+}
+
+/// [`stream_body`] whose traffic capture also applies `redact` to every
+/// string of every upstream and downstream event it records, after
+/// [`sanitize_capture`]. `redact` is meant to replace the request's
+/// secrets and leave the rest of the text whole.
+pub fn stream_body_redacted<S, E>(
+    upstream: S,
+    config: TranslatorConfig,
+    sinks: StreamSinks,
+    redact: Sanitizer,
+) -> Body
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Send + 'static,
+{
+    body_of(upstream, config, sinks, Some(redact))
+}
+
+fn body_of<S, E>(
+    upstream: S,
+    config: TranslatorConfig,
+    sinks: StreamSinks,
+    redact: Option<Sanitizer>,
+) -> Body
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Send + 'static,
+{
     let state = VertexStreamState {
         upstream: Box::pin(upstream),
         translator: LiveStreamTranslator::streaming(config),
@@ -1098,6 +1129,7 @@ where
             .as_ref()
             .map(|traffic| traffic.stream_capture()),
         sinks,
+        redact,
     };
     let stream = futures_util::stream::unfold(state, |mut state| async move {
         state
@@ -1120,6 +1152,8 @@ struct VertexStreamState<E> {
     chunks: u64,
     stream_capture: Option<StreamTrafficCapture>,
     sinks: StreamSinks,
+    /// Applied to every string of a captured event, when set.
+    redact: Option<Sanitizer>,
 }
 
 impl<E> VertexStreamState<E> {
@@ -1227,16 +1261,19 @@ impl<E> VertexStreamState<E> {
             }
         };
         let sanitize = self.sinks.sanitize.clone();
+        let redact = self.redact.clone();
         let Some(capture) = self.stream_capture.as_mut() else {
             return;
         };
         for event in events {
             match serde_json::from_str::<Value>(&event.data) {
                 Ok(value) => {
-                    capture.upstream_event(
-                        event.event.as_deref(),
-                        &sanitize_capture(&value, &*sanitize),
-                    );
+                    let captured = sanitize_capture(&value, &*sanitize);
+                    let captured = match redact.as_ref() {
+                        Some(redact) => redact_every_string(&captured, &**redact),
+                        None => captured,
+                    };
+                    capture.upstream_event(event.event.as_deref(), &captured);
                 }
                 Err(_) => capture.malformed("json", "malformed_event"),
             }
@@ -1248,7 +1285,11 @@ impl<E> VertexStreamState<E> {
             return;
         };
         for event in parse_sse_events(bytes) {
-            if let Ok(value) = serde_json::from_str(&event.data) {
+            if let Ok(value) = serde_json::from_str::<Value>(&event.data) {
+                let value = match self.redact.as_ref() {
+                    Some(redact) => redact_every_string(&value, &**redact),
+                    None => value,
+                };
                 capture.downstream_event(event.event.as_deref().unwrap_or("message"), value);
             }
         }

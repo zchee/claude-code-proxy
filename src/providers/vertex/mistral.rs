@@ -16,8 +16,8 @@ use serde_json::Value;
 use crate::anthropic::schema::MessagesRequest;
 use crate::provider::RequestContext;
 use crate::providers::opencode::chat::{
-    self as translator, EffortPolicy, ReasoningReplay, ReceivePolicy, RequestPolicy, StreamLabels,
-    StreamWiring, TerminalPolicy,
+    self as translator, EffortPolicy, ReasoningReplay, ReceivePolicy, RedactedWiring,
+    RequestPolicy, StreamLabels, StreamWiring, TerminalPolicy,
 };
 
 use super::BufferedCapture;
@@ -102,7 +102,38 @@ fn wiring(sanitize: Sanitizer) -> StreamWiring {
 }
 
 /// The Anthropic SSE body translated from the upstream Mistral stream.
-/// `model` is the name the client asked for.
+/// `model` is the name the client asked for. `sanitize` cleans upstream
+/// prose; `redact` is applied to every string of every event the traffic
+/// capture records.
+pub(super) fn stream_body_redacted<S, E>(
+    upstream: S,
+    message_id: String,
+    model: String,
+    ctx: &RequestContext,
+    sanitize: Sanitizer,
+    redact: Sanitizer,
+) -> Body
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Send + 'static,
+{
+    translator::stream_body_redacted(
+        upstream,
+        message_id,
+        model,
+        ctx.monitor.clone(),
+        ctx.req_id.clone(),
+        ctx.traffic.clone(),
+        RedactedWiring {
+            wiring: wiring(sanitize),
+            redact,
+        },
+    )
+}
+
+/// [`stream_body_redacted`] with a redactor that changes nothing, for tests
+/// whose context has no traffic capture.
+#[cfg(test)]
 pub(super) fn stream_body<S, E>(
     upstream: S,
     message_id: String,
@@ -114,15 +145,8 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: Send + 'static,
 {
-    translator::stream_body_with(
-        upstream,
-        message_id,
-        model,
-        ctx.monitor.clone(),
-        ctx.req_id.clone(),
-        ctx.traffic.clone(),
-        wiring(sanitize),
-    )
+    let redact: Sanitizer = std::sync::Arc::new(str::to_string);
+    stream_body_redacted(upstream, message_id, model, ctx, sanitize, redact)
 }
 
 /// Reads the whole upstream Mistral stream with the shared buffered limits

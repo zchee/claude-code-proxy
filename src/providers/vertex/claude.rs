@@ -28,7 +28,8 @@ use crate::provider::{
 };
 use crate::providers::codex::native::NativeResponseOutcome;
 use crate::providers::opencode::chat::{
-    ReceivePolicy, StreamLabels, StreamWiring, TerminalPolicy, sanitize_upstream_messages,
+    ReceivePolicy, RedactedWiring, StreamLabels, StreamWiring, TerminalPolicy, redact_every_string,
+    sanitize_upstream_messages,
 };
 use crate::providers::opencode::messages;
 
@@ -37,7 +38,7 @@ use super::models::ResolvedModel;
 use super::sanitize::sanitize_vertex_text;
 use super::translate::stream::Sanitizer;
 use super::{
-    MAX_BUFFERED_RESPONSE_BYTES, VertexProvider, error_response, invalid_request,
+    MAX_BUFFERED_RESPONSE_BYTES, VertexProvider, error_response, invalid_request, redactor,
     report_error_events, sse_response, status_for_error_type,
 };
 
@@ -100,6 +101,8 @@ const BASE64URL: GeneralPurpose = GeneralPurpose::new(
 struct Started {
     upstream: VertexResponse,
     sanitize: Sanitizer,
+    /// Takes the request's secrets out of every string a capture records.
+    redact: Sanitizer,
 }
 
 /// The upstream method for a request: `streamRawPredict` for a stream,
@@ -282,7 +285,12 @@ async fn start(
                 .into_provider_error()
         })?;
     let sanitize = token_sanitizer(&upstream);
-    Ok(Started { upstream, sanitize })
+    let redact = redactor(&upstream);
+    Ok(Started {
+        upstream,
+        sanitize,
+        redact,
+    })
 }
 
 /// Answers a Messages request for a Claude model: the upstream stream as
@@ -341,12 +349,15 @@ fn wiring(sanitize: Sanitizer) -> StreamWiring {
 }
 
 fn stream_body(started: Started, ctx: &RequestContext) -> Body {
-    messages::stream_body_with(
+    messages::stream_body_redacted(
         started.upstream.into_byte_stream(),
         ctx.monitor.clone(),
         ctx.req_id.clone(),
         ctx.traffic.clone(),
-        wiring(started.sanitize),
+        RedactedWiring {
+            wiring: wiring(started.sanitize),
+            redact: started.redact,
+        },
     )
 }
 
@@ -360,7 +371,11 @@ fn stream_body(started: Started, ctx: &RequestContext) -> Body {
 /// answered with the status [`status_for_error_type`] gives for its type
 /// and its message, sanitised.
 async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
-    let Started { upstream, sanitize } = started;
+    let Started {
+        upstream,
+        sanitize,
+        redact,
+    } = started;
     let bytes = match read_body(upstream.into_byte_stream()).await {
         Ok(bytes) => bytes,
         Err(error) => return error_response(error),
@@ -377,20 +392,24 @@ async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
         if let Some(traffic) = ctx.traffic.as_ref() {
             traffic.write_json(
                 "032-upstream-response-body",
-                &sanitize_upstream_messages(&value, &*sanitize),
+                &redact_every_string(&sanitize_upstream_messages(&value, &*sanitize), &*redact),
             );
             traffic.write_json(
                 "051-downstream-response",
-                &json!({
-                    "type": "error",
-                    "error": {"type": error.error_type(), "message": &error.message},
-                }),
+                &redact_every_string(
+                    &json!({
+                        "type": "error",
+                        "error": {"type": error.error_type(), "message": &error.message},
+                    }),
+                    &*redact,
+                ),
             );
         }
         return error_response(error);
     }
     if let Some(traffic) = ctx.traffic.as_ref() {
-        let captured = sanitize_upstream_messages(&value, &*sanitize);
+        let captured =
+            redact_every_string(&sanitize_upstream_messages(&value, &*sanitize), &*redact);
         traffic.write_json("032-upstream-response-body", &captured);
         traffic.write_json("051-downstream-response", &captured);
     }
