@@ -144,6 +144,9 @@ struct VertexConfig {
     // the whole config file, because a file that fails to parse is ignored.
     #[serde(rename = "locationOverrides")]
     pub location_overrides: Option<serde_json::Value>,
+    // Read as any JSON value for the same reason: one bad endpoint entry
+    // must not drop the rest of the file.
+    pub endpoints: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -276,6 +279,7 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     // Listed from the resolved sources so the summary cannot disagree with
     // what the provider uses, including blank values that fall through.
     let vertex = resolve_vertex_config(&env, &cfg.config_dir);
+    let vertex_endpoints = resolve_vertex_endpoints(&cfg.config_dir);
     let vertex_settings = [
         ("vertex.project", vertex.project_setting.as_ref()),
         ("vertex.location", Some(&vertex.location_setting)),
@@ -450,6 +454,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             } else {
                 out.push(format!("{VERTEX_LOCATION_OVERRIDES_KEY} (config)"));
             }
+        }
+        if let Some(line) = vertex_endpoints.summary_line() {
+            out.push(line);
         }
         if let Some(codex) = file_cfg.codex {
             if codex
@@ -1257,6 +1264,331 @@ pub fn vertex_host(location: &str) -> String {
         "us" | "eu" => format!("aiplatform.{location}.rep.googleapis.com"),
         region => format!("{region}-aiplatform.googleapis.com"),
     }
+}
+
+/// `config.json` key holding the deployed endpoints: an object of
+/// `"<name>": {...}` members, where `<name>` is what a request names as
+/// `vertex/endpoint/<name>`.
+pub const VERTEX_ENDPOINTS_KEY: &str = "vertex.endpoints";
+
+/// The keys an endpoint entry may have.
+const VERTEX_ENDPOINT_KEYS: [&str; 6] =
+    ["endpoint", "location", "model", "project", "host", "tools"];
+
+/// Longest endpoint name. The name is part of a model name and of messages.
+const MAX_VERTEX_ENDPOINT_NAME_BYTES: usize = 64;
+
+/// Longest endpoint ID. The ID becomes one segment of the request path.
+const MAX_VERTEX_ENDPOINT_ID_BYTES: usize = 128;
+
+/// Longest `model` value. It is sent in the request body only.
+const MAX_VERTEX_ENDPOINT_MODEL_BYTES: usize = 512;
+
+/// Host suffix of a Vertex AI dedicated endpoint: Google documents its DNS
+/// name as `{endpoint_id}.{region}-{uid}.prediction.vertexai.goog`.
+pub const VERTEX_DEDICATED_HOST_SUFFIX: &str = ".prediction.vertexai.goog";
+
+/// One deployed endpoint, validated. The proxy only calls it; the user
+/// deploys the model and creates the endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexEndpointConfig {
+    /// The endpoint ID, the last segment of its resource name.
+    pub endpoint: String,
+    /// The endpoint's region. Never `global`.
+    pub location: String,
+    /// The `model` value the serving container accepts, such as vLLM's
+    /// `--served-model-name`.
+    pub model: String,
+    /// The project of the endpoint, when it is not the Vertex project.
+    pub project: Option<String>,
+    /// The dedicated endpoint URL as `scheme://host[:port]`, when the user
+    /// set one. Without it the proxy reads the endpoint once to learn it.
+    pub host: Option<String>,
+    /// False when requests that carry tools are refused before they are
+    /// sent.
+    pub tools: bool,
+}
+
+/// One entry of `vertex.endpoints` as read: its name and either the
+/// validated settings or an error that names the setting and the entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexEndpointEntry {
+    /// The member name as written in `config.json`.
+    pub name: String,
+    /// The settings, or the message saying what is wrong with them.
+    pub config: Result<VertexEndpointConfig, String>,
+}
+
+/// The deployed endpoints of `config.json`. Each entry is validated on its
+/// own, so a broken entry makes only requests to that endpoint fail.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VertexEndpoints {
+    /// The entries in the order they were read.
+    pub entries: Vec<VertexEndpointEntry>,
+    /// Set when `vertex.endpoints` is present but is not an object; there
+    /// are no entries then.
+    pub unreadable: bool,
+}
+
+impl VertexEndpoints {
+    /// The entry named `name`, if any.
+    pub fn get(&self, name: &str) -> Option<&VertexEndpointEntry> {
+        self.entries.iter().find(|entry| entry.name == name)
+    }
+
+    /// The names of the entries whose settings are valid, in the order
+    /// they were read.
+    pub fn usable_names(&self) -> impl Iterator<Item = &str> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.config.is_ok())
+            .map(|entry| entry.name.as_str())
+    }
+
+    /// The first problem: the setting is not an object, or an entry is
+    /// invalid.
+    pub fn first_error(&self) -> Option<anyhow::Error> {
+        if self.unreadable {
+            return Some(anyhow::anyhow!(unreadable_endpoints_message()));
+        }
+        self.entries
+            .iter()
+            .find_map(|entry| entry.config.as_ref().err())
+            .map(|message| anyhow::anyhow!("{message}"))
+    }
+
+    /// The startup summary line: the names of the entries, or `None` when
+    /// the setting is absent. Only names are listed: a host receives the
+    /// access token.
+    fn summary_line(&self) -> Option<String> {
+        if self.unreadable {
+            return Some(format!("{VERTEX_ENDPOINTS_KEY} (config, not an object)"));
+        }
+        if self.entries.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = self
+            .entries
+            .iter()
+            .map(|entry| {
+                if is_vertex_endpoint_name(&entry.name) {
+                    entry.name.as_str()
+                } else {
+                    "[invalid name]"
+                }
+            })
+            .collect();
+        Some(format!("{VERTEX_ENDPOINTS_KEY}: {}", names.join(", ")))
+    }
+}
+
+fn unreadable_endpoints_message() -> String {
+    format!(
+        "Invalid Vertex setting {VERTEX_ENDPOINTS_KEY} in config.json: must be an object of \"<name>\": {{\"endpoint\", \"location\", \"model\"}} members"
+    )
+}
+
+/// Whether `name` can be used as `vertex/endpoint/<name>`: letters, digits,
+/// `_` and `-`, at most 64 bytes.
+pub fn is_vertex_endpoint_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_VERTEX_ENDPOINT_NAME_BYTES
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// Reads `vertex.endpoints` from `config_dir/config.json`. There is no
+/// environment variable: an endpoint takes several values at once.
+pub fn resolve_vertex_endpoints(config_dir: &Path) -> VertexEndpoints {
+    let value = read_file_config(config_dir)
+        .and_then(|file| file.vertex)
+        .and_then(|vertex| vertex.endpoints);
+    vertex_endpoints_from_value(value.as_ref())
+}
+
+/// The deployed endpoints of this process's config file.
+pub fn vertex_endpoints() -> VertexEndpoints {
+    resolve_vertex_endpoints(&paths::config_dir())
+}
+
+/// Validates every member of `vertex.endpoints`. `null` and absence set
+/// nothing.
+fn vertex_endpoints_from_value(value: Option<&serde_json::Value>) -> VertexEndpoints {
+    match value {
+        None | Some(serde_json::Value::Null) => VertexEndpoints::default(),
+        Some(serde_json::Value::Object(members)) => VertexEndpoints {
+            entries: members
+                .iter()
+                .map(|(name, value)| VertexEndpointEntry {
+                    name: name.clone(),
+                    config: validate_vertex_endpoint(name, value),
+                })
+                .collect(),
+            unreadable: false,
+        },
+        Some(_) => VertexEndpoints {
+            entries: Vec::new(),
+            unreadable: true,
+        },
+    }
+}
+
+/// One entry's settings, or a message naming the setting and the entry.
+/// The value of `host` is never repeated, because a rejected value may
+/// carry credentials.
+fn validate_vertex_endpoint(
+    name: &str,
+    value: &serde_json::Value,
+) -> Result<VertexEndpointConfig, String> {
+    if !is_vertex_endpoint_name(name) {
+        return Err(format!(
+            "Invalid Vertex setting {VERTEX_ENDPOINTS_KEY} in config.json: endpoint name {name:?} must be letters, digits, '_' and '-', at most {MAX_VERTEX_ENDPOINT_NAME_BYTES} of them"
+        ));
+    }
+    let invalid = |reason: String| {
+        format!(
+            "Invalid Vertex setting {VERTEX_ENDPOINTS_KEY} in config.json: endpoint {name:?}: {reason}"
+        )
+    };
+    let serde_json::Value::Object(fields) = value else {
+        return Err(invalid(
+            "must be an object with the keys endpoint, location and model, and optionally project, host and tools".to_string(),
+        ));
+    };
+    if let Some(key) = fields
+        .keys()
+        .find(|key| !VERTEX_ENDPOINT_KEYS.contains(&key.as_str()))
+    {
+        return Err(invalid(format!(
+            "unknown key {key:?}; the keys are endpoint, location, model, project, host and tools"
+        )));
+    }
+    let text = |key: &str| -> Result<Option<String>, String> {
+        match fields.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(raw)) if !raw.trim().is_empty() => {
+                Ok(Some(raw.trim().to_string()))
+            }
+            Some(_) => Err(invalid(format!("{key} must be a non-empty string"))),
+        }
+    };
+    let required = |key: &str| -> Result<String, String> {
+        text(key)?.ok_or_else(|| invalid(format!("{key} is required")))
+    };
+
+    let endpoint = required("endpoint")?;
+    validate_vertex_endpoint_id(&endpoint).map_err(|reason| invalid(reason.to_string()))?;
+    let location = required("location")?;
+    validate_vertex_location(&location).map_err(|reason| invalid(format!("location {reason}")))?;
+    if location == VERTEX_DEFAULT_LOCATION {
+        return Err(invalid(
+            "location must be the endpoint's region, such as us-central1; an endpoint is never in global".to_string(),
+        ));
+    }
+    let model = required("model")?;
+    if model.len() > MAX_VERTEX_ENDPOINT_MODEL_BYTES || model.chars().any(char::is_control) {
+        return Err(invalid(format!(
+            "model must be at most {MAX_VERTEX_ENDPOINT_MODEL_BYTES} bytes without control characters"
+        )));
+    }
+    let project = text("project")?;
+    if let Some(project) = &project {
+        validate_vertex_project(project).map_err(|reason| invalid(format!("project {reason}")))?;
+    }
+    let host = text("host")?
+        .map(|host| validate_vertex_endpoint_host(&host))
+        .transpose()
+        .map_err(|reason| invalid(format!("host {reason}")))?;
+    let tools = match fields.get("tools") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Bool(tools)) => *tools,
+        Some(_) => return Err(invalid("tools must be true or false".to_string())),
+    };
+    Ok(VertexEndpointConfig {
+        endpoint,
+        location,
+        model,
+        project,
+        host,
+        tools,
+    })
+}
+
+/// An endpoint ID: lowercase letters, digits and `-`, starting with a letter
+/// or digit. Vertex AI generates numeric IDs; a user-chosen ID uses the same
+/// characters.
+fn validate_vertex_endpoint_id(value: &str) -> Result<(), &'static str> {
+    let starts_alphanumeric = value
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    if !starts_alphanumeric
+        || value.len() > MAX_VERTEX_ENDPOINT_ID_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(
+            "endpoint must be the endpoint ID: lowercase letters, digits and '-', starting with a letter or digit",
+        );
+    }
+    Ok(())
+}
+
+/// A configured `host`: the dedicated endpoint URL, or its DNS name alone,
+/// which gets `https://` in front. Checked as
+/// [`validate_vertex_dedicated_url`] checks the URL the endpoint reports.
+fn validate_vertex_endpoint_host(value: &str) -> Result<String, &'static str> {
+    if value.contains("://") {
+        validate_vertex_dedicated_url(value)
+    } else {
+        validate_vertex_dedicated_url(&format!("https://{value}"))
+    }
+}
+
+/// A URL the access token may be sent to for a deployed endpoint, returned
+/// as `scheme://host[:port]`: https to a host under
+/// `.prediction.vertexai.goog`, or a loopback host over https or plain
+/// http. No user info, path, query or fragment: the request path is
+/// appended once, by the proxy.
+///
+/// # Errors
+///
+/// A fixed reason, so callers can report it without repeating a value that
+/// may carry a credential.
+pub fn validate_vertex_dedicated_url(value: &str) -> Result<String, &'static str> {
+    let url = url::Url::parse(value).map_err(|_| "is not a valid URL")?;
+    let (loopback, dedicated) = match url.host() {
+        Some(url::Host::Ipv4(ip)) => (ip.is_loopback(), false),
+        Some(url::Host::Ipv6(ip)) => (ip.is_loopback(), false),
+        Some(url::Host::Domain(domain)) => {
+            let domain = domain.strip_suffix('.').unwrap_or(domain);
+            let dedicated = domain.len() > VERTEX_DEDICATED_HOST_SUFFIX.len()
+                && domain
+                    .to_ascii_lowercase()
+                    .ends_with(VERTEX_DEDICATED_HOST_SUFFIX);
+            (domain.eq_ignore_ascii_case("localhost"), dedicated)
+        }
+        None => return Err("has no host"),
+    };
+    match url.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        _ => return Err("must use https (plain http only for a loopback host)"),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("must not contain a user name or password");
+    }
+    if !loopback && !dedicated {
+        return Err(
+            "must be a dedicated endpoint host, https://<endpoint-id>.<region>-<uid>.prediction.vertexai.goog, or a loopback host",
+        );
+    }
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Err("must be a scheme and a host only, without a path, query or fragment");
+    }
+    Ok(url.origin().ascii_serialization())
 }
 
 pub fn is_verbose() -> bool {
@@ -3238,5 +3570,310 @@ mod tests {
         let _disabled_env = EnvGuard::set("CCP_CODEX_REQUEST_COMPRESSION", "false");
         assert!(!codex_request_compression());
         assert_eq!(codex_transport(), CodexTransport::Auto);
+    }
+
+    fn synthetic_endpoints(file: &str) -> VertexEndpoints {
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(config.path().join("config.json"), file).unwrap();
+        resolve_vertex_endpoints(config.path())
+    }
+
+    #[test]
+    fn vertex_endpoints_synthetic_valid_entries_are_read_with_their_defaults() {
+        let endpoints = synthetic_endpoints(
+            r#"{"vertex":{"endpoints":{
+                "my-llm":{"endpoint":"1234567890123456789","location":"us-central1","model":"gemma-2-9b-it"},
+                "hf_tgi":{"endpoint":"9876543210987654321","location":"europe-west4","model":"tgi",
+                          "project":"other-project","host":"9876543210987654321.europe-west4-123456789.prediction.vertexai.goog",
+                          "tools":false},
+                "local":{"endpoint":"synthetic-endpoint","location":"us-east5","model":"synthetic/model",
+                         "host":"http://127.0.0.1:8080/","tools":null,"project":null}
+            }}}"#,
+        );
+        assert!(!endpoints.unreadable);
+        assert!(endpoints.first_error().is_none(), "{endpoints:?}");
+        let tests = [
+            (
+                "my-llm",
+                VertexEndpointConfig {
+                    endpoint: "1234567890123456789".to_string(),
+                    location: "us-central1".to_string(),
+                    model: "gemma-2-9b-it".to_string(),
+                    project: None,
+                    host: None,
+                    tools: true,
+                },
+            ),
+            (
+                "hf_tgi",
+                VertexEndpointConfig {
+                    endpoint: "9876543210987654321".to_string(),
+                    location: "europe-west4".to_string(),
+                    model: "tgi".to_string(),
+                    project: Some("other-project".to_string()),
+                    // A DNS name alone gets https in front.
+                    host: Some(
+                        "https://9876543210987654321.europe-west4-123456789.prediction.vertexai.goog"
+                            .to_string(),
+                    ),
+                    tools: false,
+                },
+            ),
+            (
+                "local",
+                VertexEndpointConfig {
+                    endpoint: "synthetic-endpoint".to_string(),
+                    location: "us-east5".to_string(),
+                    model: "synthetic/model".to_string(),
+                    project: None,
+                    host: Some("http://127.0.0.1:8080".to_string()),
+                    tools: true,
+                },
+            ),
+        ];
+        for (name, expected) in tests {
+            let entry = endpoints
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is missing"));
+            assert_eq!(entry.config.as_ref(), Ok(&expected), "{name}");
+        }
+        let mut names: Vec<&str> = endpoints.usable_names().collect();
+        names.sort_unstable();
+        assert_eq!(names, ["hf_tgi", "local", "my-llm"]);
+    }
+
+    #[test]
+    fn vertex_endpoints_synthetic_invalid_entries_name_the_setting_and_the_endpoint() {
+        let prefix = "Invalid Vertex setting vertex.endpoints in config.json: ";
+        let tests = [
+            (
+                r#"{"endpoint":"123","location":"us-central1","model":"m","host":"http://synthetic.example"}"#,
+                "endpoint \"e\": host must use https (plain http only for a loopback host)",
+            ),
+            (
+                r#"{"endpoint":"123","location":"us-central1","model":"m","host":"http://123.us-central1-9.prediction.vertexai.goog"}"#,
+                "endpoint \"e\": host must use https (plain http only for a loopback host)",
+            ),
+            (
+                r#"{"endpoint":"123","location":"us-central1","model":"m","host":"https://synthetic.example"}"#,
+                "endpoint \"e\": host must be a dedicated endpoint host, https://<endpoint-id>.<region>-<uid>.prediction.vertexai.goog, or a loopback host",
+            ),
+            (
+                r#"{"endpoint":"123","location":"us-central1","model":"m","host":"https://prediction.vertexai.goog"}"#,
+                "endpoint \"e\": host must be a dedicated endpoint host, https://<endpoint-id>.<region>-<uid>.prediction.vertexai.goog, or a loopback host",
+            ),
+            (
+                r#"{"endpoint":"123","location":"us-central1","model":"m","host":"https://123.us-central1-9.prediction.vertexai.goog.synthetic.example"}"#,
+                "endpoint \"e\": host must be a dedicated endpoint host, https://<endpoint-id>.<region>-<uid>.prediction.vertexai.goog, or a loopback host",
+            ),
+            (
+                r#"{"endpoint":"123","location":"us-central1","model":"m","host":"https://123.us-central1-9.prediction.vertexai.goog/v1/projects/p"}"#,
+                "endpoint \"e\": host must be a scheme and a host only, without a path, query or fragment",
+            ),
+            (
+                r#"{"endpoint":"123","location":"us-central1","model":"m","host":"https://user:synthetic-pass@123.us-central1-9.prediction.vertexai.goog"}"#,
+                "endpoint \"e\": host must not contain a user name or password",
+            ),
+            (
+                r#"{"endpoint":"123","location":"global","model":"m"}"#,
+                "endpoint \"e\": location must be the endpoint's region, such as us-central1; an endpoint is never in global",
+            ),
+            (
+                r#"{"endpoint":"123","location":"US-CENTRAL1","model":"m"}"#,
+                "endpoint \"e\": location must be a Vertex AI location such as global, us-central1 or europe-west4: lowercase letters, digits and '-'",
+            ),
+            (
+                r#"{"location":"us-central1","model":"m"}"#,
+                "endpoint \"e\": endpoint is required",
+            ),
+            (
+                r#"{"endpoint":"123","model":"m"}"#,
+                "endpoint \"e\": location is required",
+            ),
+            (
+                r#"{"endpoint":"123","location":"us-central1","model":"  "}"#,
+                "endpoint \"e\": model must be a non-empty string",
+            ),
+            (
+                r#"{"endpoint":"123","location":"us-central1"}"#,
+                "endpoint \"e\": model is required",
+            ),
+            (
+                r#"{"endpoint":"projects/p/locations/l/endpoints/123","location":"us-central1","model":"m"}"#,
+                "endpoint \"e\": endpoint must be the endpoint ID: lowercase letters, digits and '-', starting with a letter or digit",
+            ),
+            (
+                r#"{"endpoint":123,"location":"us-central1","model":"m"}"#,
+                "endpoint \"e\": endpoint must be a non-empty string",
+            ),
+            (
+                r#"{"endpoint":"123","location":"us-central1","model":"m","project":"bad/project"}"#,
+                "endpoint \"e\": project must be a Google Cloud project ID: letters, digits, '.', '_', ':' and '-', starting with a letter or digit",
+            ),
+            (
+                r#"{"endpoint":"123","location":"us-central1","model":"m","tools":"no"}"#,
+                "endpoint \"e\": tools must be true or false",
+            ),
+            (
+                r#"{"endpointId":"123","location":"us-central1","model":"m"}"#,
+                "endpoint \"e\": unknown key \"endpointId\"; the keys are endpoint, location, model, project, host and tools",
+            ),
+            (
+                r#""123""#,
+                "endpoint \"e\": must be an object with the keys endpoint, location and model, and optionally project, host and tools",
+            ),
+        ];
+        for (entry, reason) in tests {
+            let endpoints = synthetic_endpoints(&format!(
+                r#"{{"vertex":{{"endpoints":{{"e":{entry},"ok":{{"endpoint":"1","location":"us-central1","model":"m"}}}}}}}}"#
+            ));
+            let expected = format!("{prefix}{reason}");
+            assert_eq!(
+                endpoints.get("e").map(|entry| entry.config.clone()),
+                Some(Err(expected.clone())),
+                "{entry}"
+            );
+            assert!(!expected.contains("synthetic-pass"), "{entry}");
+            // The broken entry leaves the other one usable.
+            assert_eq!(
+                endpoints.usable_names().collect::<Vec<_>>(),
+                ["ok"],
+                "{entry}"
+            );
+            assert_eq!(
+                endpoints.first_error().map(|error| error.to_string()),
+                Some(expected),
+                "{entry}"
+            );
+        }
+
+        let endpoints = synthetic_endpoints(
+            r#"{"vertex":{"endpoints":{"my llm":{"endpoint":"1","location":"us-central1","model":"m"}}}}"#,
+        );
+        assert_eq!(
+            endpoints.get("my llm").map(|entry| entry.config.clone()),
+            Some(Err(format!(
+                "{prefix}endpoint name \"my llm\" must be letters, digits, '_' and '-', at most 64 of them"
+            )))
+        );
+        assert_eq!(endpoints.usable_names().count(), 0);
+    }
+
+    #[test]
+    fn vertex_endpoints_synthetic_absent_null_and_non_objects() {
+        for file in [
+            r#"{}"#,
+            r#"{"vertex":{"project":"p"}}"#,
+            r#"{"vertex":{"endpoints":null}}"#,
+            r#"{"vertex":{"endpoints":{}}}"#,
+        ] {
+            let endpoints = synthetic_endpoints(file);
+            assert_eq!(endpoints, VertexEndpoints::default(), "{file}");
+            assert!(endpoints.first_error().is_none(), "{file}");
+            assert_eq!(endpoints.summary_line(), None, "{file}");
+        }
+        for file in [
+            r#"{"vertex":{"endpoints":["my-llm"]}}"#,
+            r#"{"vertex":{"endpoints":"my-llm"}}"#,
+        ] {
+            let endpoints = synthetic_endpoints(file);
+            assert!(endpoints.unreadable, "{file}");
+            assert!(endpoints.entries.is_empty(), "{file}");
+            assert_eq!(
+                endpoints.first_error().map(|error| error.to_string()),
+                Some(
+                    "Invalid Vertex setting vertex.endpoints in config.json: must be an object of \"<name>\": {\"endpoint\", \"location\", \"model\"} members"
+                        .to_string()
+                ),
+                "{file}"
+            );
+            assert_eq!(
+                endpoints.summary_line().as_deref(),
+                Some("vertex.endpoints (config, not an object)"),
+                "{file}"
+            );
+        }
+        // The rest of the file is still read when an endpoint is broken.
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"vertex":{"project":"file-project","endpoints":{"e":42}}}"#,
+        )
+        .unwrap();
+        let resolved = resolve_vertex_config(&HashMap::new(), config.path());
+        assert_eq!(resolved.project().unwrap(), "file-project");
+    }
+
+    #[test]
+    fn vertex_endpoints_synthetic_summary_lists_names_and_never_a_host() {
+        let endpoints = synthetic_endpoints(
+            r#"{"vertex":{"endpoints":{
+                "my-llm":{"endpoint":"1","location":"us-central1","model":"m",
+                          "host":"https://user:synthetic-pass@1.us-central1-9.prediction.vertexai.goog"},
+                "bad name":{"endpoint":"2","location":"us-central1","model":"m"}
+            }}}"#,
+        );
+        let line = endpoints.summary_line().expect("a summary line");
+        assert!(line.starts_with("vertex.endpoints: "), "{line}");
+        assert!(line.contains("my-llm"), "{line}");
+        assert!(line.contains("[invalid name]"), "{line}");
+        assert!(!line.contains("bad name"), "{line}");
+        assert!(!line.contains("synthetic-pass"), "{line}");
+        assert!(!line.contains("prediction.vertexai.goog"), "{line}");
+    }
+
+    #[test]
+    fn vertex_dedicated_url_synthetic_takes_the_documented_form_and_refuses_others() {
+        let accepted = [
+            (
+                "https://1234567890123456789.us-central1-987654321.prediction.vertexai.goog",
+                "https://1234567890123456789.us-central1-987654321.prediction.vertexai.goog",
+            ),
+            (
+                "https://1234567890123456789.us-central1-987654321.prediction.vertexai.goog/",
+                "https://1234567890123456789.us-central1-987654321.prediction.vertexai.goog",
+            ),
+            (
+                "https://1234567890123456789.us-central1-abc.PREDICTION.vertexai.goog",
+                "https://1234567890123456789.us-central1-abc.prediction.vertexai.goog",
+            ),
+            ("http://127.0.0.1:18080", "http://127.0.0.1:18080"),
+            ("http://[::1]:18080/", "http://[::1]:18080"),
+            ("https://localhost:18443", "https://localhost:18443"),
+        ];
+        for (value, expected) in accepted {
+            assert_eq!(
+                validate_vertex_dedicated_url(value).as_deref(),
+                Ok(expected),
+                "{value}"
+            );
+        }
+        let refused = [
+            // A DNS name without a scheme is not a URL: nothing is put in
+            // front of what the endpoint reports.
+            (
+                "1234567890123456789.us-central1-987654321.prediction.vertexai.goog",
+                "is not a valid URL",
+            ),
+            (
+                "http://1234567890123456789.us-central1-987654321.prediction.vertexai.goog",
+                "must use https (plain http only for a loopback host)",
+            ),
+            (
+                "https://us-central1-aiplatform.googleapis.com",
+                "must be a dedicated endpoint host, https://<endpoint-id>.<region>-<uid>.prediction.vertexai.goog, or a loopback host",
+            ),
+            (
+                "https://1.us-central1-9.prediction.vertexai.goog?x=1",
+                "must be a scheme and a host only, without a path, query or fragment",
+            ),
+            (
+                "ftp://1.us-central1-9.prediction.vertexai.goog",
+                "must use https (plain http only for a loopback host)",
+            ),
+        ];
+        for (value, reason) in refused {
+            assert_eq!(validate_vertex_dedicated_url(value), Err(reason), "{value}");
+        }
     }
 }
