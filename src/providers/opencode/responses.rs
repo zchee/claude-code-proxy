@@ -17,7 +17,7 @@ use crate::traffic::{StreamTrafficCapture, TrafficCapture};
 
 use super::chat::{
     FrameScanner, POST_TERMINAL_MAX_BYTES, ReceiveContext, StreamLabels, StreamWiring,
-    TerminalPolicy, UpstreamStream, box_upstream,
+    TerminalPolicy, UpstreamStream, box_upstream, stream_error,
 };
 use super::client::{OpenCodeError, OpenCodeResponse};
 
@@ -52,7 +52,11 @@ pub const RESPONSES_HANDLED_EVENT_TYPES: &[&str] = &[
 
 /// Responses event types the Codex translator ignores and that carry
 /// nothing it would need: progress notifications and the `.done` events
-/// that repeat what the deltas already delivered.
+/// that repeat what the deltas already delivered. Under
+/// [`TerminalPolicy::Strict`] a snapshot here, or a `response.output_item.done`,
+/// that carries output text or reasoning summary text when no delta of that
+/// kind has arrived in the stream is an error: the translator would drop
+/// that text.
 pub const RESPONSES_HARMLESS_EVENT_TYPES: &[&str] = &[
     "response.queued",
     "response.content_part.added",
@@ -64,6 +68,62 @@ pub const RESPONSES_HARMLESS_EVENT_TYPES: &[&str] = &[
 
 const TERMINAL_EVENT_TYPES: [&str; 3] =
     ["response.completed", "response.incomplete", "response.done"];
+
+/// Which kinds of text a strict stream has received as deltas, so that a
+/// snapshot repeating them can be told from one that carries text no delta
+/// delivered.
+#[derive(Debug, Default)]
+struct DeltasSeen {
+    output_text: bool,
+    reasoning_summary: bool,
+}
+
+impl DeltasSeen {
+    /// Notes the delta `value` carries, or returns why a strict stream
+    /// rejects it: a snapshot with non-empty text of a kind no delta has
+    /// delivered.
+    fn check(&mut self, value: &serde_json::Value) -> Option<&'static str> {
+        let has_text = |text: Option<&serde_json::Value>| {
+            text.and_then(serde_json::Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+        };
+        let (carries_text, delivered) = match value.get("type")?.as_str()? {
+            "response.output_text.delta" => {
+                self.output_text |= has_text(value.get("delta"));
+                return None;
+            }
+            "response.reasoning_summary_text.delta" => {
+                self.reasoning_summary |= has_text(value.get("delta"));
+                return None;
+            }
+            "response.output_text.done" => (has_text(value.get("text")), self.output_text),
+            "response.content_part.added" | "response.content_part.done" => {
+                (has_text(value.pointer("/part/text")), self.output_text)
+            }
+            "response.reasoning_summary_text.done" => {
+                (has_text(value.get("text")), self.reasoning_summary)
+            }
+            "response.reasoning_summary_part.done" => (
+                has_text(value.pointer("/part/text")),
+                self.reasoning_summary,
+            ),
+            "response.output_item.done" => {
+                let item = value.get("item")?;
+                let (parts, delivered) = match item.get("type")?.as_str()? {
+                    "message" => (item.get("content"), self.output_text),
+                    "reasoning" => (item.get("summary"), self.reasoning_summary),
+                    _ => return None,
+                };
+                let carries_text = parts
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|parts| parts.iter().any(|part| has_text(part.get("text"))));
+                (carries_text, delivered)
+            }
+            _ => return None,
+        };
+        (carries_text && !delivered).then_some("snapshot_without_delta")
+    }
+}
 
 /// Why a strict stream rejects a parsed frame, or `None` when its `type`
 /// is listed.
@@ -145,6 +205,7 @@ fn check_buffered_frames(upstream: &[u8], labels: &StreamLabels) -> anyhow::Resu
         |kind: &str| anyhow::anyhow!("{} Responses stream is invalid: {kind}", labels.provider);
     let mut decoder = SseDecoder::default();
     let mut frames = FrameScanner::default();
+    let mut deltas = DeltasSeen::default();
     let mut completed = false;
     let mut done_seen = false;
     let mut start = 0;
@@ -174,7 +235,7 @@ fn check_buffered_frames(upstream: &[u8], labels: &StreamLabels) -> anyhow::Resu
             }
             let value: serde_json::Value =
                 serde_json::from_str(data).map_err(|_| invalid("malformed_event"))?;
-            if let Some(kind) = unlisted_frame(&value) {
+            if let Some(kind) = unlisted_frame(&value).or_else(|| deltas.check(&value)) {
                 return Err(invalid(kind));
             }
             completed = value
@@ -211,6 +272,16 @@ pub fn stream_body(
 
 /// The Anthropic SSE body translated from any Responses upstream byte
 /// stream, with the labels and receive policy of `wiring`.
+///
+/// Under [`TerminalPolicy::Strict`], `response.completed` (or
+/// `response.incomplete` or `response.done`) is the only terminal event the
+/// upstream sends: it is held, and the read window of
+/// [`super::chat::POST_TERMINAL_READ_LIMIT`] starts after it. One `[DONE]`
+/// after it is accepted and does not start the window again. A closing the
+/// translator produces by itself, before the upstream's completion (the
+/// repair of a `Read` call whose arguments stalled on whitespace), is held
+/// the same way and also starts the window; any event after it, the
+/// upstream's own completion included, is an error.
 pub fn stream_body_with<S, E>(
     upstream: S,
     message_id: String,
@@ -230,7 +301,7 @@ where
     let stream = futures_util::stream::unfold(stream, |mut stream| async move {
         stream
             .state
-            .next_output_with(&mut stream.context)
+            .next_output_with(&mut stream.context, &mut stream.strict)
             .await
             .map(|bytes| (Ok::<Bytes, Infallible>(Bytes::from(bytes)), stream))
     });
@@ -269,6 +340,7 @@ where
     WiredResponsesStream {
         state,
         context: ReceiveContext::new(wiring),
+        strict: StrictResponses::default(),
     }
 }
 
@@ -277,6 +349,16 @@ where
 struct WiredResponsesStream {
     state: ResponsesStreamState<UpstreamStream>,
     context: ReceiveContext,
+    strict: StrictResponses,
+}
+
+/// What a strict stream remembers besides its receive context.
+#[derive(Debug, Default)]
+struct StrictResponses {
+    /// The closing output the translator produced before the upstream's
+    /// completion, held until the read window after it has passed.
+    held: Option<Vec<u8>>,
+    deltas: DeltasSeen,
 }
 
 impl Drop for WiredResponsesStream {
@@ -307,10 +389,18 @@ where
 {
     #[cfg(test)]
     async fn next_output(&mut self) -> Option<Vec<u8>> {
-        self.next_output_with(&mut ReceiveContext::default()).await
+        self.next_output_with(
+            &mut ReceiveContext::default(),
+            &mut StrictResponses::default(),
+        )
+        .await
     }
 
-    async fn next_output_with(&mut self, context: &mut ReceiveContext) -> Option<Vec<u8>> {
+    async fn next_output_with(
+        &mut self,
+        context: &mut ReceiveContext,
+        strict: &mut StrictResponses,
+    ) -> Option<Vec<u8>> {
         if self.terminal {
             return None;
         }
@@ -320,11 +410,12 @@ where
         }
 
         loop {
-            let after_terminal = context.is_strict() && self.pending_completion.is_some();
+            let after_terminal =
+                context.is_strict() && (self.pending_completion.is_some() || strict.held.is_some());
             let next = if after_terminal {
                 match context.read_after_terminal(&mut self.upstream).await {
                     Some(next) => next,
-                    None => return self.complete(context),
+                    None => return self.complete_strict(context, strict),
                 }
             } else {
                 self.upstream.next().await
@@ -335,6 +426,9 @@ where
                 None => {
                     if self.decoder.finish().is_err() {
                         return Some(self.fail_at("decoder", "incomplete_stream", context));
+                    }
+                    if strict.held.is_some() {
+                        return self.complete_strict(context, strict);
                     }
                     return self.complete(context);
                 }
@@ -348,7 +442,7 @@ where
             self.bytes = self.bytes.saturating_add(chunk.len() as u64);
             self.chunks = self.chunks.saturating_add(1);
             if context.is_strict() {
-                match self.strict_chunk(&chunk, context) {
+                match self.strict_chunk(&chunk, context, strict) {
                     Ok(output) if output.is_empty() => continue,
                     Ok(output) => {
                         self.record_progress(&output);
@@ -424,8 +518,9 @@ where
         &mut self,
         chunk: &[u8],
         context: &mut ReceiveContext,
+        strict: &mut StrictResponses,
     ) -> Result<Vec<u8>, (&'static str, &'static str)> {
-        let mut terminal = self.pending_completion.is_some();
+        let mut terminal = self.pending_completion.is_some() || strict.held.is_some();
         if terminal && context.exceeds_post_terminal_bytes(chunk.len()) {
             return Err(("protocol", "post_terminal_limit"));
         }
@@ -441,9 +536,9 @@ where
                 .map_err(|_| ("decoder", "malformed_sse"))?;
             start = end;
             for event in events {
-                self.strict_event(&event, context, &mut output)?;
+                self.strict_event(&event, context, strict, &mut output)?;
             }
-            if !terminal && self.pending_completion.is_some() {
+            if !terminal && (self.pending_completion.is_some() || strict.held.is_some()) {
                 terminal = true;
                 if context.exceeds_post_terminal_bytes(chunk.len() - end) {
                     return Err(("protocol", "post_terminal_limit"));
@@ -454,11 +549,14 @@ where
     }
 
     /// One frame of a strict stream: a `type` from neither list is an error,
-    /// and after the completion only one `[DONE]` is accepted.
+    /// so is a snapshot whose text no delta delivered, and after the
+    /// completion only one `[DONE]` is accepted. A closing the translator
+    /// produces by itself is held in `strict`.
     fn strict_event(
         &mut self,
         event: &SseEvent,
         context: &ReceiveContext,
+        strict: &mut StrictResponses,
         output: &mut Vec<u8>,
     ) -> Result<(), (&'static str, &'static str)> {
         let data = event.data.trim();
@@ -480,10 +578,10 @@ where
                 &context.wiring.receive.upstream_value(&value),
             );
         }
-        if self.pending_completion.is_some() {
+        if self.pending_completion.is_some() || strict.held.is_some() {
             return Err(("protocol", "event_after_completion"));
         }
-        if let Some(kind) = unlisted_frame(&value) {
+        if let Some(kind) = unlisted_frame(&value).or_else(|| strict.deltas.check(&value)) {
             return Err(("protocol", kind));
         }
         let event_type = value.get("type").and_then(serde_json::Value::as_str);
@@ -491,12 +589,35 @@ where
             self.pending_completion = Some(value);
             return Ok(());
         }
+        let finished_before = self.translator.is_finished();
         let translated = self
             .translator
             .accept(&value, self.traffic.as_deref())
             .map_err(|_| ("translation", "invalid_event"))?;
-        output.extend(translated);
+        if !finished_before && self.translator.is_finished() {
+            strict.held = Some(translated);
+        } else {
+            output.extend(translated);
+        }
         Ok(())
+    }
+
+    /// Ends a strict stream once the upstream closed or the read window
+    /// passed: releases a closing the translator produced by itself, or
+    /// translates the upstream's held completion.
+    fn complete_strict(
+        &mut self,
+        context: &ReceiveContext,
+        strict: &mut StrictResponses,
+    ) -> Option<Vec<u8>> {
+        let Some(output) = strict.held.take() else {
+            return self.complete(context);
+        };
+        self.terminal = true;
+        self.record_progress(&output);
+        self.capture_downstream(&output);
+        self.finish_capture(true, context);
+        Some(output)
     }
 
     /// Translates the held completion once the upstream closed or, for a
@@ -547,11 +668,16 @@ where
                 }),
             );
         }
-        let output = self.translator.error_chunk(
-            &format!("{} Responses stream is invalid", labels.provider),
-            "api_error",
-            self.traffic.as_deref(),
-        );
+        let message = format!("{} Responses stream is invalid", labels.provider);
+        // A strict stream may have finished the translator with a closing it
+        // still holds; the translator then has no error to give, so the error
+        // event is written here and the held closing is never sent.
+        let output = if context.is_strict() && self.translator.is_finished() {
+            stream_error(&message)
+        } else {
+            self.translator
+                .error_chunk(&message, "api_error", self.traffic.as_deref())
+        };
         self.capture_downstream(&output);
         self.finish_capture(false, context);
         output
@@ -1050,6 +1176,232 @@ mod tests {
     async fn synthetic_strict_stream_waits_exactly_two_seconds_after_the_completion() {
         let upstream = futures_util::stream::iter(chunks(&[COMPLETION]))
             .chain(futures_util::stream::pending());
+        let started = tokio::time::Instant::now();
+        let text = body_text(strict_body(upstream)).await;
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(2));
+        assert!(text.contains("message_stop"), "{text}");
+        assert!(!text.contains("api_error"), "{text}");
+    }
+
+    const READ_CALL_ADDED: &str = "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"Read\"}}\n\n";
+
+    /// A `Read` argument delta that ends in 1,024 spaces, which the Codex
+    /// translator repairs into a finished tool call with its own
+    /// `message_delta` and `message_stop`.
+    fn synthetic_stalled_read_delta() -> String {
+        let delta = format!("{{\"file_path\":\"/tmp/a\"}}{}", " ".repeat(1024));
+        let frame = serde_json::json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "delta": delta,
+        });
+        format!("data: {frame}\n\n")
+    }
+
+    /// The events of a client body, with the error event last when there is
+    /// one.
+    fn events_of(text: &str) -> Vec<(Option<String>, serde_json::Value)> {
+        let mut decoder = SseDecoder::default();
+        let events = decoder.push(text.as_bytes()).unwrap();
+        assert!(decoder.finish().is_ok(), "{text}");
+        events
+            .into_iter()
+            .map(|event| {
+                let value = serde_json::from_str(&event.data)
+                    .unwrap_or_else(|_| panic!("unparseable event in {text}"));
+                (event.event, value)
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_holds_a_repaired_read_call_until_the_read_window_ends() {
+        let wire = format!("{READ_CALL_ADDED}{}", synthetic_stalled_read_delta());
+        let upstream =
+            futures_util::stream::iter(chunks(&[&wire])).chain(futures_util::stream::pending());
+        let mut body = strict_body(upstream).into_data_stream();
+        let started = tokio::time::Instant::now();
+        let first = body.next().await.unwrap().unwrap();
+        let first = String::from_utf8(first.to_vec()).unwrap();
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        assert!(first.contains("content_block_start"), "{first}");
+        assert!(!first.contains("message_stop"), "{first}");
+        let last = body.next().await.unwrap().unwrap();
+        let last = String::from_utf8(last.to_vec()).unwrap();
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(2));
+        assert!(
+            last.contains(r#""partial_json":"{\"file_path\":\"/tmp/a\"}""#),
+            "{last}"
+        );
+        assert!(last.contains(r#""stop_reason":"tool_use""#), "{last}");
+        assert!(
+            last.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+            "{last}"
+        );
+        assert!(body.next().await.is_none());
+
+        let started = tokio::time::Instant::now();
+        let text = body_text(strict_body(futures_util::stream::iter(chunks(&[&wire])))).await;
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        assert!(text.contains(r#""stop_reason":"tool_use""#), "{text}");
+        assert!(!text.contains("api_error"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_reports_a_tail_after_a_repaired_read_call() {
+        let repaired = format!("{READ_CALL_ADDED}{}", synthetic_stalled_read_delta());
+        let late = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n";
+        for tail in [
+            format!("{COMPLETION}{late}"),
+            "data: not-json\n\n".to_string(),
+            late.to_string(),
+            PING.to_string(),
+            "data: [DONE]\n\n".to_string(),
+            // The upstream's own completion after a repair is a second
+            // terminal event, so it is rejected as well.
+            COMPLETION.to_string(),
+        ] {
+            let wire = format!("{repaired}{tail}");
+            for parts in [
+                vec![wire.as_str()],
+                vec![&wire[..repaired.len()], tail.as_str()],
+            ] {
+                let text = body_text(strict_body(futures_util::stream::iter(chunks(&parts)))).await;
+                let case = format!("tail {tail:?} in {} items", parts.len());
+                assert!(!text.contains("message_stop"), "{case}: {text}");
+                let events = events_of(&text);
+                let (name, value) = events.last().unwrap_or_else(|| panic!("{case}: {text}"));
+                assert_eq!(name.as_deref(), Some("error"), "{case}: {text}");
+                assert_eq!(value["error"]["message"], INVALID, "{case}: {text}");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_reports_a_transport_error_after_a_repaired_read_call() {
+        let wire = format!("{READ_CALL_ADDED}{}", synthetic_stalled_read_delta());
+        let upstream = futures_util::stream::iter([
+            Ok(Bytes::from(wire)),
+            Err(std::io::Error::other("connection reset")),
+        ]);
+        let text = body_text(strict_body(upstream)).await;
+        assert!(!text.contains("message_stop"), "{text}");
+        let events = events_of(&text);
+        let (name, value) = events.last().unwrap();
+        assert_eq!(name.as_deref(), Some("error"), "{text}");
+        assert_eq!(value["error"]["message"], INVALID, "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_rejects_a_snapshot_whose_text_no_delta_delivered() {
+        let text_delta = "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"seen\"}\n\n";
+        let summary_delta = "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"seen\"}\n\n";
+        let tests = [
+            (
+                "output text done",
+                "",
+                "{\"type\":\"response.output_text.done\",\"output_index\":0,\"text\":\"lost\"}",
+            ),
+            (
+                "content part added",
+                "",
+                "{\"type\":\"response.content_part.added\",\"output_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"lost\"}}",
+            ),
+            (
+                "content part done",
+                "",
+                "{\"type\":\"response.content_part.done\",\"output_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"lost\"}}",
+            ),
+            (
+                "message item done",
+                "",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"lost\"}]}}",
+            ),
+            (
+                "summary text done",
+                "",
+                "{\"type\":\"response.reasoning_summary_text.done\",\"output_index\":0,\"text\":\"lost\"}",
+            ),
+            (
+                "summary part done",
+                "",
+                "{\"type\":\"response.reasoning_summary_part.done\",\"output_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"lost\"}}",
+            ),
+            (
+                "reasoning item done",
+                "",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"lost\"}]}}",
+            ),
+            (
+                "summary snapshot after a text delta only",
+                text_delta,
+                "{\"type\":\"response.reasoning_summary_text.done\",\"output_index\":0,\"text\":\"lost\"}",
+            ),
+            (
+                "text snapshot after a summary delta only",
+                summary_delta,
+                "{\"type\":\"response.output_text.done\",\"output_index\":0,\"text\":\"lost\"}",
+            ),
+        ];
+        for (name, before, snapshot) in tests {
+            let wire = format!("{before}data: {snapshot}\n\n{COMPLETION}");
+            let text = body_text(strict_body(futures_util::stream::iter(chunks(&[&wire])))).await;
+            assert!(text.contains(INVALID), "{name}: {text}");
+            assert!(!text.contains("message_stop"), "{name}: {text}");
+            let error = accumulate_response_with(wire.as_bytes(), "msg", "model", &strict_wiring())
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                format!("{INVALID}: snapshot_without_delta"),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_accepts_snapshots_that_repeat_their_deltas() {
+        let wire = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[]}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"output_index\":0,\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"summary_index\":0,\"delta\":\"think\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.done\",\"output_index\":0,\"summary_index\":0,\"text\":\"think\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.done\",\"output_index\":0,\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"think\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"think\"}]}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_a\"}}\n\n",
+            "data: {\"type\":\"response.content_part.added\",\"output_index\":1,\"item_id\":\"msg_a\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"item_id\":\"msg_a\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":1,\"item_id\":\"msg_a\",\"text\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.content_part.done\",\"output_index\":1,\"item_id\":\"msg_a\",\"part\":{\"type\":\"output_text\",\"text\":\"hello\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_a\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let text = body_text(strict_body(futures_util::stream::iter(chunks(&[wire])))).await;
+        assert!(text.contains("think"), "{text}");
+        assert!(text.contains("hello"), "{text}");
+        assert!(text.contains("message_stop"), "{text}");
+        assert!(!text.contains("api_error"), "{text}");
+        let wiring = strict_wiring();
+        assert!(
+            check_buffered_frames(wire.as_bytes(), &wiring.labels).is_ok(),
+            "{wire}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_does_not_restart_the_read_window_at_done() {
+        let upstream = futures_util::stream::unfold(
+            vec![(0, COMPLETION), (1_500, "data: [DONE]\n\n")].into_iter(),
+            |mut steps| async move {
+                let (delay_ms, part) = steps.next()?;
+                if delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+                Some((Ok(Bytes::from_static(part.as_bytes())), steps))
+            },
+        )
+        .chain(futures_util::stream::pending());
         let started = tokio::time::Instant::now();
         let text = body_text(strict_body(upstream)).await;
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(2));

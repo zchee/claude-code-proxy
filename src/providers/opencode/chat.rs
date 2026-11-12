@@ -87,7 +87,10 @@ pub enum TerminalPolicy {
     /// forwards upstream bytes as received and fails instead. Responses
     /// frames must also carry a `type` listed in
     /// [`super::responses::RESPONSES_HANDLED_EVENT_TYPES`] or
-    /// [`super::responses::RESPONSES_HARMLESS_EVENT_TYPES`].
+    /// [`super::responses::RESPONSES_HARMLESS_EVENT_TYPES`], a snapshot
+    /// must not carry text that no delta delivered, and a closing the
+    /// Responses translator produces by itself is a terminal event as well
+    /// (see [`super::responses::stream_body_with`]).
     Strict,
 }
 
