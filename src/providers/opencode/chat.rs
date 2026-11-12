@@ -2820,7 +2820,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_scanner_ends_frames_where_the_decoder_does_in_any_split() {
+    fn synthetic_frame_scanner_ends_frames_where_the_decoder_does_in_any_split() {
         let tests: [(&str, &str, &[usize]); 6] = [
             ("lf", "data: a\n\n: c\n\n", &[9, 14]),
             ("cr", "data: a\r\rdata: b\r\r", &[9, 18]),
@@ -2870,7 +2870,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_frames_prefix_keeps_whole_frames_only() {
+    fn synthetic_complete_frames_prefix_keeps_whole_frames_only() {
         let tests = [
             ("empty input", "", ""),
             ("one whole frame", "data: a\n\n", "data: a\n\n"),
@@ -3047,7 +3047,7 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_still_accepts_content_after_finish_reason() {
+    fn synthetic_default_policy_still_accepts_content_after_finish_reason() {
         let upstream = format!(
             "{TEXT_THEN_STOP}data: {{\"choices\":[{{\"delta\":{{\"content\":\"late\"}}}}]}}\n\ndata: [DONE]\n\n"
         );
