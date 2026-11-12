@@ -8,6 +8,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 
 use crate::providers::grok::translate::stream::SseDecoder;
+use crate::providers::opencode::chat::complete_frames_prefix;
 
 use super::translate::stream::{POST_TERMINAL_READ_LIMIT, Sanitizer, StreamError};
 use super::{BufferedCapture, MAX_BUFFERED_RESPONSE_BYTES};
@@ -159,11 +160,14 @@ impl EventStreamSink {
 
     /// The body to translate. After [`ReadEnd::ReadLimit`] a frame still
     /// being received is left out, as the streaming path discards it; the
-    /// translators would otherwise reject the body as cut off.
+    /// translators would otherwise reject the body as cut off. After
+    /// [`ReadEnd::Closed`] the body is passed whole, so a frame the upstream
+    /// cut off stays an error.
     pub(super) fn into_body(self, end: ReadEnd) -> Vec<u8> {
         let mut bytes = self.bytes;
         if end == ReadEnd::ReadLimit {
-            bytes.truncate(complete_frames_len(&bytes));
+            let complete = complete_frames_prefix(&bytes).len();
+            bytes.truncate(complete);
         }
         bytes
     }
@@ -213,38 +217,6 @@ impl BufferedSink for EventStreamSink {
     }
 }
 
-/// Length of the prefix of `bytes` that ends with a complete event-stream
-/// frame: what follows the last blank line is a frame still being received.
-/// Lines end with `\n`, `\r` or `\r\n`, as the decoder reads them.
-fn complete_frames_len(bytes: &[u8]) -> usize {
-    let mut end = 0;
-    let mut line_empty = true;
-    let mut after_cr = false;
-    for (index, &byte) in bytes.iter().enumerate() {
-        if after_cr {
-            after_cr = false;
-            if byte == b'\n' {
-                // The second half of a `\r\n` already counted.
-                if end == index {
-                    end = index + 1;
-                }
-                continue;
-            }
-        }
-        match byte {
-            b'\n' | b'\r' => {
-                if line_empty {
-                    end = index + 1;
-                }
-                line_empty = true;
-                after_cr = byte == b'\r';
-            }
-            _ => line_empty = false,
-        }
-    }
-    end
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -264,24 +236,6 @@ mod tests {
 
     const DELTA: &str = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n";
     const COMPLETED: &str = "data: {\"type\":\"response.completed\",\"response\":{}}\n\n";
-
-    #[test]
-    fn complete_frames_len_synthetic_stops_after_the_last_blank_line_for_every_line_ending() {
-        let cases: [(&str, usize); 9] = [
-            ("", 0),
-            ("data: a", 0),
-            ("data: a\n", 0),
-            ("data: a\n\n", 9),
-            ("data: a\n\ndata: b", 9),
-            ("data: a\r\n\r\ndata: b\r\n", 11),
-            ("data: a\r\rdata: b", 9),
-            ("data: a\n\r\n", 10),
-            (": comment\n\ndata: a\n\n: partial", 20),
-        ];
-        for (input, expected) in cases {
-            assert_eq!(complete_frames_len(input.as_bytes()), expected, "{input:?}");
-        }
-    }
 
     #[tokio::test]
     async fn responses_sink_synthetic_reads_to_the_close_and_keeps_every_byte() {

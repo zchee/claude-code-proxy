@@ -518,6 +518,9 @@ mod tests {
         let BufferedFailure::Translate(error) = failure else {
             panic!("expected a translation failure, got {}", failure.kind());
         };
-        assert!(error.to_string().contains("incomplete frame"), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "Vertex AI Mistral stream ended with an incomplete frame"
+        );
     }
 }
