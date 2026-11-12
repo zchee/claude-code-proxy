@@ -1757,3 +1757,289 @@ fn vertex_server_synthetic_partner_errors_echoing_the_token_leak_nothing()
     }
     Ok(())
 }
+
+/// `vertex auth status` with a usable credential and `extra`; returns the
+/// exit code, stdout and stderr.
+fn vertex_status_with(
+    home: &TempDir,
+    fixture: &VertexFixture,
+    extra: &[(&str, &str)],
+) -> Result<(Option<i32>, String, String), Box<dyn std::error::Error>> {
+    let credentials = write_vertex_credentials(home, fixture);
+    let mut command = vertex_command(home, &["vertex", "auth", "status"]);
+    command
+        .env("GOOGLE_APPLICATION_CREDENTIALS", &credentials)
+        .env("CCP_VERTEX_PROJECT", "synthetic-project");
+    for (name, value) in extra {
+        command.env(name, value);
+    }
+    let output = command.output()?;
+    Ok((
+        output.status.code(),
+        String::from_utf8(output.stdout)?,
+        String::from_utf8(output.stderr)?,
+    ))
+}
+
+#[test]
+fn vertex_auth_status_synthetic_prints_the_location_overrides_with_their_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = vertex_fixture(Vec::new());
+
+    let home = TempDir::new()?;
+    let (code, stdout, stderr) = vertex_status_with(&home, &fixture, &[])?;
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == "Location overrides: none"),
+        "{stdout}"
+    );
+
+    let home = TempDir::new()?;
+    let (code, stdout, stderr) = vertex_status_with(
+        &home,
+        &fixture,
+        &[(
+            "CCP_VERTEX_LOCATION_OVERRIDES",
+            "mistralai=europe-west4, anthropic/claude-opus-4-6=us-east5",
+        )],
+    )?;
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    assert!(
+        stdout.lines().any(|line| line
+            == "Location overrides: mistralai=europe-west4, anthropic/claude-opus-4-6=us-east5 (CCP_VERTEX_LOCATION_OVERRIDES)"),
+        "{stdout}"
+    );
+
+    // From config.json in the isolated config directory.
+    let home = TempDir::new()?;
+    let config_dir = home.path().join("config");
+    std::fs::create_dir_all(&config_dir)?;
+    std::fs::write(
+        config_dir.join("config.json"),
+        serde_json::json!({"vertex": {"locationOverrides": {"mistralai": "us-central1"}}})
+            .to_string(),
+    )?;
+    let (code, stdout, stderr) = vertex_status_with(&home, &fixture, &[])?;
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    assert!(
+        stdout.lines().any(|line| line
+            == "Location overrides: mistralai=us-central1 (vertex.locationOverrides in config.json)"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn vertex_auth_status_synthetic_malformed_location_override_exits_two_naming_the_setting()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = vertex_fixture(Vec::new());
+    let home = TempDir::new()?;
+    let (code, stdout, stderr) = vertex_status_with(
+        &home,
+        &fixture,
+        &[("CCP_VERTEX_LOCATION_OVERRIDES", "mistralai")],
+    )?;
+    let expected = "Invalid Vertex setting CCP_VERTEX_LOCATION_OVERRIDES: entry \"mistralai\" has no location; an entry is <key>=<location> in the variable and \"<key>\": \"<location>\" in config.json";
+    // A credential that works does not hide the setting: no request could
+    // be sent with it.
+    assert_eq!(code, Some(2), "{stdout}\n{stderr}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == format!("Location overrides: {expected}")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Access token obtained: true"), "{stdout}");
+    assert!(
+        format!("{stdout}\n{stderr}").matches(expected).count() >= 2,
+        "the failure itself names the setting too:\n{stdout}\n{stderr}"
+    );
+    Ok(())
+}
+
+/// The upstream echoes the access token where no `message` key holds it: in
+/// text the model writes, in a Responses error's `param` and in a Mistral
+/// error's `detail`. The client gets what the model wrote, but no file the
+/// proxy writes (captures, log, error records) may hold the token.
+#[cfg(unix)]
+#[test]
+fn vertex_server_synthetic_token_outside_message_fields_stays_out_of_every_file()
+-> Result<(), Box<dyn std::error::Error>> {
+    let echo = format!("the token is {VERTEX_ACCESS_TOKEN}");
+    let sse_frame = |value: serde_json::Value| format!("data: {value}\n\n");
+    let claude_events = [
+        serde_json::json!({"type": "message_start", "message": {
+            "id": "msg_vrtx_01Synthetic", "type": "message", "role": "assistant",
+            "model": "claude-opus-5-5", "content": [], "stop_reason": null, "stop_sequence": null,
+            "usage": {"input_tokens": 12, "output_tokens": 1}
+        }}),
+        serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": echo}}),
+        serde_json::json!({"type": "content_block_stop", "index": 0}),
+        serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"output_tokens": 5}}),
+        serde_json::json!({"type": "message_stop"}),
+    ];
+    let claude_stream: String = claude_events
+        .iter()
+        .map(|event| {
+            format!(
+                "event: {}\ndata: {event}\n\n",
+                event["type"].as_str().unwrap()
+            )
+        })
+        .collect();
+    let claude_message = serde_json::json!({
+        "id": "msg_vrtx_01Synthetic", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+        "content": [{"type": "text", "text": echo}], "stop_reason": "end_turn", "stop_sequence": null,
+        "usage": {"input_tokens": 727, "output_tokens": 308}
+    })
+    .to_string();
+    let responses_text: String = [
+        serde_json::json!({"type": "response.created", "response": {"id": "resp_synthetic", "status": "in_progress"}}),
+        serde_json::json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "message", "id": "msg_up", "role": "assistant", "content": []}}),
+        serde_json::json!({"type": "response.output_text.delta", "output_index": 0, "item_id": "msg_up", "delta": echo}),
+        serde_json::json!({"type": "response.completed", "response": {
+            "id": "resp_synthetic", "status": "completed", "incomplete_details": null,
+            "usage": {"input_tokens": 12, "output_tokens": 3, "total_tokens": 15}
+        }}),
+    ]
+    .into_iter()
+    .map(sse_frame)
+    .collect();
+    let responses_param = sse_frame(serde_json::json!({"type": "response.failed", "response": {
+        "id": "resp_synthetic", "status": "failed",
+        "error": {"code": "invalid_request_error", "message": "Invalid parameter", "param": echo}
+    }}));
+    let mistral_chunk = |delta: serde_json::Value, finish: Option<&str>| {
+        serde_json::json!({
+            "id": "synthetic-mistral", "object": "chat.completion.chunk", "model": "mistral-medium-3",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]
+        })
+    };
+    let mistral_text = format!(
+        "{}{}",
+        sse_frame(mistral_chunk(
+            serde_json::json!({"role": "assistant", "content": echo}),
+            None
+        )),
+        sse_frame(mistral_chunk(serde_json::json!({}), Some("stop")))
+    );
+    let mistral_detail = sse_frame(serde_json::json!({
+        "error": {"message": "Invalid request", "detail": echo}
+    }));
+    let json = "application/json";
+    let sse = "text/event-stream";
+    let fixture = vertex_fixture(vec![
+        (200, sse, claude_stream),
+        (200, json, claude_message),
+        (200, sse, responses_text.clone()),
+        (200, sse, responses_text),
+        (200, sse, responses_param.clone()),
+        (200, sse, responses_param),
+        (200, sse, mistral_text.clone()),
+        (200, sse, mistral_text),
+        (200, sse, mistral_detail.clone()),
+        (200, sse, mistral_detail),
+    ]);
+
+    let home = TempDir::new()?;
+    let credentials = write_vertex_credentials(&home, &fixture);
+    let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let mut child = vertex_server(
+        &home,
+        &fixture,
+        port,
+        &[
+            ("GOOGLE_APPLICATION_CREDENTIALS", credentials.as_os_str()),
+            ("CCP_TRAFFIC_LOG", std::ffi::OsStr::new("1")),
+            (
+                "CCP_VERTEX_LOCATION_OVERRIDES",
+                std::ffi::OsStr::new("mistralai=us-central1"),
+            ),
+        ],
+    )?;
+    // (model, stream, whether the model's text, and so the token, reaches
+    // the client)
+    let requests = [
+        ("vertex/anthropic/claude-opus-5-5", true, true),
+        ("vertex/anthropic/claude-opus-5-5", false, true),
+        ("vertex/xai/grok-4.7", true, true),
+        ("vertex/xai/grok-4.7", false, true),
+        ("vertex/xai/grok-4.7", true, false),
+        ("vertex/xai/grok-4.7", false, false),
+        ("vertex/mistralai/mistral-medium-3", true, true),
+        ("vertex/mistralai/mistral-medium-3", false, true),
+        ("vertex/mistralai/mistral-medium-3", true, false),
+        ("vertex/mistralai/mistral-medium-3", false, false),
+    ];
+    for (model, stream, answered) in requests {
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": 64,
+            "stream": stream,
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+        .to_string();
+        let response = post_raw(port, &body)?;
+        if answered {
+            // The echo did reach the proxy: the model's own text is the
+            // client's to see.
+            assert!(response.starts_with("HTTP/1.1 200"), "{model}: {response}");
+            assert!(
+                response.contains(VERTEX_ACCESS_TOKEN),
+                "{model} stream={stream}: {response}"
+            );
+        } else if stream {
+            assert!(response.starts_with("HTTP/1.1 200"), "{model}: {response}");
+            assert!(response.contains("event: error"), "{model}: {response}");
+        } else {
+            assert!(response.starts_with("HTTP/1.1 502"), "{model}: {response}");
+        }
+        if !answered {
+            assert!(
+                !response.contains(VERTEX_ACCESS_TOKEN),
+                "{model} stream={stream}: {response}"
+            );
+        }
+    }
+    thread::sleep(Duration::from_millis(500));
+    child.0.kill()?;
+    child.0.wait()?;
+
+    let state_dir = home.path().join("state").join("claude-code-proxy");
+    let mut names = Vec::new();
+    let mut pending = vec![state_dir.join("traffic")];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    // The scan below is only meaningful if the upstream events were
+    // captured on every path.
+    for expected in [
+        "061-vertex-claude-messages-stream-summary.json",
+        "032-upstream-response-body.json",
+        "061-vertex-responses-stream-summary.json",
+        "061-vertex-mistral-stream-summary.json",
+        "061-vertex-buffered-summary.json",
+    ] {
+        assert!(
+            names.iter().any(|name| name.ends_with(expected)),
+            "missing {expected}: {names:?}"
+        );
+    }
+    let files = all_files_text(&state_dir);
+    assert!(files.contains("[redacted]"), "{files}");
+    assert!(
+        !files.contains(VERTEX_ACCESS_TOKEN),
+        "a file the proxy wrote holds the token: {files}"
+    );
+    Ok(())
+}

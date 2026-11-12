@@ -2570,3 +2570,429 @@ async fn vertex_partner_synthetic_echoed_secrets_are_redacted_in_responses_and_t
         }
     }
 }
+
+// Partner errors, buffered settling, refusals and framing.
+
+/// Google's error body for `status`.
+fn google_error(code: u16, status: &str, message: &str) -> Value {
+    json!({"error":{"code":code,"message":message,"status":status}})
+}
+
+#[tokio::test]
+async fn vertex_partner_synthetic_403_and_404_name_model_garden_with_the_model_project_and_location()
+ {
+    // One family per wire, with the upstream model value and the location
+    // each request goes to.
+    let families = [
+        (CLAUDE_MODEL, "claude-opus-5-5", "global", vec![]),
+        ("vertex/xai/grok-4.7", "xai/grok-4.7", "global", vec![]),
+        (
+            MISTRAL_MODEL,
+            "mistral-medium-3",
+            "us-central1",
+            vec![MISTRAL_LOCATION],
+        ),
+    ];
+    let errors = [
+        (
+            403,
+            google_error(
+                403,
+                "PERMISSION_DENIED",
+                "Permission denied on resource project ccp-project.",
+            ),
+            StatusCode::FORBIDDEN,
+            "permission_error",
+        ),
+        (
+            404,
+            google_error(404, "NOT_FOUND", "Publisher Model was not found."),
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+        ),
+    ];
+    for (model, upstream_model, location, env) in &families {
+        let answers = errors
+            .iter()
+            .flat_map(|(code, body, ..)| {
+                [
+                    Answer::error(*code, body.clone()),
+                    Answer::error(*code, body.clone()),
+                ]
+            })
+            .collect();
+        let upstream = FakeVertex::start(answers).await;
+        let registry = registry(provider(&upstream, env));
+        for (code, _, status, kind) in &errors {
+            for stream in [false, true] {
+                let (actual, _, body) = send(
+                    app_with_monitor(registry.clone(), None),
+                    "/v1/messages",
+                    &message_request(model, stream),
+                    &[],
+                )
+                .await;
+                assert_eq!(actual, *status, "{model} stream={stream}: {body}");
+                let value: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(value["error"]["type"], *kind, "{model}: {body}");
+                let message = error_message(&body);
+                let expected = format!(
+                    ". Also check that model {upstream_model} is enabled in Model Garden for project ccp-project in location {location} and, for a preview model, that the project has been granted access; the status alone does not say which of these is the cause (upstream HTTP {code})"
+                );
+                assert!(message.ends_with(&expected), "{model} {code}: {message}");
+                // The guidance every Vertex 403 and 404 already gave stays.
+                let general = if *code == 403 {
+                    "roles/aiplatform.user"
+                } else {
+                    "Check the model ID"
+                };
+                assert!(message.contains(general), "{model} {code}: {message}");
+            }
+        }
+        assert_eq!(upstream.requests().len(), 4, "{model}");
+    }
+}
+
+#[tokio::test]
+async fn vertex_partner_synthetic_400_keeps_its_message_without_model_garden_guidance() {
+    // Mistral's own error shape carries the message at the top level.
+    let upstream = FakeVertex::start(vec![Answer::error(
+        400,
+        json!({
+            "object":"error",
+            "message":"Invalid model: mistral-medium-3",
+            "type":"invalid_request_error",
+            "param":null,
+            "code":"1500"
+        }),
+    )])
+    .await;
+    let (status, _, body) = send(
+        app_with_monitor(registry(provider(&upstream, &[MISTRAL_LOCATION])), None),
+        "/v1/messages",
+        &message_request(MISTRAL_MODEL, false),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["error"]["type"], "invalid_request_error", "{body}");
+    assert_eq!(
+        error_message(&body),
+        "Invalid model: mistral-medium-3 (upstream HTTP 400)"
+    );
+}
+
+#[tokio::test]
+async fn vertex_claude_synthetic_non_streaming_error_object_in_a_200_is_an_error_response() {
+    let cases = [
+        (
+            "overloaded_error",
+            "Overloaded",
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+        ),
+        (
+            "rate_limit_error",
+            "Number of request tokens has exceeded your rate limit",
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+        ),
+        (
+            "invalid_request_error",
+            "max_tokens: field required",
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+        ),
+    ];
+    let upstream = FakeVertex::start(
+        cases
+            .iter()
+            .map(|(kind, message, ..)| {
+                claude_json(
+                    json!({"type":"error","error":{"type":kind,"message":message}}).to_string(),
+                )
+            })
+            .collect(),
+    )
+    .await;
+    let registry = registry(provider(&upstream, &[]));
+    let monitor = MonitorHandle::new(10);
+    for (upstream_kind, upstream_message, status, kind) in &cases {
+        let (actual, _, body) = send(
+            app_with_monitor(registry.clone(), Some(monitor.clone())),
+            "/v1/messages",
+            &message_request(CLAUDE_MODEL, false),
+            &[],
+        )
+        .await;
+        assert_eq!(actual, *status, "{upstream_kind}: {body}");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["type"], "error", "{body}");
+        assert_eq!(value["error"]["type"], *kind, "{body}");
+        assert_eq!(
+            error_message(&body),
+            format!("Vertex AI returned a Claude {upstream_kind}: {upstream_message}")
+        );
+    }
+    assert_eq!(upstream.requests().len(), cases.len());
+    let state = monitor.snapshot();
+    assert_eq!(state.recent.len(), cases.len());
+    for request in &state.recent {
+        assert_eq!(request.status, RequestStatus::Failed, "{request:?}");
+    }
+}
+
+#[tokio::test]
+async fn vertex_claude_synthetic_crlf_framed_stream_passes_through_byte_for_byte() {
+    let events: Vec<String> = claude_stream("Hello over CRLF")
+        .iter()
+        .map(|event| event.replace('\n', "\r\n"))
+        .collect();
+    let whole = events.concat();
+    // The same bytes again, cut between the CR and the LF of every line end.
+    let mut split = Vec::new();
+    let mut rest = whole.as_str();
+    while let Some(position) = rest.find("\r\n") {
+        split.push(rest[..=position].to_string());
+        rest = &rest[position + 1..];
+    }
+    split.push(rest.to_string());
+    split.retain(|chunk| !chunk.is_empty());
+    assert_eq!(split.concat(), whole);
+    let upstream = FakeVertex::start(vec![claude_sse(events), claude_sse(split)]).await;
+    let registry = registry(provider(&upstream, &[]));
+    for case in ["one event per chunk", "cut between CR and LF"] {
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages",
+            &message_request(CLAUDE_MODEL, true),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{case}: {body}");
+        assert_eq!(body, whole, "{case}");
+    }
+}
+
+/// Claude Code's file-reading tool. Its calls are the ones the Responses
+/// translator holds and repairs.
+fn read_tool() -> Value {
+    json!({
+        "name":"Read",
+        "description":"Reads a file from the local filesystem.",
+        "input_schema":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}
+    })
+}
+
+/// A `Read` call whose arguments are complete JSON followed by 1,024
+/// spaces, the stall the translator repairs into a finished call. No
+/// completion follows.
+fn responses_stalled_read_call() -> Vec<Value> {
+    vec![
+        json!({"type":"response.created","response":{"id":"resp_synthetic","status":"in_progress"}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":{
+            "type":"function_call","id":"fc_up","call_id":"call_read_1","name":"Read","arguments":""
+        }}),
+        json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_up",
+            "delta":format!("{{\"file_path\":\"/tmp/a\"}}{}", " ".repeat(1024))}),
+    ]
+}
+
+#[tokio::test]
+async fn vertex_responses_synthetic_repaired_read_call_returns_while_the_upstream_stays_open() {
+    for family in &RESPONSES_FAMILIES {
+        let upstream = FakeVertex::start(vec![
+            Answer::sse_held_open(&responses_stalled_read_call()),
+            Answer::sse_held_open(&responses_stalled_read_call()),
+        ])
+        .await;
+        let registry = registry(provider(&upstream, family.env));
+        for stream in [false, true] {
+            let request = json!({
+                "model": family.model,
+                "max_tokens": 256,
+                "stream": stream,
+                "tools": [read_tool()],
+                "messages": [{"role":"user","content":"Read /tmp/a"}]
+            });
+            let started = Instant::now();
+            let (status, _, body) = send(
+                app_with_monitor(registry.clone(), None),
+                "/v1/messages",
+                &request,
+                &[],
+            )
+            .await;
+            let elapsed = started.elapsed();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{} stream={stream}: {body}",
+                family.model
+            );
+            // The repaired call is the end of the message: no completion is
+            // awaited and no read window runs.
+            assert!(
+                elapsed < Duration::from_millis(1500),
+                "{} stream={stream}: answered after {elapsed:?}",
+                family.model
+            );
+            let (blocks, stop) = if stream {
+                let events = sse_events(&body);
+                assert_eq!(
+                    events.last().map(|(name, _)| name.as_str()),
+                    Some("message_stop"),
+                    "{body}"
+                );
+                (streamed_content(&events), stop_reason(&events))
+            } else {
+                let message: Value = serde_json::from_str(&body).unwrap();
+                (
+                    message["content"].as_array().unwrap().clone(),
+                    message["stop_reason"].as_str().map(str::to_string),
+                )
+            };
+            assert_eq!(stop.as_deref(), Some("tool_use"), "{body}");
+            let call = blocks
+                .iter()
+                .find(|block| block["type"] == "tool_use")
+                .unwrap_or_else(|| panic!("no tool_use: {body}"));
+            assert_eq!(call["name"], "Read", "{body}");
+            assert_eq!(call["input"], json!({"file_path":"/tmp/a"}), "{body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn vertex_responses_synthetic_buffered_failure_or_unlisted_event_returns_while_the_upstream_stays_open()
+ {
+    let failed = vec![
+        json!({"type":"response.created","response":{"id":"resp_synthetic","status":"in_progress"}}),
+        json!({"type":"response.failed","response":{
+            "id":"resp_synthetic","status":"failed",
+            "error":{"code":"server_error","message":"The server had an error while processing the request"}
+        }}),
+    ];
+    let unlisted = vec![
+        json!({"type":"response.created","response":{"id":"resp_synthetic","status":"in_progress"}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up","role":"assistant","content":[]}}),
+        json!({"type":"response.refusal.delta","output_index":0,"item_id":"msg_up","delta":"No."}),
+    ];
+    let cases = [
+        (
+            "upstream failure",
+            failed,
+            "The server had an error while processing the request",
+        ),
+        (
+            "unlisted event",
+            unlisted,
+            "Vertex AI Responses stream is invalid: unlisted_event_type",
+        ),
+    ];
+    for family in &RESPONSES_FAMILIES {
+        let upstream = FakeVertex::start(
+            cases
+                .iter()
+                .map(|(_, frames, _)| Answer::sse_held_open(frames))
+                .collect(),
+        )
+        .await;
+        let registry = registry(provider(&upstream, family.env));
+        for (case, _, needle) in &cases {
+            let started = Instant::now();
+            let (status, _, body) = send(
+                app_with_monitor(registry.clone(), None),
+                "/v1/messages",
+                &message_request(family.model, false),
+                &[],
+            )
+            .await;
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(1500),
+                "{} {case}: answered after {elapsed:?}",
+                family.model
+            );
+            assert_eq!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "{} {case}: {body}",
+                family.model
+            );
+            let value: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["error"]["type"], "api_error", "{body}");
+            assert!(
+                error_message(&body).contains(needle),
+                "{} {case}: {body}",
+                family.model
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn vertex_responses_synthetic_snapshot_carrying_a_refusal_is_an_error() {
+    let message_added = json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up","role":"assistant","content":[]}});
+    let refusal = json!({"type":"refusal","refusal":"I can't help with that."});
+    let snapshots = [
+        json!({"type":"response.content_part.added","output_index":0,"item_id":"msg_up","content_index":0,"part":refusal}),
+        json!({"type":"response.content_part.done","output_index":0,"item_id":"msg_up","content_index":0,"part":refusal}),
+        json!({"type":"response.output_item.done","output_index":0,"item":{
+            "type":"message","id":"msg_up","role":"assistant","status":"completed","content":[refusal]
+        }}),
+    ];
+    let wires: Vec<Vec<Value>> = snapshots
+        .iter()
+        .map(|snapshot| {
+            vec![
+                json!({"type":"response.created","response":{"id":"resp_synthetic","status":"in_progress"}}),
+                message_added.clone(),
+                snapshot.clone(),
+                responses_completed(),
+            ]
+        })
+        .collect();
+    for family in &RESPONSES_FAMILIES {
+        let upstream = FakeVertex::start(
+            wires
+                .iter()
+                .flat_map(|wire| [Answer::sse(wire), Answer::sse(wire)])
+                .collect(),
+        )
+        .await;
+        let registry = registry(provider(&upstream, family.env));
+        for wire in &wires {
+            let shape = wire[2]["type"].as_str().unwrap();
+            for stream in [false, true] {
+                let (status, _, body) = send(
+                    app_with_monitor(registry.clone(), None),
+                    "/v1/messages",
+                    &message_request(family.model, stream),
+                    &[],
+                )
+                .await;
+                if stream {
+                    assert_stream_failed_with(status, &body, RESPONSES_STREAM_INVALID);
+                } else {
+                    assert_eq!(
+                        status,
+                        StatusCode::BAD_GATEWAY,
+                        "{} {shape}: {body}",
+                        family.model
+                    );
+                    assert!(
+                        error_message(&body)
+                            .contains("Vertex AI Responses stream is invalid: refusal_in_snapshot"),
+                        "{} {shape}: {body}",
+                        family.model
+                    );
+                }
+                // The refusal is not passed off as an answer.
+                assert!(!body.contains("I can't help with that."), "{shape}: {body}");
+            }
+        }
+        assert_eq!(upstream.requests().len(), 6, "{}", family.model);
+    }
+}
