@@ -1081,7 +1081,10 @@ async fn vertex_synthetic_unregistered_ids_are_sent_and_other_publishers_are_ref
         "LOW"
     );
 
-    for model in ["vertex/xai/grok-4.7", "vertex/gemini-3.5-flash:predict"] {
+    for model in [
+        "vertex/openai/gpt-oss-120b-maas",
+        "vertex/gemini-3.5-flash:predict",
+    ] {
         let (status, _, body) = post(
             app_with_monitor(registry.clone(), None),
             "/v1/messages",

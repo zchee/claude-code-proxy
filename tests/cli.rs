@@ -1129,7 +1129,7 @@ fn help_lists_the_vertex_command_and_its_auth_actions() -> Result<(), Box<dyn st
 }
 
 #[test]
-fn models_lists_vertex_after_opencode_with_its_gemini_and_claude_models()
+fn models_lists_vertex_after_opencode_with_its_served_models()
 -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::cargo_bin("claude-code-proxy")?
         .args(["models"])
@@ -1155,7 +1155,7 @@ fn models_lists_vertex_after_opencode_with_its_gemini_and_claude_models()
         .split(',')
         .map(str::trim)
         .collect();
-    assert_eq!(models.len(), 32, "{vertex}");
+    assert_eq!(models.len(), 44, "{vertex}");
     for model in [
         "gemini-4-argon",
         "gemini-4-carbon",

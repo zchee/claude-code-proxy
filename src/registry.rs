@@ -579,7 +579,7 @@ mod tests {
     fn vertex_models_route_to_vertex_without_stealing_existing_provider_ids() {
         let registry = Registry::new(AliasProvider::Codex);
         let advertised = registry.supported_models_for("vertex");
-        assert_eq!(advertised.len(), 32, "{advertised:?}");
+        assert_eq!(advertised.len(), 44, "{advertised:?}");
         for model in &advertised {
             assert_eq!(
                 registry.provider_for_model(model, None).unwrap().name(),

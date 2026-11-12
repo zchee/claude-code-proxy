@@ -1,19 +1,22 @@
-//! Google Cloud Vertex AI provider: Anthropic Messages requests for Gemini
-//! models, sent as `streamGenerateContent` with Application Default
-//! Credentials.
+//! Google Cloud Vertex AI provider: Anthropic Messages requests with
+//! Application Default Credentials, for Gemini models (sent as
+//! `streamGenerateContent`) and for the xAI Grok, OpenAI and Meta Muse
+//! partner models (sent as OpenAI Responses requests).
 //!
 //! The upstream is always asked for a stream. A non-streaming client gets a
-//! message built from the same translation state, so both modes decide the
-//! stop reason and content the same way.
+//! message built from the same translation, so both modes decide the stop
+//! reason and content the same way.
 //!
 //! Anthropic Claude models (`vertex/anthropic/<model-id>`) are passed
 //! through as Anthropic Messages instead; see [`claude`].
 
 pub mod auth;
+mod buffered;
 pub mod claude;
 pub mod cli;
 pub mod client;
 pub mod models;
+mod responses;
 pub mod sanitize;
 pub mod translate;
 
@@ -45,14 +48,15 @@ use crate::providers::kimi::count_tokens;
 use crate::traffic::{StreamTrafficCapture, TrafficCapture};
 
 use self::auth::{VertexAuthError, VertexCredentials};
+use self::buffered::{BufferedFailure, BufferedSink, ReadEnd, read_upstream};
 use self::cli::VERTEX_CLI;
 use self::client::{VertexClient, VertexError, VertexResponse, VertexTarget};
 use self::models::{ModelError, ResolvedModel, WireFormat};
 use self::sanitize::sanitize_vertex_text;
 use self::translate::request::prepare_request;
 use self::translate::stream::{
-    LiveStreamTranslator, MAX_SSE_FRAME_BYTES, POST_TERMINAL_READ_LIMIT, Sanitizer, StreamError,
-    StreamSinks, TranslatorConfig, sanitize_capture, stream_body,
+    LiveStreamTranslator, MAX_SSE_FRAME_BYTES, Sanitizer, StreamError, StreamSinks,
+    TranslatorConfig, sanitize_capture, stream_body,
 };
 
 /// Largest upstream body read for a non-streaming response. The body is
@@ -78,9 +82,18 @@ struct Ready {
 /// One request that Vertex AI accepted: the response body is still unread.
 struct Started {
     upstream: VertexResponse,
-    config: TranslatorConfig,
+    reception: Reception,
     sanitize: Sanitizer,
     model_id: String,
+}
+
+/// How the upstream body of a started request is translated.
+enum Reception {
+    /// Gemini `streamGenerateContent`.
+    Gemini(TranslatorConfig),
+    /// An OpenAI Responses stream (xAI Grok, OpenAI, Meta Muse).
+    /// `model` is the name the client asked for.
+    Responses { message_id: String, model: String },
 }
 
 /// The `vertex` provider.
@@ -175,6 +188,45 @@ impl VertexProvider {
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &model.upstream_model);
         }
+        match model.wire {
+            WireFormat::GenerateContent => self.start_gemini(body, ctx, requested, model).await,
+            WireFormat::Responses { route } => {
+                let translated =
+                    responses::prepare_request(body, &model).map_err(invalid_request)?;
+                let upstream = self
+                    .send_partner(
+                        &model,
+                        |target| responses::url(target, &model, route),
+                        &translated,
+                        ctx,
+                    )
+                    .await?;
+                Ok(Started {
+                    sanitize: sanitizer(&upstream),
+                    upstream,
+                    reception: Reception::Responses {
+                        message_id: new_message_id(),
+                        model: requested,
+                    },
+                    model_id: model.upstream_model,
+                })
+            }
+            // Claude requests are passed through by `claude` before this
+            // point and never translated here.
+            WireFormat::AnthropicMessages | WireFormat::MistralChat => {
+                Err(family_not_supported(&requested, &model))
+            }
+        }
+    }
+
+    /// Translates a Gemini request and sends it as `streamGenerateContent`.
+    async fn start_gemini(
+        &self,
+        body: &MessagesRequest,
+        ctx: &RequestContext,
+        requested: String,
+        model: ResolvedModel,
+    ) -> Result<Started, ProviderError> {
         let translated = prepare_request(body, &model).map_err(invalid_request)?;
         let ready = self.ready()?;
         if let Some(monitor) = ctx.monitor.as_ref() {
@@ -192,27 +244,69 @@ impl VertexProvider {
             )
             .await
             .map_err(VertexError::into_provider_error)?;
-        // Copied before the body is consumed: upstream prose inside the
-        // stream may echo the token, and the sanitiser must know it.
-        let secrets: Vec<String> = upstream.access_token.iter().cloned().collect();
-        let sanitize: Sanitizer = Arc::new(move |text: &str| {
-            let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
-            sanitize_vertex_text(text, &secrets)
-        });
         let config = TranslatorConfig {
-            message_id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+            message_id: new_message_id(),
             model: requested,
             signature_model: model.upstream_model.clone(),
             estimated_input_tokens: count_tokens::count_tokens(body),
             emit_thinking: translated.includes_thoughts(),
         };
         Ok(Started {
+            sanitize: sanitizer(&upstream),
             upstream,
-            config,
-            sanitize,
+            reception: Reception::Gemini(config),
             model_id: model.upstream_model,
         })
     }
+
+    /// Sends a partner model's request to the URL `url` builds for the
+    /// model's target. The target is chosen before credentials are looked
+    /// up, so a model that is not served in the configured location gets
+    /// its 400, naming the settings, without a credential lookup or an
+    /// upstream call.
+    async fn send_partner(
+        &self,
+        model: &ResolvedModel,
+        url: impl FnOnce(&VertexTarget) -> Result<reqwest::Url, VertexError>,
+        body: &Value,
+        ctx: &RequestContext,
+    ) -> Result<VertexResponse, ProviderError> {
+        let ready = self.ready()?;
+        let target = VertexTarget::for_model(&ready.config, model)
+            .map_err(VertexError::into_provider_error)?;
+        let url = url(&target).map_err(VertexError::into_provider_error)?;
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.upstream_started(&ctx.req_id);
+        }
+        let credentials = Self::credentials(ready).await?;
+        ready
+            .client
+            .post_sse(
+                &target,
+                &model.upstream_model,
+                url,
+                body,
+                credentials,
+                ctx.traffic.as_deref(),
+            )
+            .await
+            .map_err(VertexError::into_provider_error)
+    }
+}
+
+fn new_message_id() -> String {
+    format!("msg_{}", uuid::Uuid::new_v4().simple())
+}
+
+/// The sanitiser for text from `upstream`. The token is copied before the
+/// body is consumed: upstream prose inside the stream may echo it, and the
+/// sanitiser must know it.
+fn sanitizer(upstream: &VertexResponse) -> Sanitizer {
+    let secrets: Vec<String> = upstream.access_token.iter().cloned().collect();
+    Arc::new(move |text: &str| {
+        let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
+        sanitize_vertex_text(text, &secrets)
+    })
 }
 
 impl Default for VertexProvider {
@@ -252,17 +346,7 @@ impl Provider for VertexProvider {
         // outcome, which the server reads when the body ends, so the request
         // is recorded as failed with the sanitised message the client saw.
         let outcome = NativeResponseOutcome::default();
-        let body = stream_body(
-            started.upstream.into_byte_stream(),
-            started.config,
-            StreamSinks {
-                req_id: ctx.req_id.clone(),
-                monitor: ctx.monitor.clone(),
-                traffic: ctx.traffic.clone(),
-                outcome: Some(outcome.clone()),
-                sanitize: started.sanitize,
-            },
-        );
+        let body = stream_response_body(started, &ctx, Some(outcome.clone()));
         let mut response = sse_response(body);
         response.extensions_mut().insert(outcome);
         response
@@ -306,22 +390,77 @@ impl Provider for VertexProvider {
         }
         body.stream = true;
         let started = self.start(&body, &ctx).await?;
-        let body = stream_body(
-            started.upstream.into_byte_stream(),
-            started.config,
+        let resolved_model = started.model_id.clone();
+        Ok(Generation {
+            body: GenerationBody::LiveSse(stream_response_body(started, &ctx, None)),
+            resolved_model,
+        })
+    }
+}
+
+/// The Anthropic SSE body of a started request, translated by its wire's
+/// translator. A failure the client sees as an `error` event is recorded in
+/// `outcome`.
+fn stream_response_body(
+    started: Started,
+    ctx: &RequestContext,
+    outcome: Option<NativeResponseOutcome>,
+) -> Body {
+    let Started {
+        upstream,
+        reception,
+        sanitize,
+        ..
+    } = started;
+    let upstream = upstream.into_byte_stream();
+    match reception {
+        Reception::Gemini(config) => stream_body(
+            upstream,
+            config,
             StreamSinks {
                 req_id: ctx.req_id.clone(),
                 monitor: ctx.monitor.clone(),
                 traffic: ctx.traffic.clone(),
-                outcome: None,
-                sanitize: started.sanitize,
+                outcome,
+                sanitize,
             },
-        );
-        Ok(Generation {
-            body: GenerationBody::LiveSse(body),
-            resolved_model: started.model_id,
-        })
+        ),
+        Reception::Responses { message_id, model } => report_error_events(
+            responses::stream_body(upstream, message_id, model, ctx, sanitize),
+            outcome,
+        ),
     }
+}
+
+/// Records the message of the first `error` event of `body` in `outcome`,
+/// for the translators that do not report to it themselves. Their output
+/// chunks hold whole events, so each chunk is decoded on its own.
+fn report_error_events(body: Body, outcome: Option<NativeResponseOutcome>) -> Body {
+    let Some(outcome) = outcome else {
+        return body;
+    };
+    Body::from_stream(body.into_data_stream().map(move |chunk| {
+        if let Ok(bytes) = chunk.as_ref()
+            && let Ok(events) = SseDecoder::default().push(bytes)
+        {
+            for event in events
+                .iter()
+                .filter(|event| event.event.as_deref() == Some("error"))
+            {
+                let message = serde_json::from_str::<Value>(&event.data)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .pointer("/error/message")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| "Vertex AI stream failed".to_string());
+                outcome.fail(message);
+            }
+        }
+        chunk
+    }))
 }
 
 /// Reads the whole upstream response and answers with one Anthropic message,
@@ -329,18 +468,21 @@ impl Provider for VertexProvider {
 async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
     let Started {
         upstream,
-        config,
+        reception,
         sanitize,
         ..
     } = started;
     let mut capture = ctx.traffic.as_ref().map(|_| BufferedCapture::new());
-    let result = read_message(
-        upstream.into_byte_stream(),
-        config,
-        &sanitize,
-        capture.as_mut(),
-    )
-    .await;
+    let upstream = upstream.into_byte_stream();
+    let result = match reception {
+        Reception::Gemini(config) => read_message(upstream, config, &sanitize, capture.as_mut())
+            .await
+            .map_err(BufferedFailure::Read),
+        Reception::Responses { message_id, model } => {
+            responses::read_response(upstream, &message_id, &model, &sanitize, capture.as_mut())
+                .await
+        }
+    };
     match result {
         Ok(message) => {
             if let (Some(traffic), Some(capture)) = (ctx.traffic.as_ref(), capture) {
@@ -360,8 +502,8 @@ async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
             }
             (StatusCode::OK, Json(message)).into_response()
         }
-        Err(error) => {
-            let mapped = stream_error(&error, &sanitize);
+        Err(failure) => {
+            let mapped = buffered_error(&failure, &sanitize);
             if let (Some(traffic), Some(capture)) = (ctx.traffic.as_ref(), capture) {
                 traffic.write_json(
                     "051-downstream-response",
@@ -370,62 +512,57 @@ async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
                         "error": {"type": mapped.error_type(), "message": &mapped.message},
                     }),
                 );
-                capture.finish(traffic, Some(&error));
+                capture.finish_with_kind(traffic, Some(failure.kind()));
             }
             error_response(mapped)
         }
     }
 }
 
-/// Feeds the upstream body to one translator chunk by chunk.
+/// The non-streaming answer for a failure: [`stream_error`] for a failed
+/// read, a 502 with the translator's sanitised message otherwise.
+fn buffered_error(failure: &BufferedFailure, sanitize: &Sanitizer) -> ProviderError {
+    match failure {
+        BufferedFailure::Read(error) => stream_error(error, sanitize),
+        BufferedFailure::Translate(error) => ProviderError::new(
+            StatusCode::BAD_GATEWAY,
+            ProviderErrorKind::Api,
+            error.to_string(),
+        ),
+    }
+}
+
+/// Feeds the upstream body to one Gemini translator chunk by chunk.
 ///
 /// The response is complete when the upstream closes, or
-/// [`POST_TERMINAL_READ_LIMIT`] after the `finishReason` when it stays open:
-/// the same rule the streaming path applies. More than
-/// [`MAX_BUFFERED_RESPONSE_BYTES`] is an error.
+/// [`translate::stream::POST_TERMINAL_READ_LIMIT`] after the `finishReason`
+/// when it stays open: the same rule the streaming path applies. More than
+/// [`MAX_BUFFERED_RESPONSE_BYTES`] is an error. The reading loop is the one
+/// every wire's non-streaming path shares.
 async fn read_message<S>(
     upstream: S,
     config: TranslatorConfig,
     sanitize: &Sanitizer,
-    mut capture: Option<&mut BufferedCapture>,
+    capture: Option<&mut BufferedCapture>,
 ) -> Result<Value, StreamError>
 where
     S: Stream<Item = Result<Bytes, VertexError>>,
 {
-    let mut upstream = std::pin::pin!(upstream);
     let mut translator = LiveStreamTranslator::new(config);
-    let mut deadline = None;
-    let mut read = 0usize;
-    loop {
-        let next = if translator.is_terminal() {
-            let deadline = *deadline
-                .get_or_insert_with(|| tokio::time::Instant::now() + POST_TERMINAL_READ_LIMIT);
-            match tokio::time::timeout_at(deadline, upstream.next()).await {
-                Ok(next) => next,
-                Err(_) => {
-                    translator.finish_after_read_limit()?;
-                    return translator.response();
-                }
-            }
-        } else {
-            upstream.next().await
-        };
-        let chunk = match next {
-            Some(Ok(chunk)) => chunk,
-            Some(Err(_)) => return Err(StreamError::Transport),
-            None => {
-                translator.finish()?;
-                return translator.response();
-            }
-        };
-        read = read.saturating_add(chunk.len());
-        if read > MAX_BUFFERED_RESPONSE_BYTES {
-            return Err(StreamError::Malformed("the response exceeds 16 MiB"));
-        }
-        if let Some(capture) = capture.as_deref_mut() {
-            capture.upstream(&chunk, sanitize);
-        }
-        translator.push(&chunk)?;
+    match read_upstream(upstream, &mut translator, sanitize, capture).await? {
+        ReadEnd::Closed => translator.finish()?,
+        ReadEnd::ReadLimit => translator.finish_after_read_limit()?,
+    };
+    translator.response()
+}
+
+impl BufferedSink for LiveStreamTranslator {
+    fn push(&mut self, chunk: &[u8]) -> Result<(), StreamError> {
+        LiveStreamTranslator::push(self, chunk).map(drop)
+    }
+
+    fn terminal_events(&self) -> usize {
+        usize::from(self.is_terminal())
     }
 }
 
@@ -468,9 +605,14 @@ impl BufferedCapture {
         }
     }
 
-    fn finish(mut self, traffic: &TrafficCapture, error: Option<&StreamError>) {
-        if let Some(error) = error {
-            self.events.malformed("translation", error.kind());
+    fn finish(self, traffic: &TrafficCapture, error: Option<&StreamError>) {
+        self.finish_with_kind(traffic, error.map(StreamError::kind));
+    }
+
+    /// Writes the summary; `error` is the kind of the failure, if any.
+    fn finish_with_kind(mut self, traffic: &TrafficCapture, error: Option<&str>) {
+        if let Some(kind) = error {
+            self.events.malformed("translation", kind);
         }
         self.events.finish_named(
             traffic,
@@ -519,19 +661,23 @@ fn check_settings(config: &ResolvedVertexConfig) -> Result<(), ProviderError> {
     Ok(())
 }
 
-/// Refuses a model this version cannot send: every wire format but
-/// Gemini's and Claude's, until the handler for that family exists. The 400
-/// comes before any setting or credential is read.
+/// Refuses a model this version cannot send: the wire formats whose
+/// handler does not exist yet. The 400 comes before any setting or
+/// credential is read.
 fn require_served(requested: &str, model: &ResolvedModel) -> Result<(), ProviderError> {
     match model.wire {
-        WireFormat::GenerateContent | WireFormat::AnthropicMessages => Ok(()),
-        WireFormat::Responses { .. } | WireFormat::MistralChat => {
-            Err(invalid_request(ModelError::FamilyNotSupported {
-                requested: requested.to_string(),
-                family: model.family.label(),
-            }))
-        }
+        WireFormat::GenerateContent
+        | WireFormat::AnthropicMessages
+        | WireFormat::Responses { .. } => Ok(()),
+        WireFormat::MistralChat => Err(family_not_supported(requested, model)),
     }
+}
+
+fn family_not_supported(requested: &str, model: &ResolvedModel) -> ProviderError {
+    invalid_request(ModelError::FamilyNotSupported {
+        requested: requested.to_string(),
+        family: model.family.label(),
+    })
 }
 
 fn invalid_request(error: impl std::fmt::Display) -> ProviderError {
@@ -568,6 +714,7 @@ mod tests {
 
     use futures_util::stream;
 
+    use super::translate::stream::POST_TERMINAL_READ_LIMIT;
     use super::*;
 
     /// Shaped like a Google OAuth access token.
@@ -609,7 +756,7 @@ mod tests {
         assert!(provider.ready.get().is_none());
         assert_eq!(provider.name(), "vertex");
         let models = provider.supported_models();
-        assert_eq!(models.len(), 32, "{models:?}");
+        assert_eq!(models.len(), 44, "{models:?}");
         assert!(
             models
                 .iter()
@@ -890,7 +1037,7 @@ mod tests {
             monitor: None,
         };
         let body: MessagesRequest = serde_json::from_value(json!({
-            "model": "vertex/xai/grok-4.7",
+            "model": "vertex/openai/gpt-oss-120b-maas",
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .expect("valid request");
@@ -919,9 +1066,6 @@ mod tests {
             monitor: None,
         };
         for (model, family) in [
-            ("vertex/xai/grok-4.7", "xAI Grok"),
-            ("vertex/openai/gpt-6.1-sol", "OpenAI"),
-            ("vertex/meta/muse-spark-1.3", "Meta Muse"),
             ("vertex/mistralai/mistral-medium-3", "Mistral"),
             (
                 "vertex/openai/gpt-oss-120b-maas",
@@ -951,7 +1095,7 @@ mod tests {
                 assert_eq!(
                     message,
                     format!(
-                        "this version of claude-code-proxy does not support the {family} model family on Vertex AI (requested {model:?}); supported families: Gemini, Anthropic Claude"
+                        "this version of claude-code-proxy does not support the {family} model family on Vertex AI (requested {model:?}); supported families: Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse"
                     ),
                     "{model}"
                 );
@@ -1012,5 +1156,100 @@ mod tests {
             "{}",
             error.message
         );
+    }
+
+    fn synthetic_context() -> RequestContext {
+        RequestContext {
+            req_id: "req_synthetic".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "vertex".to_string(),
+            traffic: None,
+            monitor: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_families_synthetic_count_tokens_locally_without_settings() {
+        let provider = VertexProvider::new();
+        for model in [
+            "vertex/xai/grok-4.7",
+            "vertex/openai/gpt-6.1-sol",
+            "vertex/meta/muse-spark-1.3",
+        ] {
+            let body: MessagesRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello world"}]
+            }))
+            .expect("valid request");
+            let response = provider
+                .handle_count_tokens(body, synthetic_context())
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{model}");
+        }
+        assert!(provider.ready.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn responses_families_synthetic_hosted_web_search_is_a_400_before_any_setting() {
+        let provider = VertexProvider::new();
+        for model in [
+            "vertex/xai/grok-4.7",
+            "vertex/openai/gpt-6.1-sol",
+            "vertex/meta/muse-spark-1.3",
+        ] {
+            for stream in [false, true] {
+                let body: MessagesRequest = serde_json::from_value(json!({
+                    "model": model,
+                    "stream": stream,
+                    "max_tokens": 16,
+                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                    "messages": [{"role": "user", "content": "news?"}]
+                }))
+                .expect("valid request");
+                let response = provider.handle_messages(body, synthetic_context()).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{model}");
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["error"]["type"], "invalid_request_error", "{value}");
+                let message = value["error"]["message"].as_str().unwrap();
+                assert!(
+                    message.starts_with("Vertex AI does not serve the hosted web_search tool"),
+                    "{message}"
+                );
+            }
+        }
+        assert!(provider.ready.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn report_error_events_synthetic_records_the_first_error_message() {
+        let outcome = NativeResponseOutcome::default();
+        let chunks = [
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Vertex AI Responses stream is invalid\"}}\n\n",
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"second\"}}\n\n",
+        ]
+        .map(|chunk| Ok::<Bytes, std::io::Error>(Bytes::from_static(chunk.as_bytes())));
+        let body = report_error_events(
+            Body::from_stream(stream::iter(chunks)),
+            Some(outcome.clone()),
+        );
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("message_start"));
+        assert_eq!(
+            outcome.failure().as_deref(),
+            Some("Vertex AI Responses stream is invalid")
+        );
+
+        let outcome = NativeResponseOutcome::default();
+        let body = report_error_events(
+            Body::from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+            Some(outcome.clone()),
+        );
+        axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        assert_eq!(outcome.failure(), None);
     }
 }

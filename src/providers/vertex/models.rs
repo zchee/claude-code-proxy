@@ -144,7 +144,10 @@ impl Family {
     /// is answered with a 400 that says so. The commit that adds a family's
     /// handler turns this on for it.
     pub const fn is_served(self) -> bool {
-        matches!(self, Family::Gemini | Family::Claude)
+        matches!(
+            self,
+            Family::Gemini | Family::Claude | Family::Grok | Family::OpenAi | Family::MetaMuse
+        )
     }
 
     /// The location rule of a model of the family that is not in the table.
@@ -739,7 +742,7 @@ mod tests {
     #[test]
     fn advertised_models_are_the_nine_ids_bare_and_prefixed() {
         let advertised = advertised_models();
-        assert_eq!(advertised.len(), 32);
+        assert_eq!(advertised.len(), 44);
         for (id, _) in EXPECTED {
             assert!(advertised.contains(&id.to_string()), "{id}");
             assert!(advertised.contains(&format!("vertex/{id}")), "{id}");
@@ -1141,7 +1144,9 @@ mod tests {
                 "{message}"
             );
             assert!(
-                message.ends_with("supported families: Gemini, Anthropic Claude"),
+                message.ends_with(
+                    "supported families: Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse"
+                ),
                 "{message}"
             );
         }
@@ -1360,29 +1365,52 @@ mod tests {
     ];
 
     #[test]
-    fn advertised_models_are_exactly_the_gemini_and_claude_names() {
+    fn advertised_models_are_exactly_the_served_family_names() {
         let mut expected: Vec<String> = EXPECTED
             .iter()
             .flat_map(|(id, _)| [id.to_string(), format!("vertex/{id}")])
             .chain(CLAUDE_NAMES.iter().map(|name| name.to_string()))
+            .chain(
+                [
+                    "vertex/xai/grok-4.7",
+                    "vertex/xai/grok-4.6",
+                    "vertex/xai/grok-4.20-reasoning",
+                    "vertex/xai/grok-4.20-non-reasoning",
+                    "vertex/xai/grok-4.3",
+                    "vertex/meta/muse-spark-1.3",
+                    "vertex/meta/muse-wonder-1.0",
+                    "vertex/meta/muse-ember-1.0",
+                    "vertex/openai/gpt-6-astra",
+                    "vertex/openai/gpt-6.1-sol",
+                    "vertex/openai/gpt-6.1-terra",
+                    "vertex/openai/gpt-6-luna",
+                ]
+                .map(str::to_string),
+            )
             .collect();
         expected.sort_unstable();
         assert_eq!(advertised_models(), expected);
-        // Claude is listed only under the prefix: the bare `claude-*` IDs
-        // stay with the providers that own them.
-        assert!(
-            advertised_models().iter().all(
-                |name| name.contains("gemini-") || name.starts_with("vertex/anthropic/claude-")
-            ),
-            "{:?}",
-            advertised_models()
-        );
+        // Only Gemini IDs are advertised bare; a partner name always carries
+        // `vertex/`, so bare claude-*, gpt-*, grok-* and muse-* stay with the
+        // providers that own them.
+        for name in advertised_models() {
+            assert!(
+                name.starts_with("gemini-") || name.starts_with("vertex/"),
+                "{name}"
+            );
+        }
         assert_eq!(
             Family::ALL
                 .into_iter()
                 .filter(|family| family.is_served())
                 .collect::<Vec<_>>(),
-            vec![Family::Gemini, Family::Claude]
+            vec![
+                Family::Gemini,
+                Family::Claude,
+                Family::Grok,
+                Family::OpenAi,
+                Family::MetaMuse
+            ]
         );
         let mut claude = Family::Claude.model_names();
         claude.sort_unstable();
