@@ -47,7 +47,7 @@ The library looks for a credential in this order:
 2. `~/.config/gcloud/application_default_credentials.json` (`%APPDATA%\gcloud\application_default_credentials.json` on Windows), which `gcloud auth application-default login` writes.
 3. The metadata server, which exists only on Google Cloud (Compute Engine, GKE, Cloud Run).
 
-The credentials file is trusted input: the library sends its refresh token or key material to the token endpoint and other URLs the file names, and the proxy does not check those endpoints, so whoever can write the file decides where that material goes.
+The credentials file is trusted input: the token endpoint and other URLs the file names receive the credentials the library sends them, which is the refresh token and client secret for user credentials, or an assertion signed with the key for a service account (the key itself signs locally and is never sent). The proxy does not check those endpoints, so whoever can write the file decides where those credentials go.
 
 The lookup does not follow `CLOUDSDK_CONFIG`. If you run gcloud with `CLOUDSDK_CONFIG` pointing at another directory, `gcloud auth application-default login` writes the credentials there, and the proxy does not find them. Point `GOOGLE_APPLICATION_CREDENTIALS` at that file instead:
 
@@ -241,7 +241,7 @@ The proxy chooses the error type from the HTTP status of Vertex AI. When Vertex 
 | Other Vertex AI 4xx | Same status, `invalid_request_error`, with Google's message |
 | Vertex AI 5xx, or no connection | 502 `api_error`; `Vertex AI is unreachable` when no status arrived |
 | No response headers within 300 seconds | 504 `api_error` |
-| Error inside a 200 stream | A blocked prompt (`blockReason`), a stop other than `STOP` or `MAX_TOKENS` (`finishReason`, with Google's `finishMessage`), a stream that ends without a `finishReason`, or an `error` chunk. Streaming requests get an `error` event. Non-streaming requests get the matching status: 429 for rate limits, 401 and 403 for credential errors, the in-stream 4xx code or 400 for invalid requests and blocked prompts, and 502 for the rest |
+| Error inside a 200 stream | A blocked prompt (`blockReason`), a stop other than `STOP` or `MAX_TOKENS` (`finishReason`, with Google's `finishMessage`), a stream that ends without a `finishReason`, an `error` chunk, response content over 16 MiB, or an event or part with none of the documented fields. Streaming requests get an `error` event. Non-streaming requests get the matching status: 429 for rate limits, 401 and 403 for credential errors, the in-stream 4xx code or 400 for invalid requests and blocked prompts, and 502 for the rest |
 
 What to check for each status:
 

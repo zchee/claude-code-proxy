@@ -939,9 +939,18 @@ fn write_vertex_credentials(home: &TempDir, fixture: &VertexFixture) -> std::pat
     path
 }
 
+/// The file inside `home` that [`vertex_server`] sends the server's stderr
+/// to. A file rather than a pipe, so a server that writes a lot never
+/// stalls on a pipe that nobody reads while the test runs.
+#[cfg(unix)]
+fn vertex_server_stderr(home: &TempDir) -> std::path::PathBuf {
+    home.path().join("server-stderr.log")
+}
+
 /// `claude-code-proxy serve` on `port` with the Vertex settings isolated in
 /// `home`, the project set and Vertex AI pointed at `fixture`. `extra_env`
-/// adds variables, such as `GOOGLE_APPLICATION_CREDENTIALS`.
+/// adds variables, such as `GOOGLE_APPLICATION_CREDENTIALS`. The server's
+/// stderr goes to [`vertex_server_stderr`].
 #[cfg(unix)]
 fn vertex_server(
     home: &TempDir,
@@ -960,15 +969,19 @@ fn vertex_server(
     for (name, value) in extra_env {
         command.env(name, value);
     }
+    let stderr = std::fs::File::create(vertex_server_stderr(home))?;
     let child = command
         .env("CCP_VERTEX_PROJECT", "synthetic-project")
         .env("CCP_VERTEX_BASE_URL", &fixture.base)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(stderr))
         .spawn()?;
     let mut child = ChildGuard(child);
-    drop(wait_for_service(&mut child, port)?);
+    if let Err(error) = wait_for_service(&mut child, port) {
+        let stderr = std::fs::read_to_string(vertex_server_stderr(home)).unwrap_or_default();
+        return Err(format!("{error}; server stderr: {stderr}").into());
+    }
     Ok(child)
 }
 
@@ -1297,10 +1310,7 @@ fn vertex_server_synthetic_unusable_service_account_key_leaks_nothing()
     thread::sleep(Duration::from_millis(500));
     child.0.kill()?;
     child.0.wait()?;
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.0.stderr.take() {
-        pipe.read_to_string(&mut stderr)?;
-    }
+    let stderr = std::fs::read_to_string(vertex_server_stderr(&home))?;
 
     // The library never asked the token endpoint: the failure is local.
     assert_eq!(fixture.token_requests.load(Ordering::SeqCst), 0);
