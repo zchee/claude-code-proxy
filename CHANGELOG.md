@@ -44,6 +44,16 @@ description: Release notes for claude-code-proxy.
   on the OpenAI-compatible routes, sets a reasoning effort. The Llama 4 models use `us-east5` unless a location
   override names the model. Reasoning does not carry across turns.
   See the [Vertex AI provider page](https://claude-code-proxy.raine.dev/providers/vertex/#managed-open-models).
+- Models you deployed from Model Garden, Hugging Face models included, to a
+  dedicated Vertex AI endpoint can be used as `vertex/endpoint/<name>` once
+  `vertex.endpoints` in `config.json` names the endpoint ID, its region, and
+  the `model` its container serves. The proxy reads the endpoint's dedicated
+  host once, or uses a configured `host`, and sends OpenAI Chat Completions
+  there; it never deploys a model or creates an endpoint. Shared endpoints
+  are refused, a scale-to-zero endpoint that is starting answers 503, and
+  `"tools": false` refuses requests with tools for a container that cannot
+  call them.
+  See the [Vertex AI provider page](https://claude-code-proxy.raine.dev/providers/vertex/#deployed-endpoints).
 
 ## v0.1.48 (2026-11-01)
 

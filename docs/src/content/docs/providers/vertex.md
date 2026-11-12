@@ -1,9 +1,9 @@
 ---
 title: Vertex AI
-description: Use Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, Mistral, and Model Garden's managed open models on Google Cloud Vertex AI with Application Default Credentials, project, location and per-model location settings, errors, and limits.
+description: Use Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, Mistral, Model Garden's managed open models, and models you deployed to a Vertex AI endpoint on Google Cloud Vertex AI with Application Default Credentials, project, location and per-model location settings, errors, and limits.
 ---
 
-The Vertex AI provider sends requests to Google Cloud Vertex AI for seven model families. Each family uses the API Google documents for it:
+The Vertex AI provider sends requests to Google Cloud Vertex AI for eight model families. Each family uses the API Google documents for it:
 
 | Family | Model names | Upstream API |
 | --- | --- | --- |
@@ -14,8 +14,9 @@ The Vertex AI provider sends requests to Google Cloud Vertex AI for seven model 
 | [Meta Muse](#meta-muse) | `vertex/meta/muse-<…>` | OpenAI Responses on `publishers/meta/v1/responses` |
 | [Mistral](#mistral) | `vertex/mistralai/<model-id>` | Mistral's chat format on `publishers/mistralai/models/<model>:streamRawPredict` |
 | [Managed open models](#managed-open-models) | `vertex/<publisher>/<model-id>-maas` | OpenAI Chat Completions on `endpoints/openapi/chat/completions` |
+| [Deployed endpoints](#deployed-endpoints) | `vertex/endpoint/<name>`, where `<name>` is a key of `vertex.endpoints` | OpenAI Chat Completions on `endpoints/<endpoint-id>/chat/completions` at the endpoint's dedicated host |
 
-Every path follows `https://<host>/v1/projects/<project>/locations/<location>/`, except for the two Llama 4 managed open models, whose path starts with `v1beta1` (see [Llama 4 location](#llama-4-location)). For example, a Gemini request goes to:
+Every path follows `https://<host>/v1/projects/<project>/locations/<location>/` (for a deployed endpoint, `<host>` is the endpoint's dedicated host), except for the two Llama 4 managed open models, whose path starts with `v1beta1` (see [Llama 4 location](#llama-4-location)). For example, a Gemini request goes to:
 
 ```text
 https://aiplatform.googleapis.com/v1/projects/<project>/locations/<location>/publishers/google/models/<model>:streamGenerateContent?alt=sse
@@ -25,7 +26,7 @@ https://aiplatform.googleapis.com/v1/projects/<project>/locations/<location>/pub
 <strong>Requests are billed to your Google Cloud project.</strong> Vertex AI has no subscription. Every request is charged at Vertex AI's pay-as-you-go rates to the project the proxy is configured with, using your own Google credentials with the `cloud-platform` scope. This holds for partner and open models too: Claude, Grok, OpenAI, Muse, Mistral, and managed open model requests are billed through the same project. A listener that other people can reach can spend that project's money.
 </div>
 
-Deployed endpoints (`vertex/endpoint/<name>`) are not supported; see [Models](#models).
+A deployed endpoint is one you created yourself, for example by deploying a Hugging Face model from Model Garden. The proxy only calls it: it never deploys a model, creates, changes, or deletes an endpoint, or enables a model. See [Deployed endpoints](#deployed-endpoints).
 
 ## Prerequisites
 
@@ -119,6 +120,7 @@ The command requests one access token and prints:
 - `Location overrides:` the [location overrides](#location-overrides) as `<key>=<location>` entries with their source, such as `mistralai=europe-west4 (CCP_VERTEX_LOCATION_OVERRIDES)`, or `none`, or the error when they are malformed
 - `Quota project:` and its source, or `none`
 - `Access token obtained: true`, or `false` with the reason
+- one `Deployed endpoint vertex/endpoint/<name>:` line per entry of [`vertex.endpoints`](#deployed-endpoints), with the endpoint ID, the project and where it came from, the location, the `model`, and the host: the configured one, or `not read yet` when the proxy reads it with `endpoints.get` on the first request. An invalid entry shows its error instead, and `Deployed endpoints: none` is printed when there are none. The command does not contact the endpoints.
 
 It reads only the `type` and `quota_project_id` fields of the credentials file and never prints a token, key, or secret. Without a credentials file it contacts the metadata server and can wait up to 30 seconds for an answer.
 
@@ -128,7 +130,7 @@ The command does not check that a partner model or a managed open model is enabl
 | --- | --- |
 | 0 | A project is set, the project, location, base URL, and location override settings are valid, and an access token was obtained. |
 | 1 | No credential was found or no token was obtained. After the report it prints `Not authenticated`, and the gcloud hint on stderr. |
-| 2 | A Vertex setting is missing or invalid, a malformed location override included. After the report it prints the error, which names the setting. This wins when credentials are also missing. |
+| 2 | A Vertex setting is missing or invalid, a malformed location override or an invalid `vertex.endpoints` entry included. After the report it prints the error, which names the setting. This wins when credentials are also missing. |
 
 `vertex auth login` and `vertex auth device` print the `gcloud auth application-default login` hint on stderr and exit with status 2. `vertex auth logout` removes nothing: it fails with a message that gcloud manages the credentials and points at `gcloud auth application-default revoke`, and exits with status 1.
 
@@ -319,13 +321,7 @@ A name ending in `-maas` stays in its family under `anthropic`, `xai`, and `mist
 
 A name without a publisher is always Gemini: `vertex/gpt-6.1-sol` is sent to Gemini and fails upstream, while `vertex/openai/gpt-6.1-sol` reaches OpenAI. An unregistered ID gets its family's defaults: Gemini's lowest thinking level `LOW` (see [Thinking](#thinking)), the family's location rule, and for a managed open model the defaults in [Managed open models](#managed-open-models). A model ID starts with a letter or digit and contains only letters, digits, `.`, `_`, `-`, and `@`, up to 256 bytes.
 
-Deployed endpoints are recognised and rejected with HTTP 400 before any setting or credential is read:
-
-```text
-this version of claude-code-proxy does not support the deployed endpoint (endpoint/<name>) model family on Vertex AI (requested "vertex/endpoint/my-endpoint"); supported families: Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, Mistral, Model Garden managed open model
-```
-
-A name under `endpoint/` is a deployed endpoint even when it ends in `-maas`. Any other form, such as `vertex/ai21/<model-id>` or a `vertex/meta/llama-<…>` name without `-maas`, gets HTTP 400 with a message listing the accepted forms, which ends `or vertex/<publisher>/<model-id>-maas for a Model Garden managed open model`.
+`vertex/endpoint/<name>` is a [deployed endpoint](#deployed-endpoints), even when the name ends in `-maas`. The listing adds every entry of `vertex.endpoints` whose settings are valid; it reads `config.json` when the proxy or the `models` command starts. A name contains only letters, digits, `_`, and `-`, up to 64 bytes; any other name is a 400 before any setting is read. Any other form, such as `vertex/ai21/<model-id>` or a `vertex/meta/llama-<…>` name without `-maas`, gets HTTP 400 with a message listing the accepted forms, which ends `or vertex/endpoint/<name> for an endpoint named in vertex.endpoints in config.json`.
 
 Whether a model is offered in your location, and whether your project may use it, is decided by Google. A model that is not offered or not enabled answers with Google's error (see [Errors](#errors)).
 
@@ -687,6 +683,134 @@ A `finish_reason` completes the message, with or without `data: [DONE]`. After i
 
 A non-streaming read stops at an event the stream would end on, without waiting for Vertex AI to close the stream: an upstream error event, a malformed event, content after `finish_reason`, or an event after `[DONE]`. The `finish_reason` itself is followed by the same 2-second read as on a stream.
 
+## Deployed endpoints
+
+A model you deployed to a Vertex AI endpoint, from Model Garden or from Hugging Face through Model Garden, is reached as `vertex/endpoint/<name>`. `<name>` is a key you choose in `vertex.endpoints` in `config.json`. The proxy calls the endpoint and nothing else: it does not deploy a model, create, change, or delete an endpoint, enable a model, or handle a Hugging Face token.
+
+### Preparing an endpoint
+
+Deploy the model first, in the Model Garden console or with gcloud. Google's commands, for reference; the proxy never runs them:
+
+```sh
+gcloud ai model-garden models list --can-deploy-hugging-face-models
+```
+
+```sh
+gcloud ai model-garden models deploy --model=MODEL_ID --hugging-face-access-token=HF_ACCESS_TOKEN
+```
+
+The endpoint must be:
+
+- **Dedicated.** Model Garden's predefined deployment settings use a public dedicated endpoint. A shared endpoint limits a request to 60 seconds and 1.5 MB and does not stream, and the proxy always asks for a stream, so it refuses an endpoint that `endpoints.get` reports as shared with HTTP 400. A dedicated endpoint takes 10 MB and streams with SSE. Private Service Connect endpoints are not supported.
+- **Served by a container that speaks OpenAI Chat Completions.** Google documents Hugging Face TGI (1.4.0 or later, for a model that has a chat template) and Model Garden's prebuilt vLLM containers, and says that not every model deployed to them supports Chat Completions. `rawPredict` and `predict` are not used.
+- **Set up for tool calls**, for Claude Code. The proxy cannot see whether a container calls tools. vLLM needs `--enable-auto-tool-choice` and a `--tool-call-parser` that fits the model, and the chat template must handle tools. Without that, a request with tools gets the container's HTTP 400, or the model never calls a tool, and Claude Code can do little. For an endpoint used only for plain chat, set `"tools": false`.
+
+A dedicated endpoint's inference timeout is 600 seconds unless the endpoint's `clientConnectionConfig.inferenceTimeout` sets another, up to 3,600 seconds. The proxy waits up to 300 seconds for the response headers and then has no limit between chunks.
+
+An endpoint that scales to zero (`min_replica_count` 0, a Preview feature) answers HTTP 429 with `Model is not yet ready for inference` while no replica is ready, and drops the request. The proxy answers that with a 503 saying the endpoint is starting, not with a rate limit; retry after a few minutes.
+
+### Endpoint configuration
+
+```json
+{
+  "vertex": {
+    "endpoints": {
+      "my-llm": { "endpoint": "1234567890123456789", "location": "us-central1", "model": "gemma-2-9b-it" }
+    }
+  }
+}
+```
+
+| Key | Required | Meaning |
+| --- | --- | --- |
+| `endpoint` | yes | The endpoint ID: lowercase letters, digits, and `-`. |
+| `location` | yes | The endpoint's region, such as `us-central1`. Never `global`. |
+| `model` | yes | The `model` value the serving container accepts: vLLM's `--served-model-name`, or the `--model` value when that is not set; TGI's examples send `tgi`. No single value works for every container. |
+| `project` | no | The endpoint's project, when it is not the Vertex project. The Vertex project must still be set. |
+| `host` | no | The endpoint's dedicated URL, `https://<endpoint-id>.<region>-<uid>.prediction.vertexai.goog`, or that DNS name alone, which gets `https://`. A loopback host may use `http`. No path, query, user name, or password. |
+| `tools` | no | `false` refuses a request that carries tools with HTTP 400 before anything is sent. Default `true`. |
+
+An unknown key, a missing or empty required key, `global`, or a host that is not a dedicated endpoint host or a loopback host is an error that names `vertex.endpoints` and the endpoint. Only requests to that endpoint fail, with HTTP 500 `Invalid Vertex configuration: ...`; other endpoints and families keep working. A `vertex.endpoints` value that is not an object fails every endpoint request. The proxy reads `vertex.endpoints` with the other settings on the first Vertex AI request; restart it after a change. The startup summary lists the endpoint names, never a host.
+
+### Where requests go
+
+The request goes to the endpoint's dedicated host:
+
+```text
+https://<endpoint-id>.<region>-<uid>.prediction.vertexai.goog/v1/projects/<project>/locations/<location>/endpoints/<endpoint-id>/chat/completions
+```
+
+With `host` set, that host is used and the endpoint is never read. Without it, before the first request to the endpoint the proxy reads the endpoint once with `endpoints.get` (the permission `aiplatform.endpoints.get`, which `roles/aiplatform.user` includes) from the regional host, or from `vertex.baseUrl` when it is set:
+
+```text
+https://<location>-aiplatform.googleapis.com/v1/projects/<project>/locations/<location>/endpoints/<endpoint-id>
+```
+
+When the answer has `dedicatedEndpointEnabled: true`, its `dedicatedEndpointDns` is the host. Google documents that value as a full `https://...prediction.vertexai.goog` URL, so the proxy reads it as a URL and puts nothing in front of it. The host is kept until the proxy exits; a lookup that failed is tried again by the next request. The suffix of the DNS name is not the project number in general, so the proxy never builds it.
+
+The Google access token is sent only to the configured base URL or the regional host for the lookup, and to a dedicated endpoint host (`*.prediction.vertexai.goog`, over https) or a loopback host for the request. It is never sent to the shared host for a dedicated endpoint, which does not answer there. The lookup fails, and nothing is sent to the endpoint, when:
+
+| `endpoints.get` answer | Proxy answer |
+| --- | --- |
+| `dedicatedEndpointEnabled` is `false`, missing, or not a boolean | 400 `invalid_request_error`, `Vertex AI endpoint <name> is not a dedicated endpoint (...)`, saying a dedicated endpoint is required |
+| dedicated, but no `dedicatedEndpointDns` | 502 `api_error`, `... endpoints.get returned no dedicatedEndpointDns ...`, asking for `host` |
+| dedicated, but `dedicatedEndpointDns` is not an https URL of a `*.prediction.vertexai.goog` host | 502 `api_error`, `... endpoints.get returned a dedicatedEndpointDns that ...` with the reason, asking for `host` |
+| HTTP 403 | 403 `permission_error`, naming `aiplatform.endpoints.get` and offering `host` instead |
+| HTTP 404 | 404 `invalid_request_error`, naming the endpoint, project, and location |
+
+### Endpoint request and response
+
+The request comes from the same Chat Completions translator as the managed open models:
+
+- `model` is the configured `model`.
+- `stream` is always `true`, with `stream_options.include_usage`.
+- No `reasoning_effort` and no thinking switch is sent: a container's controls are unknown. Thinking blocks in the history are not sent.
+- Function tools, `tool_choice`, and `parallel_tool_calls` are sent as the translator writes them, unless the endpoint has `"tools": false`:
+
+```text
+Vertex AI endpoint my-llm is configured with "tools": false in vertex.endpoints, so a request that carries tools is not sent to it; send the request without tools, or set "tools": true once the endpoint's serving container supports tool calling
+```
+
+A stream is read with the same rules as a managed open model's: a `finish_reason` or `data: [DONE]` completes it, `delta.reasoning_content` becomes a thinking block, and content after `finish_reason` or any event after `[DONE]` is an error. A streaming client gets an `api_error` event with `Vertex AI endpoint stream is invalid`; a non-streaming client gets a 502 with the reason. An error event (`{"error": {"message": ...}}`) ends a non-streaming read at once.
+
+| Endpoint answer | Proxy answer |
+| --- | --- |
+| HTTP 429 whose message contains `Model is not yet ready for inference` | 503 `api_error`, `Vertex AI endpoint <name> is starting: ...`; it is not a rate limit |
+| Any other HTTP 429 | 429 `rate_limit_error`, naming the endpoint; the container may be overloaded |
+| HTTP 403 | 403 `permission_error`, naming `aiplatform.endpoints.predict` |
+| HTTP 404 | 404 `invalid_request_error`, naming the endpoint, project, location, and the `host` setting |
+| Any other status | as for every family (see [Errors](#errors)), with the endpoint, project, location, and setting appended |
+
+`/v1/messages/count_tokens` is the local estimate and needs no setting; any valid endpoint name is counted.
+
+### Checking an endpoint
+
+These checks need your own endpoint and Google credentials. Write the endpoint into `~/.config/claude-code-proxy/config.json` as in [Endpoint configuration](#endpoint-configuration), with your values.
+
+Show what the proxy resolves for the endpoint; the line names the endpoint, project, and location:
+
+```sh
+CCP_VERTEX_PROJECT=PROJECT_ID claude-code-proxy vertex auth status
+```
+
+Start the proxy:
+
+```sh
+CCP_VERTEX_PROJECT=PROJECT_ID CCP_VERTEX_LOCATION=global claude-code-proxy serve --port 18799 --no-monitor
+```
+
+Send the smallest request. It shows whether the dedicated host takes the path above and whether `endpoints.get` reports the endpoint as dedicated:
+
+```sh
+curl -sS http://127.0.0.1:18799/v1/messages -H 'content-type: application/json' -H 'x-api-key: anything' -H 'anthropic-version: 2023-06-01' -d '{"model":"vertex/endpoint/my-llm","max_tokens":64,"messages":[{"role":"user","content":"Reply with the single word: ok"}]}'
+```
+
+Start Claude Code on the endpoint and let it call tools for three rounds; this shows whether the container's tool calling works:
+
+```sh
+ANTHROPIC_BASE_URL=http://127.0.0.1:18799 ANTHROPIC_AUTH_TOKEN=anything ANTHROPIC_MODEL=vertex/endpoint/my-llm ANTHROPIC_SMALL_FAST_MODEL=vertex/endpoint/my-llm CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 claude
+```
+
 ## OpenAI-compatible APIs
 
 When the OpenAI routes are enabled, every Vertex AI model works with both `POST /v1/chat/completions` and `POST /v1/responses`. Text, images, function tools, tool results, token limits, streaming, and usage use the standard shape for the chosen route. `reasoning_effort` and `reasoning.effort` accept `low`, `medium`, `high`, `xhigh`, and `max` for every family. `parallel_tool_calls` is accepted.
@@ -698,6 +822,7 @@ When the OpenAI routes are enabled, every Vertex AI model works with both `POST 
 | xAI Grok, Meta Muse | Effort is not sent. |
 | OpenAI | Effort is sent as `reasoning.effort`. |
 | Mistral | Effort is not sent. |
+| Deployed endpoints | Effort is not sent. |
 | Managed open models | gpt-oss gets `reasoning_effort` as in [Open-model thinking](#open-model-thinking). GLM and Gemma get `enable_thinking: true` when the request sets an effort and `false` when it does not, because these routes carry an effort but no thinking setting. Llama 4 and DeepSeek get neither. On gpt-oss, `tool_choice` `required` or a named function is the [400 above](#forced-tool-choice-on-gpt-oss). |
 
 ## Errors
@@ -707,8 +832,12 @@ The proxy chooses the error type from the HTTP status of Vertex AI. When Vertex 
 | Situation | Proxy answer |
 | --- | --- |
 | Project missing or a setting invalid, including a malformed location override | 500 `api_error`, `Invalid Vertex configuration: ...` naming the setting |
+| Invalid `vertex.endpoints` entry, for a request to that endpoint | 500 `api_error`, `Invalid Vertex configuration: Invalid Vertex setting vertex.endpoints in config.json: endpoint "<name>": ...` |
+| `vertex/endpoint/<name>` not in `vertex.endpoints` | 400 `invalid_request_error`, `Vertex AI endpoint "<name>" is not configured: ...` listing the configured names, before any credential is read |
+| Request with tools to an endpoint with `"tools": false` | 400 `invalid_request_error`, before any credential is read (see [Endpoint request and response](#endpoint-request-and-response)) |
+| Shared endpoint, or a dedicated endpoint without a usable `dedicatedEndpointDns` | 400 or 502 before the endpoint is called (see [Where requests go](#where-requests-go)) |
 | HTTP client could not be set up, which happens on the first Vertex AI request rather than at startup | 500 `api_error`, `Vertex AI transport is unavailable: ...` with the cause |
-| Deployed endpoint, or a name in no accepted form | 400 `invalid_request_error`, before any setting or credential is read (see [Models](#models)) |
+| A name in no accepted form, or an invalid endpoint name | 400 `invalid_request_error`, before any setting or credential is read (see [Models](#models)) |
 | Forced tool choice (`any` or `tool`) for gpt-oss | 400 `invalid_request_error`, `Vertex AI model openai/gpt-oss-120b-maas does not support a forced tool choice ...`, before any setting or credential is read (see [Forced tool choice on gpt-oss](#forced-tool-choice-on-gpt-oss)) |
 | Hosted web search tool for Grok, OpenAI, or Muse | 400 `invalid_request_error`, `Vertex AI does not serve the hosted web_search tool for <family> models; ...` |
 | Mistral without a Mistral location | 400 `invalid_request_error`, `Vertex AI models of publisher mistralai are not served in location <location>: ...` naming the settings |
@@ -721,7 +850,7 @@ The proxy chooses the error type from the HTTP status of Vertex AI. When Vertex 
 | Vertex AI 5xx, or no connection | 502 `api_error`; `Vertex AI is unreachable` when no status arrived |
 | No response headers within 300 seconds | 504 `api_error` |
 | Error inside a Gemini 200 stream | A blocked prompt (`blockReason`), a stop other than `STOP` or `MAX_TOKENS` (`finishReason`, with Google's `finishMessage`), a stream that ends without a `finishReason`, an `error` chunk, response content over 16 MiB, or an event or part with none of the documented fields. Streaming requests get an `error` event. Non-streaming requests get the matching status: 429 for rate limits, 401 and 403 for credential errors, the in-stream 4xx code or 400 for invalid requests and blocked prompts, and 502 for the rest |
-| Error inside a Claude, Grok, OpenAI, Muse, Mistral, or managed open model 200 stream | Streaming requests get an `api_error` event: `Vertex AI Messages stream is invalid` for Claude, `Vertex AI Responses stream is invalid` for Grok, OpenAI, and Muse, `Vertex AI Mistral stream is invalid` for Mistral, `Vertex AI open model stream is invalid` for the managed open models. Non-streaming requests get a 502 |
+| Error inside a Claude, Grok, OpenAI, Muse, Mistral, managed open model, or deployed endpoint 200 stream | Streaming requests get an `api_error` event: `Vertex AI Messages stream is invalid` for Claude, `Vertex AI Responses stream is invalid` for Grok, OpenAI, and Muse, `Vertex AI Mistral stream is invalid` for Mistral, `Vertex AI open model stream is invalid` for the managed open models, `Vertex AI endpoint stream is invalid` for deployed endpoints. Non-streaming requests get a 502 |
 
 For a Claude, Grok, OpenAI, Muse, Mistral, or managed open model, a 403 or 404 message adds this sentence before `(upstream HTTP <status>)`:
 
@@ -729,7 +858,7 @@ For a Claude, Grok, OpenAI, Muse, Mistral, or managed open model, a 403 or 404 m
 Also check that model {model} is enabled in Model Garden for project {project} in location {location} and, for a preview model, that the project has been granted access; the status alone does not say which of these is the cause
 ```
 
-`{model}` is the model ID sent upstream, such as `xai/grok-4.7`, `claude-opus-5-5`, or `zai-org/glm-5.2-maas`, and the project and location are the ones the request used, an override included.
+`{model}` is the model ID sent upstream, such as `xai/grok-4.7`, `claude-opus-5-5`, or `zai-org/glm-5.2-maas`, and the project and location are the ones the request used, an override included. A deployed endpoint gets its own 403, 404, and 429 messages instead (see [Endpoint request and response](#endpoint-request-and-response)).
 
 What to check for each status:
 
@@ -752,7 +881,9 @@ With [traffic capture](/reference/files-and-storage/#traffic-captures) on, Verte
 | Grok, OpenAI, Muse stream | `060-vertex-responses-stream-error`, `061-vertex-responses-stream-summary` |
 | Mistral stream | `061-vertex-mistral-stream-summary` |
 | Managed open model stream | `061-vertex-open-model-stream-summary` |
-| Non-streaming Gemini, Grok, OpenAI, Muse, Mistral, managed open model | `061-vertex-buffered-summary` and `051-downstream-response` |
+| Deployed endpoint stream | `061-vertex-endpoint-stream-summary` |
+| Deployed endpoint lookup (`endpoints.get`) | `018-upstream-endpoint-lookup-request-metadata`, `018-upstream-endpoint-lookup-response-headers`, and `018-upstream-endpoint-lookup-fields` with only `dedicatedEndpointEnabled` and `dedicatedEndpointDns`; the rest of the answer is not kept |
+| Non-streaming Gemini, Grok, OpenAI, Muse, Mistral, managed open model, deployed endpoint | `061-vertex-buffered-summary` and `051-downstream-response` |
 
 The `060-...-stream-error` file is written only when the stream failed. No capture file holds the request's access token, in any field: every string the proxy writes for a Vertex AI request has the token replaced with `[redacted]`. Apart from that replacement, upstream text in these files is kept whole, however long, except upstream error and finish messages, which also go through the cleaning described in [Errors](#errors) and are cut to 500 characters.
 
@@ -764,6 +895,7 @@ The `060-...-stream-error` file is written only when the stream failed. No captu
 | `CCP_VERTEX_LOCATION`, `GOOGLE_CLOUD_LOCATION` | `vertex.location` | Vertex AI location. Default `global`. |
 | `CCP_VERTEX_LOCATION_OVERRIDES` | `vertex.locationOverrides` | Locations for single publishers or models (see [Location overrides](#location-overrides)). |
 | `CCP_VERTEX_BASE_URL` | `vertex.baseUrl` | Replaces the host derived from the location, for a relay or a local test server. |
+| none | `vertex.endpoints` | Deployed endpoints by name (see [Endpoint configuration](#endpoint-configuration)). |
 | `GOOGLE_APPLICATION_CREDENTIALS` | none | Credentials file, read by the Google library. |
 | `GOOGLE_CLOUD_QUOTA_PROJECT` | none | Quota project, read by the Google library. |
 
@@ -802,17 +934,25 @@ No request to Vertex AI was observed while this provider was built. The request 
 | DeepSeek | The body's `model` is `deepseek-ai/deepseek-v4.1-flash-maas`. Google's pages name the publisher and the ID but show no request with this string. | HTTP 400 or 404 naming the model. |
 | GLM, Gemma | Both accept `chat_template_kwargs.enable_thinking` with `true` and `false`. Google's thinking page shows GLM with `false` and Gemma with `true`. | HTTP 400 naming `chat_template_kwargs`. |
 | Gemma, Llama 4, DeepSeek | The models take function tools. Google documents tool calling for GLM and gpt-oss, not for these. | HTTP 400 when tools are sent, or the model never calls a tool. |
+| Deployed endpoints | A dedicated host takes the same `/v1/projects/<project>/locations/<location>/endpoints/<endpoint-id>/chat/completions` path as the regional host. Google shows the path on the regional host only. | HTTP 404 from the dedicated host for an endpoint that exists. |
+| Deployed endpoints | `endpoints.get` reports a dedicated endpoint with `dedicatedEndpointEnabled: true` and a `dedicatedEndpointDns` that is a full `https://` URL, as the API reference describes it. | A usable endpoint is refused: 400 `is not a dedicated endpoint`, or 502 `returned a dedicatedEndpointDns that is not a valid URL` when the value is a bare DNS name. Set `host` to the DNS name; a bare name there gets `https://`. |
+| Deployed endpoints | The container calls tools with the default Model Garden deployment settings. No Google page shows that. | HTTP 400 from the container when tools are sent, such as vLLM's message about `--enable-auto-tool-choice`, or the model never calls a tool. Claude Code can then do little; `"tools": false` keeps plain chat working. |
+| Deployed endpoints | The container's stream ends with `finish_reason` or `data: [DONE]`, may send usage in a chunk without choices, and sends an error as `{"error": {"message": ...}}`. TGI and vLLM versions differ. | The stream ends with `Vertex AI endpoint stream is invalid`. An error sent as `{"error": "<text>"}` is reported as a malformed event rather than with its text. |
+| Deployed endpoints | The container accepts `stream_options` and `parallel_tool_calls`. Some vLLM versions refuse fields they do not know. | HTTP 400 naming the field. |
+| Deployed endpoints | A wrong endpoint ID, location, or project answers 404 (or 403). No Google page maps each mistake to a status. | Another status; the message still names the endpoint, project, location, and setting. |
+| Deployed endpoints | A scale-to-zero endpoint's 429 contains `Model is not yet ready for inference`, as Google's autoscaling guide quotes it. | The start-up 429 is reported as a rate limit (429 `rate_limit_error`). |
+| Deployed endpoints | The 10 MB limit of a dedicated endpoint is the only size limit; the proxy does not check it. Google does not say whether it applies to the request and the response separately. | HTTP 413 or 400 for a long history. |
 
 ## Limitations
 
-- Deployed endpoints (`vertex/endpoint/<name>`) are refused with HTTP 400. The proxy does not enable models or create endpoints.
+- The proxy does not enable models, deploy models, or create, change, or delete endpoints. Deployed endpoints must be dedicated and serve OpenAI Chat Completions; shared endpoints, Private Service Connect endpoints, and `rawPredict` or `predict` bodies are not supported. The Vertex project must be set even when every endpoint names its own project.
 - gpt-oss refuses a forced tool choice with HTTP 400. The managed open models other than gpt-oss, GLM, and Gemma have no thinking switch, so Claude Code's effort and thinking settings do not reach them.
 - Gemini's built-in tools (Google Search, code execution, URL context) and Anthropic server tools are not available for Gemini. Structured output (`output_config.format`), `cache_control`, and `metadata` are ignored for Gemini.
 - For Gemini, PDF and other document blocks are dropped and image URLs are rejected. Gemini responses that contain images, files, or code-execution parts end with an error.
 - `thinkingBudget` is never sent, so models that take only `thinkingBudget`, such as Gemini 2.5, are not supported.
 - Safety settings are Google's defaults; the proxy sends none.
 - Claude features that Vertex AI does not accept are not checked by the proxy; the upstream error is returned. `anthropic-beta` values outside the Claude Code list are dropped without an error.
-- Grok, OpenAI, Muse, Mistral, and the managed open models do not carry reasoning across turns. Grok, OpenAI, and Muse refuse hosted tools. Stored responses (`store: true`, `previous_response_id`) and OpenAI's `/responses/compact` are not used.
+- Grok, OpenAI, Muse, Mistral, the managed open models, and deployed endpoints do not carry reasoning across turns. Grok, OpenAI, and Muse refuse hosted tools. Stored responses (`store: true`, `previous_response_id`) and OpenAI's `/responses/compact` are not used.
 - Grok, OpenAI, Muse, Mistral, and managed open model streams end with an error on any event the proxy does not recognise, and accept events up to 1 MiB each.
 - Token counts for `/v1/messages/count_tokens` are local estimates for every family; Vertex AI's token-counting endpoints are not used.
 - A non-streaming Gemini, Grok, OpenAI, Muse, Mistral, or managed open model request has no deadline before the first terminal event (Gemini's `finishReason`, the Responses completion, or the Chat Completions `finish_reason` or `[DONE]` of Mistral and the managed open models): like a stream, it waits as long as the model takes. After that event the read ends when Vertex AI closes the stream or 2 seconds pass. A non-streaming Claude request is read until Vertex AI closes the response, also without a deadline.

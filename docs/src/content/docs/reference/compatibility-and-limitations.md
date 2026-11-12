@@ -85,7 +85,7 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 
 ## Vertex AI
 
-- Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, Mistral, and Model Garden's managed open models are supported. Partner models are reached only as `vertex/<publisher>/<model-id>`, managed open models only as `vertex/<publisher>/<model-id>-maas`, and both must be enabled in Model Garden first. Deployed endpoints are rejected with HTTP 400.
+- Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, Mistral, Model Garden's managed open models, and endpoints you deployed are supported. Partner models are reached only as `vertex/<publisher>/<model-id>`, managed open models only as `vertex/<publisher>/<model-id>-maas`, and both must be enabled in Model Garden first. A deployed endpoint is reached as `vertex/endpoint/<name>` once `vertex.endpoints` names it; it must be a dedicated endpoint whose container serves OpenAI Chat Completions. The proxy never deploys a model or creates an endpoint.
 - The proxy stores no Google credentials and has no login of its own. Application Default Credentials do not follow `CLOUDSDK_CONFIG`.
 - The provider was built from Google's API reference without observing live traffic. The [provider page](/providers/vertex/#implemented-from-documentation-only) lists the assumptions and the symptom of each.
 - Each family is served only in some locations. Mistral needs `us-central1` or `europe-west4`, Muse always uses `global`, the Llama 4 open models always use `us-east5`, and `CCP_VERTEX_LOCATION_OVERRIDES` or `vertex.locationOverrides` sets the location per publisher or model.

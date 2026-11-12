@@ -4,7 +4,7 @@
 //! documented response shapes: `streamGenerateContent` for Gemini, the
 //! Anthropic Messages events for Claude, OpenAI Responses events for xAI
 //! Grok, OpenAI and Meta Muse, and `chat.completion.chunk` objects for
-//! Mistral and Model Garden's managed open models.
+//! Mistral, Model Garden's managed open models and deployed endpoints.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -20,7 +20,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri, heade
 use axum::response::Response;
 use bytes::Bytes;
 use claude_code_proxy::{
-    config::{AliasProvider, resolve_vertex_config},
+    config::{AliasProvider, resolve_vertex_config, resolve_vertex_endpoints},
     monitor::{MonitorHandle, RequestStatus, snapshot::MonitorSnapshot},
     provider::Provider,
     providers::vertex::{
@@ -159,6 +159,7 @@ impl Answer {
 /// What the stand-in received.
 #[derive(Debug, Clone)]
 struct Recorded {
+    method: Method,
     path_and_query: String,
     authorization: Option<String>,
     accept: Option<String>,
@@ -175,6 +176,7 @@ struct StandIn {
 
 async fn answer_next(
     State(stand_in): State<StandIn>,
+    method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
@@ -186,6 +188,7 @@ async fn answer_next(
             .map(str::to_string)
     };
     stand_in.requests.lock().unwrap().push(Recorded {
+        method,
         path_and_query: uri
             .path_and_query()
             .map(|value| value.as_str().to_string())
@@ -3627,4 +3630,547 @@ async fn vertex_responses_synthetic_snapshot_carrying_a_refusal_is_an_error() {
         }
         assert_eq!(upstream.requests().len(), 6, "{}", family.model);
     }
+}
+
+// Deployed endpoints. The paths, the dedicated DNS form and the cold-start
+// wording below are written out from Google's endpoint documentation, not
+// taken from the provider's constants. The proxy never deploys anything:
+// every endpoint here is one the test says the user already has.
+
+const ENDPOINT_MODEL: &str = "vertex/endpoint/my-llm";
+
+const ENDPOINT_CHAT_PATH: &str =
+    "/v1/projects/ccp-project/locations/us-central1/endpoints/1234567890123456789/chat/completions";
+
+const ENDPOINT_GET_PATH: &str =
+    "/v1/projects/ccp-project/locations/us-central1/endpoints/1234567890123456789";
+
+/// The `my-llm` entry of the documented example configuration, with
+/// `extra` merged in.
+fn endpoint_entry(extra: Value) -> Value {
+    let mut entry = json!({
+        "endpoint": "1234567890123456789",
+        "location": "us-central1",
+        "model": "gemma-2-9b-it"
+    });
+    if let (Some(entry), Some(extra)) = (entry.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            entry.insert(key.clone(), value.clone());
+        }
+    }
+    entry
+}
+
+/// A provider whose Vertex base URL is `upstream` and whose
+/// `vertex.endpoints` is `endpoints`.
+fn endpoint_provider(upstream: &FakeVertex, endpoints: Value) -> VertexProvider {
+    let env: HashMap<String, String> = HashMap::from([
+        ("CCP_VERTEX_PROJECT".to_string(), "ccp-project".to_string()),
+        ("CCP_VERTEX_BASE_URL".to_string(), upstream.base.clone()),
+    ]);
+    let config_dir = tempfile::tempdir().expect("temporary config directory");
+    std::fs::write(
+        config_dir.path().join("config.json"),
+        json!({"vertex": {"endpoints": endpoints}}).to_string(),
+    )
+    .unwrap();
+    let config = resolve_vertex_config(&env, config_dir.path());
+    let endpoints = resolve_vertex_endpoints(config_dir.path());
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {SYNTHETIC_TOKEN}")).unwrap(),
+    );
+    let client = VertexClient::with_client(client_builder().no_proxy().build().unwrap());
+    VertexProvider::with_client_and_endpoints(
+        client,
+        VertexCredentials::fixed(headers),
+        config,
+        endpoints,
+    )
+}
+
+/// What `endpoints.get` answers for a dedicated endpoint whose
+/// `dedicatedEndpointDns` is `dns`.
+fn endpoint_metadata(fields: Value) -> Answer {
+    let mut metadata = json!({
+        "name": "projects/ccp-project/locations/us-central1/endpoints/1234567890123456789",
+        "displayName": "synthetic-endpoint",
+        "deployedModels": [{"id": "1", "displayName": "gemma-2-9b-it"}]
+    });
+    if let (Some(metadata), Some(fields)) = (metadata.as_object_mut(), fields.as_object()) {
+        for (key, value) in fields {
+            metadata.insert(key.clone(), value.clone());
+        }
+    }
+    Answer::raw(200, "application/json", vec![metadata.to_string()])
+}
+
+fn endpoint_answer_text(stream: bool, body: &str) -> String {
+    if stream {
+        let events = sse_events(body);
+        assert_eq!(
+            events.last().map(|(name, _)| name.as_str()),
+            Some("message_stop"),
+            "{body}"
+        );
+        let content = streamed_content(&events);
+        content[0]["text"].as_str().unwrap_or_default().to_string()
+    } else {
+        let message: Value = serde_json::from_str(body).unwrap();
+        message["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+}
+
+#[tokio::test]
+async fn vertex_endpoint_synthetic_configured_host_gets_the_request_and_endpoints_get_is_not_called()
+ {
+    let upstream = FakeVertex::start(vec![
+        open_model_sse(&open_model_text("Hello")),
+        open_model_sse(&open_model_text("Hello")),
+    ])
+    .await;
+    let provider = endpoint_provider(
+        &upstream,
+        json!({"my-llm": endpoint_entry(json!({"host": upstream.base}))}),
+    );
+    let registry = registry(provider);
+    for stream in [false, true] {
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages",
+            &open_model_request(ENDPOINT_MODEL, stream),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "stream={stream}: {body}");
+        assert_eq!(endpoint_answer_text(stream, &body), "Hello", "{body}");
+    }
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    for sent in requests {
+        assert_eq!(sent.method, Method::POST);
+        assert_eq!(sent.path_and_query, ENDPOINT_CHAT_PATH);
+        assert_eq!(
+            sent.authorization.as_deref(),
+            Some(format!("Bearer {SYNTHETIC_TOKEN}").as_str())
+        );
+        assert_eq!(sent.accept.as_deref(), Some("text/event-stream"));
+        // The configured model, the tools as translated, a stream with
+        // usage, and neither an effort nor a thinking switch.
+        assert_eq!(
+            sent.body,
+            json!({
+                "model": "gemma-2-9b-it",
+                "messages": [
+                    {"role":"system","content":"Be brief."},
+                    {"role":"user","content":"Say hello"}
+                ],
+                "tools": [{"type":"function","function":{
+                    "name":"read_file",
+                    "description":"Read a file",
+                    "parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+                }}],
+                "stream": true,
+                "stream_options": {"include_usage": true},
+                "max_tokens": 256
+            })
+        );
+    }
+}
+
+#[tokio::test]
+async fn vertex_endpoint_synthetic_endpoints_get_runs_once_and_its_dedicated_url_is_used_as_written()
+ {
+    // The dedicated host is a second stand-in, so a request that went to
+    // the base URL instead would be seen there.
+    let dedicated = FakeVertex::start(vec![
+        open_model_sse(&open_model_text("Hello")),
+        open_model_sse(&open_model_text("Hello")),
+    ])
+    .await;
+    let lookup = FakeVertex::start(vec![endpoint_metadata(json!({
+        "dedicatedEndpointEnabled": true,
+        "dedicatedEndpointDns": dedicated.base,
+    }))])
+    .await;
+    let registry = registry(endpoint_provider(
+        &lookup,
+        json!({"my-llm": endpoint_entry(json!({}))}),
+    ));
+    for stream in [false, true] {
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages",
+            &message_request(ENDPOINT_MODEL, stream),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "stream={stream}: {body}");
+        assert_eq!(endpoint_answer_text(stream, &body), "Hello", "{body}");
+    }
+    let lookups = lookup.requests();
+    assert_eq!(lookups.len(), 1, "endpoints.get runs once: {lookups:?}");
+    assert_eq!(lookups[0].method, Method::GET);
+    assert_eq!(lookups[0].path_and_query, ENDPOINT_GET_PATH);
+    assert_eq!(
+        lookups[0].authorization.as_deref(),
+        Some(format!("Bearer {SYNTHETIC_TOKEN}").as_str())
+    );
+    let requests = dedicated.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    for sent in requests {
+        // The path is appended once, to the reported URL as written.
+        assert_eq!(sent.method, Method::POST);
+        assert_eq!(sent.path_and_query, ENDPOINT_CHAT_PATH);
+        assert_eq!(sent.body["model"], "gemma-2-9b-it");
+    }
+}
+
+#[tokio::test]
+async fn vertex_endpoint_synthetic_shared_and_dns_less_endpoints_fail_before_any_inference_call() {
+    let dedicated = FakeVertex::start(Vec::new()).await;
+    let shared = "Vertex AI endpoint my-llm is not a dedicated endpoint (endpoint \
+                  1234567890123456789 in project ccp-project, location us-central1 \
+                  (vertex.endpoints.my-llm in config.json)): endpoints.get did not report \
+                  dedicatedEndpointEnabled: true. A shared endpoint does not stream (no SSE) and \
+                  limits a request to 60 seconds and 1.5 MB, so claude-code-proxy needs a \
+                  dedicated endpoint: deploy the model to a dedicated endpoint, or, if this \
+                  endpoint is one, set \"host\" in vertex.endpoints.my-llm to its dedicated URL";
+    let unusable = |reason: &str| {
+        format!(
+            "Vertex AI endpoint my-llm is a dedicated endpoint, but endpoints.get returned {reason} \
+             (endpoint 1234567890123456789 in project ccp-project, location us-central1 \
+             (vertex.endpoints.my-llm in config.json)). The proxy sends the access token only to \
+             https://<endpoint-id>.<region>-<uid>.prediction.vertexai.goog and never to the \
+             shared host, which a dedicated endpoint does not answer on; set \"host\" in \
+             vertex.endpoints.my-llm to the endpoint's dedicated URL (upstream HTTP 200)"
+        )
+    };
+    let cases = [
+        (
+            "shared endpoint",
+            json!({"dedicatedEndpointEnabled": false, "dedicatedEndpointDns": dedicated.base}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            shared.to_string(),
+        ),
+        (
+            "no dedicated flag",
+            json!({"dedicatedEndpointDns": dedicated.base}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            shared.to_string(),
+        ),
+        (
+            "dedicated without a DNS name",
+            json!({"dedicatedEndpointEnabled": true}),
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            unusable("no dedicatedEndpointDns"),
+        ),
+        (
+            "a DNS name without a scheme",
+            json!({
+                "dedicatedEndpointEnabled": true,
+                "dedicatedEndpointDns": "1234567890123456789.us-central1-987654321.prediction.vertexai.goog"
+            }),
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            unusable("a dedicatedEndpointDns that is not a valid URL"),
+        ),
+        (
+            "a host outside prediction.vertexai.goog",
+            json!({
+                "dedicatedEndpointEnabled": true,
+                "dedicatedEndpointDns": "https://synthetic.example"
+            }),
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            unusable(
+                "a dedicatedEndpointDns that must be a dedicated endpoint host, \
+                 https://<endpoint-id>.<region>-<uid>.prediction.vertexai.goog, or a loopback host",
+            ),
+        ),
+    ];
+    for (case, fields, status, error_type, expected) in cases {
+        // A failed lookup is not kept, so each request reads the endpoint.
+        let lookup = FakeVertex::start(vec![
+            endpoint_metadata(fields.clone()),
+            endpoint_metadata(fields),
+        ])
+        .await;
+        let registry = registry(endpoint_provider(
+            &lookup,
+            json!({"my-llm": endpoint_entry(json!({}))}),
+        ));
+        for stream in [false, true] {
+            let (answered, _, body) = send(
+                app_with_monitor(registry.clone(), None),
+                "/v1/messages",
+                &message_request(ENDPOINT_MODEL, stream),
+                &[],
+            )
+            .await;
+            assert_eq!(answered, status, "{case}, stream={stream}: {body}");
+            let value: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["error"]["type"], error_type, "{case}: {body}");
+            assert_eq!(error_message(&body), expected, "{case}, stream={stream}");
+        }
+        let lookups = lookup.requests();
+        assert_eq!(lookups.len(), 2, "{case}: {lookups:?}");
+        assert!(
+            lookups
+                .iter()
+                .all(|sent| sent.method == Method::GET && sent.path_and_query == ENDPOINT_GET_PATH),
+            "{case}: {lookups:?}"
+        );
+    }
+    assert!(
+        dedicated.requests().is_empty(),
+        "{:?}",
+        dedicated.requests()
+    );
+}
+
+#[tokio::test]
+async fn vertex_endpoint_synthetic_cold_start_429_is_a_503_and_other_429s_are_rate_limits() {
+    // The autoscaling guide's wording for a request to a scale-to-zero
+    // endpoint without a ready replica.
+    let not_ready = google_error(
+        429,
+        "RESOURCE_EXHAUSTED",
+        "Model is not yet ready for inference. Please wait and then try your request again",
+    );
+    let quota = google_error(429, "RESOURCE_EXHAUSTED", "Quota exceeded.");
+    let upstream = FakeVertex::start(vec![
+        Answer::error(429, not_ready.clone()),
+        Answer::error(429, not_ready),
+        Answer::error(429, quota.clone()),
+        Answer::error(429, quota),
+    ])
+    .await;
+    let registry = registry(endpoint_provider(
+        &upstream,
+        json!({"my-llm": endpoint_entry(json!({"host": upstream.base}))}),
+    ));
+    let cases = [
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            "Vertex AI endpoint my-llm is starting: RESOURCE_EXHAUSTED: Model is not yet ready \
+             for inference. Please wait and then try your request again. An endpoint that scales \
+             to zero answers this until a replica is ready; it is not a rate limit. Retry in a \
+             few minutes (upstream HTTP 429)",
+        ),
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "RESOURCE_EXHAUSTED: Quota exceeded.. Vertex AI endpoint 1234567890123456789 in \
+             project ccp-project, location us-central1 (vertex.endpoints.my-llm in config.json) \
+             is rate limited or its serving container is overloaded; retry later (upstream HTTP \
+             429)",
+        ),
+    ];
+    for (status, error_type, expected) in cases {
+        for stream in [false, true] {
+            let (answered, _, body) = send(
+                app_with_monitor(registry.clone(), None),
+                "/v1/messages",
+                &message_request(ENDPOINT_MODEL, stream),
+                &[],
+            )
+            .await;
+            assert_eq!(answered, status, "stream={stream}: {body}");
+            let value: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["error"]["type"], error_type, "{body}");
+            assert_eq!(error_message(&body), expected, "stream={stream}");
+        }
+    }
+    assert_eq!(upstream.requests().len(), 4);
+}
+
+#[tokio::test]
+async fn vertex_endpoint_synthetic_tools_off_refuses_tools_and_tools_on_sends_them() {
+    let upstream = FakeVertex::start(vec![open_model_sse(&open_model_text("Hello"))]).await;
+    let registry = registry(endpoint_provider(
+        &upstream,
+        json!({
+            "no-tools": endpoint_entry(json!({"host": upstream.base, "tools": false})),
+            "my-llm": endpoint_entry(json!({"host": upstream.base}))
+        }),
+    ));
+    for stream in [false, true] {
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages",
+            &open_model_request("vertex/endpoint/no-tools", stream),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "stream={stream}: {body}");
+        assert_eq!(
+            error_message(&body),
+            "Vertex AI endpoint no-tools is configured with \"tools\": false in vertex.endpoints, \
+             so a request that carries tools is not sent to it; send the request without tools, \
+             or set \"tools\": true once the endpoint's serving container supports tool calling"
+        );
+    }
+    assert!(upstream.requests().is_empty(), "{:?}", upstream.requests());
+
+    // Whether a container can call tools cannot be read from the
+    // endpoint, so an endpoint left at the default gets them.
+    let (status, _, body) = send(
+        app_with_monitor(registry.clone(), None),
+        "/v1/messages",
+        &open_model_request(ENDPOINT_MODEL, false),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sent = upstream.requests();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].body["tools"][0]["function"]["name"], "read_file");
+}
+
+#[tokio::test]
+async fn vertex_endpoint_synthetic_bad_settings_name_the_endpoint_and_nothing_is_sent() {
+    let upstream = FakeVertex::start(Vec::new()).await;
+    let registry = registry(endpoint_provider(
+        &upstream,
+        json!({
+            "plain-http": endpoint_entry(json!({"host": "http://synthetic.example"})),
+            "in-global": endpoint_entry(json!({"location": "global"})),
+            "bad name": endpoint_entry(json!({}))
+        }),
+    ));
+    let prefix =
+        "Invalid Vertex configuration: Invalid Vertex setting vertex.endpoints in config.json: ";
+    let cases = [
+        (
+            "vertex/endpoint/plain-http",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "{prefix}endpoint \"plain-http\": host must use https (plain http only for a loopback host)"
+            ),
+        ),
+        (
+            "vertex/endpoint/in-global",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "{prefix}endpoint \"in-global\": location must be the endpoint's region, such as us-central1; an endpoint is never in global"
+            ),
+        ),
+        (
+            "vertex/endpoint/bad name",
+            StatusCode::BAD_REQUEST,
+            "invalid Vertex AI endpoint name in \"vertex/endpoint/bad name\"; the name after \
+             vertex/endpoint/ is a key of vertex.endpoints in config.json: letters, digits, '_' \
+             and '-'"
+                .to_string(),
+        ),
+        (
+            "vertex/endpoint/missing",
+            StatusCode::BAD_REQUEST,
+            "Vertex AI endpoint \"missing\" is not configured: add \"missing\": {\"endpoint\": \
+             \"<endpoint-id>\", \"location\": \"<region>\", \"model\": \"<model the container \
+             serves>\"} to vertex.endpoints in config.json and restart the proxy; configured \
+             endpoints: none"
+                .to_string(),
+        ),
+    ];
+    for (model, status, expected) in cases {
+        let (answered, _, body) = send(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages",
+            &message_request(model, false),
+            &[],
+        )
+        .await;
+        assert_eq!(answered, status, "{model}: {body}");
+        assert_eq!(error_message(&body), expected, "{model}");
+    }
+    assert!(upstream.requests().is_empty(), "{:?}", upstream.requests());
+}
+
+#[tokio::test]
+async fn vertex_endpoint_synthetic_lookup_403_offers_the_host_setting() {
+    let upstream = FakeVertex::start(vec![Answer::error(
+        403,
+        google_error(
+            403,
+            "PERMISSION_DENIED",
+            "Permission 'aiplatform.endpoints.get' denied on resource.",
+        ),
+    )])
+    .await;
+    let registry = registry(endpoint_provider(
+        &upstream,
+        json!({"my-llm": endpoint_entry(json!({}))}),
+    ));
+    let (status, _, body) = send(
+        app_with_monitor(registry, None),
+        "/v1/messages",
+        &message_request(ENDPOINT_MODEL, false),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["error"]["type"], "permission_error", "{body}");
+    assert_eq!(
+        error_message(&body),
+        "PERMISSION_DENIED: Permission 'aiplatform.endpoints.get' denied on resource.. Reading \
+         Vertex AI endpoint 1234567890123456789 in project ccp-project, location us-central1 \
+         (vertex.endpoints.my-llm in config.json) with endpoints.get needs the permission \
+         aiplatform.endpoints.get (included in roles/aiplatform.user): grant it, or set \"host\" \
+         in vertex.endpoints.my-llm to the endpoint's dedicated URL so the proxy does not read \
+         the endpoint (upstream HTTP 403)"
+    );
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, Method::GET);
+}
+
+#[tokio::test]
+async fn vertex_endpoint_synthetic_models_route_lists_usable_endpoints_and_counts_tokens_locally() {
+    let upstream = FakeVertex::start(Vec::new()).await;
+    let registry = registry(endpoint_provider(
+        &upstream,
+        json!({
+            "my-llm": endpoint_entry(json!({})),
+            "in-global": endpoint_entry(json!({"location": "global"}))
+        }),
+    ));
+    let response = app_with_monitor(registry.clone(), None)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(body.contains("\"vertex/endpoint/my-llm\""), "{body}");
+    assert!(!body.contains("in-global"), "{body}");
+
+    let (status, _, body) = post(
+        app_with_monitor(registry, None),
+        "/v1/messages/count_tokens",
+        &json!({"model": ENDPOINT_MODEL, "messages": [{"role":"user","content":"hello world"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert!(value["input_tokens"].as_u64().unwrap() > 0, "{body}");
+    assert!(upstream.requests().is_empty());
 }
