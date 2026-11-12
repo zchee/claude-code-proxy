@@ -10,7 +10,9 @@ use serde::Deserialize;
 use super::auth::{
     LOGIN_COMMAND, LOGIN_GUIDANCE, VertexAuthError, VertexCredentials, access_token,
 };
-use crate::config::{ResolvedVertexConfig, VertexSetting, vertex_host};
+use crate::config::{
+    ResolvedVertexConfig, VertexLocationOverridesSetting, VertexSetting, vertex_host,
+};
 use crate::provider::CliHandlers;
 
 /// The command runner exits 1 only for this exact message; every other
@@ -242,16 +244,22 @@ pub fn status_report(
         (Ok(None), Err(_)) => "Endpoint: unknown (the location is invalid)".to_string(),
         (Err(error), _) => format!("Endpoint: {error}"),
     });
+    let location_overrides = config.location_overrides().map(drop);
+    lines.push(location_overrides_line(
+        config.location_overrides_setting.as_ref(),
+        &location_overrides,
+    ));
     lines.push(quota_project_line(env, file_fields.as_ref()));
     lines.push(match token {
         Ok(()) => "Access token obtained: true".to_string(),
         Err(error) => format!("Access token obtained: false ({})", error.reason()),
     });
 
-    let failure = match (project, location, base_url) {
-        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-            Some(StatusFailure::Configuration(error))
-        }
+    let failure = match (project, location, base_url, location_overrides) {
+        (Err(error), _, _, _)
+        | (_, Err(error), _, _)
+        | (_, _, Err(error), _)
+        | (_, _, _, Err(error)) => Some(StatusFailure::Configuration(error)),
         _ if token.is_err() => Some(StatusFailure::NotAuthenticated),
         _ => None,
     };
@@ -303,6 +311,35 @@ fn quota_project_line(env: &AdcEnvironment, file: Option<&AdcFileFields>) -> Str
         ),
         _ => "Quota project: none".to_string(),
     }
+}
+
+/// `Location overrides: none`, the entries as `<key>=<location>` with their
+/// source, or the error that names the setting. A request reads the same
+/// setting and fails with that error, so it is shown before any request is
+/// sent.
+fn location_overrides_line(
+    setting: Option<&VertexLocationOverridesSetting>,
+    validated: &anyhow::Result<()>,
+) -> String {
+    if let Err(error) = validated {
+        return format!("Location overrides: {error}");
+    }
+    let Some(setting) = setting else {
+        return "Location overrides: none".to_string();
+    };
+    if setting.entries.is_empty() {
+        return format!("Location overrides: none ({})", setting.source);
+    }
+    let entries: Vec<String> = setting
+        .entries
+        .iter()
+        .map(|entry| format!("{}={}", entry.key, entry.location.as_deref().unwrap_or("")))
+        .collect();
+    format!(
+        "Location overrides: {} ({})",
+        entries.join(", "),
+        setting.source
+    )
 }
 
 fn setting_line(label: &str, value: &str, setting: Option<&VertexSetting>) -> String {
@@ -485,7 +522,7 @@ mod tests {
         assert_eq!(
             report.text,
             format!(
-                "Credentials: {} (GOOGLE_APPLICATION_CREDENTIALS)\nCredential type: authorized_user\nProject: synthetic-project (CCP_VERTEX_PROJECT)\nLocation: global (default)\nEndpoint: https://aiplatform.googleapis.com (derived from the location)\nQuota project: synthetic-quota (quota_project_id in the credentials file)\nAccess token obtained: true",
+                "Credentials: {} (GOOGLE_APPLICATION_CREDENTIALS)\nCredential type: authorized_user\nProject: synthetic-project (CCP_VERTEX_PROJECT)\nLocation: global (default)\nEndpoint: https://aiplatform.googleapis.com (derived from the location)\nLocation overrides: none\nQuota project: synthetic-quota (quota_project_id in the credentials file)\nAccess token obtained: true",
                 path.display()
             )
         );
@@ -867,5 +904,107 @@ mod tests {
             logout.contains("`gcloud auth application-default revoke`"),
             "{logout}"
         );
+    }
+
+    fn overrides(
+        entries: &[(&str, Option<&str>)],
+        source: VertexSettingSource,
+    ) -> Option<VertexLocationOverridesSetting> {
+        Some(VertexLocationOverridesSetting {
+            entries: entries
+                .iter()
+                .map(
+                    |(key, location)| crate::config::VertexLocationOverrideEntry {
+                        key: (*key).to_string(),
+                        location: location.map(str::to_string),
+                    },
+                )
+                .collect(),
+            readable: true,
+            source,
+        })
+    }
+
+    #[test]
+    fn status_synthetic_location_overrides_are_shown_with_their_source() {
+        let report = status_report(
+            &AdcEnvironment::default(),
+            &config(Some("synthetic-project")),
+            &Ok(()),
+        );
+        assert!(
+            report.text.contains("\nLocation overrides: none\n"),
+            "{}",
+            report.text
+        );
+
+        let set = ResolvedVertexConfig {
+            location_overrides_setting: overrides(
+                &[
+                    ("mistralai", Some("europe-west4")),
+                    ("anthropic/claude-opus-4-6", Some("us-east5")),
+                ],
+                VertexSettingSource::Env("CCP_VERTEX_LOCATION_OVERRIDES"),
+            ),
+            ..config(Some("synthetic-project"))
+        };
+        let report = status_report(&AdcEnvironment::default(), &set, &Ok(()));
+        assert!(
+            report.text.contains(
+                "Endpoint: https://aiplatform.googleapis.com (derived from the location)\nLocation overrides: mistralai=europe-west4, anthropic/claude-opus-4-6=us-east5 (CCP_VERTEX_LOCATION_OVERRIDES)\nQuota project: none"
+            ),
+            "{}",
+            report.text
+        );
+        assert!(report.failure.is_none(), "{:?}", report.failure);
+    }
+
+    #[test]
+    fn status_synthetic_malformed_location_overrides_fail_as_configuration_naming_the_setting() {
+        let tests = [
+            (
+                "environment entry without a location",
+                overrides(
+                    &[("mistralai", None)],
+                    VertexSettingSource::Env("CCP_VERTEX_LOCATION_OVERRIDES"),
+                ),
+                "Invalid Vertex setting CCP_VERTEX_LOCATION_OVERRIDES: entry \"mistralai\" has no location; an entry is <key>=<location> in the variable and \"<key>\": \"<location>\" in config.json",
+            ),
+            (
+                "config file value that is not an object",
+                Some(VertexLocationOverridesSetting {
+                    entries: Vec::new(),
+                    readable: false,
+                    source: VertexSettingSource::ConfigFile("vertex.locationOverrides"),
+                }),
+                "Invalid Vertex setting vertex.locationOverrides in config.json: must be an object of \"<key>\": \"<location>\" members, for example {\"mistralai\": \"europe-west4\"}",
+            ),
+        ];
+        for (name, setting, expected) in tests {
+            let resolved = ResolvedVertexConfig {
+                location_overrides_setting: setting,
+                ..config(Some("synthetic-project"))
+            };
+            // A token was obtained: the setting alone decides the failure.
+            let report = status_report(&AdcEnvironment::default(), &resolved, &Ok(()));
+            assert!(
+                report
+                    .text
+                    .contains(&format!("\nLocation overrides: {expected}\n")),
+                "{name}: {}",
+                report.text
+            );
+            let failure = report
+                .failure
+                .unwrap_or_else(|| panic!("{name}: no failure"));
+            assert!(
+                matches!(failure, StatusFailure::Configuration(_)),
+                "{name}: {failure:?}"
+            );
+            let (guidance, error) = failure.into_guidance_and_error();
+            assert_eq!(guidance, None, "{name}");
+            // Any message other than "Not authenticated" exits 2.
+            assert_eq!(error.to_string(), expected, "{name}");
+        }
     }
 }
