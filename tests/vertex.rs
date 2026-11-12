@@ -6,6 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,13 +18,13 @@ use axum::response::Response;
 use bytes::Bytes;
 use claude_code_proxy::{
     config::{AliasProvider, resolve_vertex_config},
-    monitor::{MonitorHandle, RequestStatus},
+    monitor::{MonitorHandle, RequestStatus, snapshot::MonitorSnapshot},
     provider::Provider,
     providers::vertex::{
         VertexProvider,
         auth::VertexCredentials,
         client::{VertexClient, client_builder},
-        translate::thought_signature::{ENVELOPE_PREFIX, SKIP_THOUGHT_SIGNATURE_VALIDATOR},
+        translate::thought_signature::ENVELOPE_PREFIX,
     },
     registry::Registry,
     server::{app_with_monitor, app_with_options},
@@ -53,6 +54,9 @@ struct Answer {
     headers: Vec<(&'static str, String)>,
     body: Vec<String>,
     hold_open: bool,
+    /// Sends this many body chunks, then waits until the flag is set
+    /// before sending the rest.
+    gate: Option<(usize, Arc<AtomicBool>)>,
 }
 
 impl Answer {
@@ -67,6 +71,16 @@ impl Answer {
                 .map(|frame| format!("data: {frame}\r\n\r\n"))
                 .collect(),
             hold_open: false,
+            gate: None,
+        }
+    }
+
+    /// [`Self::sse`], but after the first `sent` frames the stand-in stays
+    /// silent, with the connection open, until `release` is set.
+    fn sse_gated(frames: &[Value], sent: usize, release: Arc<AtomicBool>) -> Self {
+        Self {
+            gate: Some((sent, release)),
+            ..Self::sse(frames)
         }
     }
 
@@ -85,20 +99,35 @@ impl Answer {
             headers: vec![("content-type", "application/json".to_string())],
             body: vec![body.to_string()],
             hold_open: false,
+            gate: None,
         }
     }
 
     fn into_response(self) -> Response {
-        let chunks = stream::iter(
-            self.body
-                .into_iter()
-                .map(|chunk| Ok::<Bytes, Infallible>(Bytes::from(chunk))),
-        );
+        let mut chunks: Vec<Result<Bytes, Infallible>> = self
+            .body
+            .into_iter()
+            .map(|chunk| Ok(Bytes::from(chunk)))
+            .collect();
+        let chunks: Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>> = match self.gate
+        {
+            Some((sent, release)) => {
+                let rest = chunks.split_off(sent.min(chunks.len()));
+                let wait = stream::once(async move {
+                    while !release.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .filter_map(|()| async { None::<Result<Bytes, Infallible>> });
+                Box::pin(stream::iter(chunks).chain(wait).chain(stream::iter(rest)))
+            }
+            None => Box::pin(stream::iter(chunks)),
+        };
         let body: Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>> = if self.hold_open
         {
             Box::pin(chunks.chain(stream::pending()))
         } else {
-            Box::pin(chunks)
+            chunks
         };
         let mut response = Response::new(Body::from_stream(body));
         *response.status_mut() = self.status;
@@ -687,8 +716,10 @@ async fn vertex_synthetic_history_without_a_usable_signature_gets_the_skip_value
     for (request, history) in requests.iter().zip(&histories) {
         let call = &request.body["contents"][1]["parts"][0];
         assert_eq!(call["functionCall"]["name"], "read_file", "{history}");
+        // The value Google documents for a call it did not sign, written
+        // out rather than taken from the code.
         assert_eq!(
-            call["thoughtSignature"], SKIP_THOUGHT_SIGNATURE_VALIDATOR,
+            call["thoughtSignature"], "skip_thought_signature_validator",
             "{history}: {}",
             request.body
         );
@@ -882,7 +913,16 @@ async fn vertex_synthetic_echoed_secrets_are_redacted_in_responses_and_the_monit
         monitored.push('\n');
     }
     assert!(monitored.contains("finishReason SAFETY"), "{monitored}");
-    for (place, text) in [("responses", &downstream), ("monitor", &monitored)] {
+    // Every field the monitor can show or send to an attached dashboard, not
+    // only the error strings.
+    let snapshot = serde_json::to_string(&MonitorSnapshot::from(state.clone()))
+        .expect("the monitor snapshot serialises");
+    assert!(snapshot.contains("[redacted]"), "{snapshot}");
+    for (place, text) in [
+        ("responses", &downstream),
+        ("monitor errors", &monitored),
+        ("monitor snapshot", &snapshot),
+    ] {
         for secret in [
             SYNTHETIC_TOKEN,
             SYNTHETIC_SIGNATURE,
@@ -933,6 +973,51 @@ async fn vertex_synthetic_upstream_left_open_after_the_finish_reason_completes_b
             let message: Value = serde_json::from_str(&body).unwrap();
             assert_eq!(message["stop_reason"], "end_turn");
             assert_eq!(message["content"][0]["text"], "Hello");
+        }
+    }
+}
+
+#[tokio::test]
+async fn vertex_synthetic_upstream_silent_before_the_finish_reason_is_not_cut_off() {
+    // A model can think for a long time before its next chunk. Without a
+    // finishReason the proxy has no deadline of its own: only the upstream
+    // ends the response. The silence below is longer than the 2 s the proxy
+    // waits after a finishReason.
+    for stream in [false, true] {
+        let release = Arc::new(AtomicBool::new(false));
+        let upstream = FakeVertex::start(vec![Answer::sse_gated(
+            &[text_frame("Thinking it over."), finish_frame("STOP")],
+            1,
+            release.clone(),
+        )])
+        .await;
+        let app = app_with_monitor(registry(provider(&upstream, &[])), None);
+        let body = message_request(MODEL, stream);
+        let request = tokio::spawn(async move { post(app, "/v1/messages", &body).await });
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !request.is_finished(),
+            "stream={stream}: the response ended while the upstream was silent"
+        );
+        assert_eq!(upstream.requests().len(), 1, "stream={stream}");
+        release.store(true, Ordering::SeqCst);
+        let (status, _, body) = tokio::time::timeout(Duration::from_secs(20), request)
+            .await
+            .unwrap_or_else(|_| panic!("stream={stream}: no answer after the upstream finished"))
+            .expect("the request task completes");
+        assert_eq!(status, StatusCode::OK, "stream={stream}: {body}");
+        if stream {
+            let events = sse_events(&body);
+            assert_eq!(
+                streamed_content(&events),
+                vec![json!({"type":"text","text":"Thinking it over."})],
+                "{body}"
+            );
+            assert_eq!(stop_reason(&events).as_deref(), Some("end_turn"));
+        } else {
+            let message: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(message["content"][0]["text"], "Thinking it over.");
+            assert_eq!(message["stop_reason"], "end_turn");
         }
     }
 }

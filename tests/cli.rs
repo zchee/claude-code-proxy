@@ -798,6 +798,8 @@ const VERTEX_SIGNATURE: &str =
     "CiQBVKhc7synthetic0signature0AAAAbbbbCCCCddddEEEEffff0123456789GGGGhhhhIIIIjjjjKKKK==";
 const VERTEX_IMAGE_DATA: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg";
 const VERTEX_EMAIL: &str = "synthetic.person@example.com";
+/// Body text of a synthetic service account private key.
+const VERTEX_PRIVATE_KEY_BODY: &str = "synthetic0private0key0body";
 
 /// Variables that would let a Vertex command find the user's real settings
 /// or credentials.
@@ -1231,6 +1233,95 @@ fn vertex_server_synthetic_credentials_created_after_a_failed_request_are_used_w
         fetched,
         "the credentials were loaded again"
     );
+    Ok(())
+}
+
+/// A service account key file whose private key cannot sign. The library
+/// signs service account tokens itself, so it fails while building the
+/// token, without any network request. Its error must not carry the key
+/// into a response, the log, an error record, a capture or stderr.
+#[cfg(unix)]
+#[test]
+fn vertex_server_synthetic_unusable_service_account_key_leaks_nothing()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::atomic::Ordering;
+    let fixture = vertex_fixture(Vec::new());
+    let home = TempDir::new()?;
+    // Valid base64 that does not decode to a usable key.
+    let line = format!("{}0123456789AB", VERTEX_PRIVATE_KEY_BODY.repeat(2));
+    let private_key = format!(
+        "-----BEGIN PRIVATE KEY-----\n{line}\n{line}\n{line}\n{line}\n-----END PRIVATE KEY-----\n"
+    );
+    let key_file = home.path().join("synthetic-service-account.json");
+    std::fs::write(
+        &key_file,
+        serde_json::json!({
+            "type": "service_account",
+            "project_id": "synthetic-project",
+            "private_key_id": "synthetic-private-key-id",
+            "private_key": private_key,
+            "client_email": "synthetic@synthetic-project.iam.gserviceaccount.com",
+            "client_id": "000000000000000000000",
+            "token_uri": format!("{}/token", fixture.base),
+            "universe_domain": "googleapis.com"
+        })
+        .to_string(),
+    )?;
+    let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let mut child = vertex_server(
+        &home,
+        &fixture,
+        port,
+        &[
+            ("GOOGLE_APPLICATION_CREDENTIALS", key_file.as_os_str()),
+            ("CCP_TRAFFIC_LOG", std::ffi::OsStr::new("1")),
+        ],
+    )?;
+    let mut downstream = String::new();
+    for stream in [false, true] {
+        let body = serde_json::json!({
+            "model": "gemini-3.5-flash",
+            "max_tokens": 64,
+            "stream": stream,
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+        .to_string();
+        let response = post_raw(port, &body)?;
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+        assert!(
+            response.contains("Google access token could not be obtained"),
+            "{response}"
+        );
+        downstream.push_str(&response);
+    }
+    thread::sleep(Duration::from_millis(500));
+    child.0.kill()?;
+    child.0.wait()?;
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.0.stderr.take() {
+        pipe.read_to_string(&mut stderr)?;
+    }
+
+    // The library never asked the token endpoint: the failure is local.
+    assert_eq!(fixture.token_requests.load(Ordering::SeqCst), 0);
+    let state_dir = home.path().join("state").join("claude-code-proxy");
+    let log = std::fs::read_to_string(state_dir.join("proxy.log"))?;
+    assert!(log.contains("\"request_failed\""), "{log}");
+    let files = all_files_text(&state_dir);
+    for (place, text) in [
+        ("state files", &files),
+        ("stderr", &stderr),
+        ("responses", &downstream),
+    ] {
+        for secret in [
+            VERTEX_PRIVATE_KEY_BODY,
+            line.as_str(),
+            "PRIVATE KEY",
+            "synthetic-private-key-id",
+        ] {
+            assert!(!text.contains(secret), "{place} leaked {secret}: {text}");
+        }
+    }
     Ok(())
 }
 

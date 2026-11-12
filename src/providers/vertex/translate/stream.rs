@@ -1753,6 +1753,36 @@ mod tests {
                 Expect::Error("finish_reason"),
             ),
             (
+                "IMAGE_SAFETY",
+                stopped("IMAGE_SAFETY"),
+                Expect::Error("finish_reason"),
+            ),
+            (
+                "IMAGE_PROHIBITED_CONTENT",
+                stopped("IMAGE_PROHIBITED_CONTENT"),
+                Expect::Error("finish_reason"),
+            ),
+            (
+                "IMAGE_RECITATION",
+                stopped("IMAGE_RECITATION"),
+                Expect::Error("finish_reason"),
+            ),
+            (
+                "IMAGE_OTHER",
+                stopped("IMAGE_OTHER"),
+                Expect::Error("finish_reason"),
+            ),
+            (
+                "NO_IMAGE",
+                stopped("NO_IMAGE"),
+                Expect::Error("finish_reason"),
+            ),
+            (
+                "CONTINUATION",
+                stopped("CONTINUATION"),
+                Expect::Error("finish_reason"),
+            ),
+            (
                 "unknown value",
                 stopped("SOMETHING_NEW"),
                 Expect::Error("finish_reason"),
