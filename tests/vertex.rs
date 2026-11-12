@@ -1,7 +1,10 @@
 //! The Vertex AI provider driven through the proxy's HTTP routes against a
 //! local stand-in for Vertex AI. Vertex traffic was not observed when these
 //! were written, so every upstream frame is synthetic and built from the
-//! documented `streamGenerateContent` response shape.
+//! documented response shapes: `streamGenerateContent` for Gemini, the
+//! Anthropic Messages events for Claude, OpenAI Responses events for xAI
+//! Grok, OpenAI and Meta Muse, and `chat.completion.chunk` objects for
+//! Mistral.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -92,6 +95,18 @@ impl Answer {
         }
     }
 
+    /// An answer whose body is exactly `chunks`, one body chunk each,
+    /// closed after the last one.
+    fn raw(status: u16, content_type: &str, chunks: Vec<String>) -> Self {
+        Self {
+            status: StatusCode::from_u16(status).expect("valid status"),
+            headers: vec![("content-type", content_type.to_string())],
+            body: chunks,
+            hold_open: false,
+            gate: None,
+        }
+    }
+
     /// A non-success answer with a JSON body.
     fn error(status: u16, body: Value) -> Self {
         Self {
@@ -147,6 +162,8 @@ struct Recorded {
     path_and_query: String,
     authorization: Option<String>,
     accept: Option<String>,
+    /// Every request header as received, repeated names included.
+    headers: HeaderMap,
     body: Value,
 }
 
@@ -175,6 +192,7 @@ async fn answer_next(
             .unwrap_or_default(),
         authorization: header_text(header::AUTHORIZATION),
         accept: header_text(header::ACCEPT),
+        headers: headers.clone(),
         body: serde_json::from_slice(&body).unwrap_or(Value::Null),
     });
     let next = stand_in.answers.lock().unwrap().pop_front();
@@ -256,15 +274,26 @@ fn registry(provider: VertexProvider) -> Arc<Registry> {
 }
 
 async fn post(app: Router, uri: &str, body: &Value) -> (StatusCode, HeaderMap, String) {
+    post_with_headers(app, uri, body, &[]).await
+}
+
+/// [`post`] with extra request headers. A name given twice is sent as two
+/// header lines.
+async fn post_with_headers(
+    app: Router,
+    uri: &str,
+    body: &Value,
+    headers: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, String) {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
     let response = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri(uri)
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
         .await
         .unwrap();
     let status = response.status();
@@ -1125,5 +1154,1419 @@ async fn vertex_models_are_listed_by_the_models_route() {
             body.contains(&format!("\"{model}\"")),
             "missing {model}: {body}"
         );
+    }
+}
+
+// Partner model families. Every expected URL, model value and body field
+// below is written out from Google's partner-model documentation, not taken
+// from the provider's constants.
+
+/// The longest any request of the partner tests may take. Only the
+/// read-limit tests wait on purpose, and they wait about two seconds.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+
+/// [`post_with_headers`] that fails the test instead of hanging when the
+/// proxy does not answer within [`REQUEST_DEADLINE`].
+async fn send(
+    app: Router,
+    uri: &str,
+    body: &Value,
+    headers: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, String) {
+    tokio::time::timeout(REQUEST_DEADLINE, post_with_headers(app, uri, body, headers))
+        .await
+        .unwrap_or_else(|_| panic!("no answer from {uri} within {REQUEST_DEADLINE:?}: {body}"))
+}
+
+fn content_type(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+}
+
+/// Asserts that a streaming answer ended in the proxy's `error` event with
+/// `message`, and never told the client the message was complete.
+fn assert_stream_failed_with(status: StatusCode, body: &str, message: &str) {
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let events = sse_events(body);
+    let (name, data) = events.last().unwrap_or_else(|| panic!("no event: {body}"));
+    assert_eq!(name, "error", "{body}");
+    assert_eq!(data["type"], "error", "{body}");
+    assert_eq!(data["error"]["type"], "api_error", "{body}");
+    assert_eq!(data["error"]["message"], message, "{body}");
+    assert!(
+        !events.iter().any(|(name, _)| name == "message_stop"),
+        "{body}"
+    );
+}
+
+// Anthropic Claude.
+
+const CLAUDE_MODEL: &str = "vertex/anthropic/claude-opus-5-5";
+
+const CLAUDE_STREAM_PATH: &str = "/v1/projects/ccp-project/locations/global/publishers/anthropic/models/claude-opus-5-5:streamRawPredict";
+
+const CLAUDE_RAW_PATH: &str = "/v1/projects/ccp-project/locations/global/publishers/anthropic/models/claude-opus-5-5:rawPredict";
+
+/// The fixed message a client sees when a Claude stream fails.
+const CLAUDE_STREAM_INVALID: &str = "Vertex AI Messages stream is invalid";
+
+/// Shaped like an Anthropic thinking signature: standard base64 whose bytes
+/// do not start with `ccp:`.
+const ANTHROPIC_SIGNATURE: &str = "EqQBCkgIBRABGAIiQLsyntheticAnthropicSignature0123456789";
+
+/// A thinking signature as this proxy's Codex translator makes it.
+const PROXY_SIGNATURE: &str = "ccp:codex:v1:cnNfc3ludGhldGlj:gAAAAABsyntheticEncryptedReasoning";
+
+/// base64url of `ccp:kimi:v1:synthetic-reasoning-state`: the form this
+/// proxy's Kimi and OpenCode translators make.
+const PROXY_SIGNATURE_BASE64URL: &str = "Y2NwOmtpbWk6djE6c3ludGhldGljLXJlYXNvbmluZy1zdGF0ZQ";
+
+/// One Anthropic SSE event, written as Claude sends it.
+fn claude_event(data: &Value) -> String {
+    let name = data["type"].as_str().expect("an event has a type");
+    format!("event: {name}\ndata: {data}\n\n")
+}
+
+/// A complete Claude stream answering `text`, one event per body chunk.
+fn claude_stream(text: &str) -> Vec<String> {
+    [
+        json!({"type":"message_start","message":{
+            "id":"msg_vrtx_01Synthetic","type":"message","role":"assistant","model":"claude-opus-5-5",
+            "content":[],"stop_reason":null,"stop_sequence":null,
+            "usage":{"input_tokens":12,"output_tokens":1}
+        }}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        json!({"type":"ping"}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":5}}),
+        json!({"type":"message_stop"}),
+    ]
+    .iter()
+    .map(claude_event)
+    .collect()
+}
+
+/// Claude's answer to a non-streaming request, in the shape of Google's
+/// example response.
+fn claude_message(text: &str) -> String {
+    json!({
+        "id":"msg_vrtx_01Synthetic","type":"message","role":"assistant","model":"claude-opus-5-5",
+        "content":[{"type":"text","text":text}],
+        "stop_reason":"end_turn","stop_sequence":null,
+        "usage":{"input_tokens":727,"output_tokens":308}
+    })
+    .to_string()
+}
+
+fn claude_json(body: String) -> Answer {
+    Answer::raw(200, "application/json", vec![body])
+}
+
+fn claude_sse(chunks: Vec<String>) -> Answer {
+    Answer::raw(200, "text/event-stream", chunks)
+}
+
+#[tokio::test]
+async fn vertex_claude_synthetic_stream_reaches_stream_raw_predict_and_passes_events_through() {
+    let events = claude_stream("Hello from Claude");
+    let upstream = FakeVertex::start(vec![claude_sse(events.clone())]).await;
+    let monitor = MonitorHandle::new(10);
+    let request = json!({
+        "model": CLAUDE_MODEL,
+        "max_tokens": 256,
+        "stream": true,
+        "system": "Be brief.",
+        "messages": [{"role":"user","content":"Say hello"}]
+    });
+    let (status, headers, body) = send(
+        app_with_monitor(registry(provider(&upstream, &[])), Some(monitor.clone())),
+        "/v1/messages",
+        &request,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(content_type(&headers), Some("text/event-stream"));
+    // The events are forwarded, not rebuilt.
+    assert_eq!(body, events.concat());
+
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 1);
+    let sent = &requests[0];
+    assert_eq!(sent.path_and_query, CLAUDE_STREAM_PATH);
+    assert_eq!(sent.accept.as_deref(), Some("text/event-stream"));
+    assert_eq!(
+        sent.authorization.as_deref(),
+        Some(format!("Bearer {SYNTHETIC_TOKEN}").as_str())
+    );
+    // The URL names the model; the body must not.
+    assert!(sent.body.get("model").is_none(), "{}", sent.body);
+    assert_eq!(sent.body["anthropic_version"], "vertex-2023-10-16");
+    // The documented streaming recipe sets both the method and the flag.
+    assert_eq!(sent.body["stream"], true, "{}", sent.body);
+    assert_eq!(sent.body["max_tokens"], 256, "{}", sent.body);
+    assert_eq!(sent.body["system"], "Be brief.", "{}", sent.body);
+    assert_eq!(sent.body["messages"][0]["role"], "user", "{}", sent.body);
+    assert_eq!(
+        sent.body["messages"][0]["content"], "Say hello",
+        "{}",
+        sent.body
+    );
+    assert!(
+        sent.headers.get("anthropic-beta").is_none(),
+        "{:?}",
+        sent.headers
+    );
+
+    let state = monitor.snapshot();
+    assert_eq!(state.recent.len(), 1);
+    assert_eq!(
+        state.recent[0].status,
+        RequestStatus::Completed,
+        "{:?}",
+        state.recent[0]
+    );
+    assert_eq!(state.recent[0].provider.as_deref(), Some("vertex"));
+}
+
+#[tokio::test]
+async fn vertex_claude_synthetic_non_streaming_reaches_raw_predict_and_returns_the_json_as_is() {
+    let answer = claude_message("Hello from Claude");
+    let dated_answer = claude_message("Hello from Opus 4.5");
+    let upstream = FakeVertex::start(vec![
+        claude_json(answer.clone()),
+        claude_json(dated_answer.clone()),
+    ])
+    .await;
+    let registry = registry(provider(&upstream, &[]));
+    let (status, headers, body) = send(
+        app_with_monitor(registry.clone(), None),
+        "/v1/messages",
+        &message_request(CLAUDE_MODEL, false),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(content_type(&headers), Some("application/json"));
+    assert_eq!(body, answer);
+
+    // A dated ID keeps its `@` in the URL, and a version the client chose
+    // is kept.
+    let mut dated = message_request("vertex/anthropic/claude-opus-4-5@20251101", false);
+    dated["anthropic_version"] = json!("2026-10-21");
+    let (status, _, body) = send(
+        app_with_monitor(registry, None),
+        "/v1/messages",
+        &dated,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, dated_answer);
+
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path_and_query, CLAUDE_RAW_PATH);
+    assert_eq!(requests[0].accept.as_deref(), Some("application/json"));
+    assert!(
+        requests[0].body.get("model").is_none(),
+        "{}",
+        requests[0].body
+    );
+    assert_eq!(requests[0].body["anthropic_version"], "vertex-2023-10-16");
+    assert_eq!(requests[0].body["stream"], false, "{}", requests[0].body);
+    assert_eq!(
+        requests[1].path_and_query,
+        "/v1/projects/ccp-project/locations/global/publishers/anthropic/models/claude-opus-4-5@20251101:rawPredict"
+    );
+    assert!(
+        requests[1].body.get("model").is_none(),
+        "{}",
+        requests[1].body
+    );
+    assert_eq!(requests[1].body["anthropic_version"], "2026-10-21");
+}
+
+#[tokio::test]
+async fn vertex_claude_synthetic_beta_headers_reach_vertex_as_one_header_of_listed_values() {
+    let upstream = FakeVertex::start(vec![
+        claude_json(claude_message("one")),
+        claude_json(claude_message("two")),
+    ])
+    .await;
+    let registry = registry(provider(&upstream, &[]));
+    // Two header lines, each mixing values on the Vertex list with values
+    // that are not on it, and one listed value sent twice.
+    let (status, _, body) = send(
+        app_with_monitor(registry.clone(), None),
+        "/v1/messages",
+        &message_request(CLAUDE_MODEL, false),
+        &[
+            (
+                "anthropic-beta",
+                "claude-code-20250219, oauth-2025-04-20, interleaved-thinking-2025-05-14",
+            ),
+            (
+                "anthropic-beta",
+                "context-1m-2025-08-07,synthetic-unlisted-2099-01-01,claude-code-20250219",
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Nothing on the list.
+    let (status, _, body) = send(
+        app_with_monitor(registry, None),
+        "/v1/messages",
+        &message_request(CLAUDE_MODEL, false),
+        &[
+            ("anthropic-beta", "oauth-2025-04-20"),
+            ("anthropic-beta", "synthetic-unlisted-2099-01-01"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 2);
+    // Vertex AI reads only one anthropic-beta header.
+    let sent: Vec<&HeaderValue> = requests[0]
+        .headers
+        .get_all("anthropic-beta")
+        .iter()
+        .collect();
+    assert_eq!(sent.len(), 1, "{:?}", requests[0].headers);
+    let mut values: Vec<&str> = sent[0]
+        .to_str()
+        .expect("an ASCII header")
+        .split(',')
+        .map(str::trim)
+        .collect();
+    values.sort_unstable();
+    assert_eq!(
+        values,
+        [
+            "claude-code-20250219",
+            "context-1m-2025-08-07",
+            "interleaved-thinking-2025-05-14"
+        ],
+        "{:?}",
+        sent[0]
+    );
+    assert_eq!(
+        requests[1].headers.get_all("anthropic-beta").iter().count(),
+        0,
+        "{:?}",
+        requests[1].headers
+    );
+    // A beta never travels in the body on Vertex AI.
+    for request in &requests {
+        assert!(
+            request.body.get("anthropic_beta").is_none(),
+            "{}",
+            request.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn vertex_claude_synthetic_thinking_claude_cannot_verify_is_dropped_and_its_own_is_kept() {
+    let upstream = FakeVertex::start(vec![claude_json(claude_message("ok"))]).await;
+    let request = json!({
+        "model": CLAUDE_MODEL,
+        "max_tokens": 256,
+        "messages": [
+            {"role":"user","content":"First question."},
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"Codex reasoning","signature":PROXY_SIGNATURE},
+                {"type":"text","text":"First answer."}
+            ]},
+            {"role":"user","content":"Second question."},
+            // Only a thinking block another provider made: the message is
+            // left out rather than sent empty.
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"Kimi reasoning","signature":PROXY_SIGNATURE_BASE64URL}
+            ]},
+            {"role":"user","content":"Third question."},
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"Unsigned reasoning","signature":""},
+                {"type":"thinking","thinking":"Claude reasoning","signature":ANTHROPIC_SIGNATURE},
+                {"type":"redacted_thinking","data":"synthetic-redacted-thinking"},
+                {"type":"text","text":"Third answer."}
+            ]},
+            {"role":"user","content":"Last question."}
+        ]
+    });
+    let (status, _, body) = send(
+        app_with_monitor(registry(provider(&upstream, &[])), None),
+        "/v1/messages",
+        &request,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 1);
+    let sent = &requests[0].body;
+    let text = sent.to_string();
+    for dropped in [
+        PROXY_SIGNATURE,
+        PROXY_SIGNATURE_BASE64URL,
+        "Codex reasoning",
+        "Kimi reasoning",
+        "Unsigned reasoning",
+    ] {
+        assert!(!text.contains(dropped), "{dropped} reached Claude: {sent}");
+    }
+    let messages = sent["messages"].as_array().expect("messages");
+    for message in messages {
+        assert_ne!(message["content"], json!([]), "{sent}");
+    }
+    let assistants: Vec<&Value> = messages
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .collect();
+    assert_eq!(assistants.len(), 2, "{sent}");
+    assert_eq!(
+        assistants[0]["content"],
+        json!([{"type":"text","text":"First answer."}]),
+        "{sent}"
+    );
+    assert_eq!(
+        assistants[1]["content"],
+        json!([
+            {"type":"thinking","thinking":"Claude reasoning","signature":ANTHROPIC_SIGNATURE},
+            {"type":"redacted_thinking","data":"synthetic-redacted-thinking"},
+            {"type":"text","text":"Third answer."}
+        ]),
+        "{sent}"
+    );
+    for question in [
+        "First question.",
+        "Second question.",
+        "Third question.",
+        "Last question.",
+    ] {
+        assert!(text.contains(question), "{question} is missing: {sent}");
+    }
+}
+
+#[tokio::test]
+async fn vertex_claude_synthetic_stream_error_or_early_close_ends_in_the_fixed_error() {
+    let mut cut_short = claude_stream("Hello");
+    // The connection closes after message_delta, before message_stop.
+    cut_short.truncate(6);
+    let upstream = FakeVertex::start(vec![
+        claude_sse(vec![
+            claude_stream("unused").remove(0),
+            claude_event(
+                &json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}),
+            ),
+        ]),
+        claude_sse(cut_short),
+    ])
+    .await;
+    let registry = registry(provider(&upstream, &[]));
+    let monitor = MonitorHandle::new(10);
+    for case in ["error event", "closed before message_stop"] {
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), Some(monitor.clone())),
+            "/v1/messages",
+            &message_request(CLAUDE_MODEL, true),
+            &[],
+        )
+        .await;
+        assert_stream_failed_with(status, &body, CLAUDE_STREAM_INVALID);
+        // The upstream's own error text is not forwarded.
+        assert!(!body.contains("Overloaded"), "{case}: {body}");
+    }
+    assert_eq!(upstream.requests().len(), 2);
+
+    let state = monitor.snapshot();
+    assert_eq!(state.recent.len(), 2);
+    for request in &state.recent {
+        assert_eq!(request.status, RequestStatus::Failed, "{request:?}");
+        assert!(
+            request
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains(CLAUDE_STREAM_INVALID)),
+            "{request:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn vertex_claude_synthetic_upstream_errors_with_anthropic_bodies_keep_their_message() {
+    let anthropic_error =
+        |kind: &str, message: &str| json!({"type":"error","error":{"type":kind,"message":message}});
+    let cases = [
+        (
+            400,
+            anthropic_error(
+                "invalid_request_error",
+                "messages.0.content: text content blocks must be non-empty",
+            ),
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            vec![
+                "messages.0.content: text content blocks must be non-empty",
+                "(upstream HTTP 400)",
+            ],
+        ),
+        (
+            429,
+            anthropic_error(
+                "rate_limit_error",
+                "Number of request tokens has exceeded your rate limit",
+            ),
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            vec![
+                "Number of request tokens has exceeded your rate limit",
+                "claude-opus-5-5",
+                "(upstream HTTP 429)",
+            ],
+        ),
+        (
+            529,
+            anthropic_error("overloaded_error", "Overloaded"),
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            vec!["Overloaded", "(upstream HTTP 529)"],
+        ),
+    ];
+    let mut answers = Vec::new();
+    for (status, body, ..) in &cases {
+        for _ in 0..2 {
+            answers.push(Answer::error(*status, body.clone()));
+        }
+    }
+    let upstream = FakeVertex::start(answers).await;
+    let registry = registry(provider(&upstream, &[]));
+    for (_, _, status, kind, needles) in &cases {
+        for stream in [false, true] {
+            let (actual, _, body) = send(
+                app_with_monitor(registry.clone(), None),
+                "/v1/messages",
+                &message_request(CLAUDE_MODEL, stream),
+                &[],
+            )
+            .await;
+            assert_eq!(actual, *status, "stream={stream}: {body}");
+            let value: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["type"], "error", "{body}");
+            assert_eq!(value["error"]["type"], *kind, "{body}");
+            let message = error_message(&body);
+            for needle in needles {
+                assert!(message.contains(needle), "missing {needle:?}: {message}");
+            }
+            // The message is taken out of the body, not the body itself.
+            assert!(!message.contains("\"type\""), "{message}");
+        }
+    }
+    assert_eq!(upstream.requests().len(), 6);
+}
+
+// xAI Grok, OpenAI and Meta Muse: OpenAI Responses.
+
+/// A Responses family as Google documents it.
+struct ResponsesFamily {
+    /// The name the client asks for.
+    model: &'static str,
+    /// Settings for the provider; Muse is asked for in a location it is not
+    /// served in, so the test shows the location it is sent to anyway.
+    env: &'static [(&'static str, &'static str)],
+    /// Where Vertex AI takes the request for project `ccp-project`.
+    path: &'static str,
+    /// The `model` value of the request body.
+    upstream_model: &'static str,
+}
+
+const RESPONSES_FAMILIES: [ResponsesFamily; 3] = [
+    ResponsesFamily {
+        model: "vertex/xai/grok-4.7",
+        env: &[],
+        path: "/v1/projects/ccp-project/locations/global/endpoints/openapi/responses",
+        upstream_model: "xai/grok-4.7",
+    },
+    ResponsesFamily {
+        model: "vertex/openai/gpt-6.1-sol",
+        env: &[],
+        path: "/v1/projects/ccp-project/locations/global/publishers/openai/v1/responses",
+        upstream_model: "gpt-6.1-sol",
+    },
+    ResponsesFamily {
+        model: "vertex/meta/muse-spark-1.3",
+        env: &[("CCP_VERTEX_LOCATION", "us-central1")],
+        path: "/v1/projects/ccp-project/locations/global/publishers/meta/v1/responses",
+        upstream_model: "muse-spark-1.3",
+    },
+];
+
+/// The fixed message a client sees when a Responses stream fails.
+const RESPONSES_STREAM_INVALID: &str = "Vertex AI Responses stream is invalid";
+
+fn responses_completed() -> Value {
+    json!({"type":"response.completed","response":{
+        "id":"resp_synthetic","status":"completed","incomplete_details":null,
+        "usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15}
+    }})
+}
+
+/// A complete Responses stream answering `text` through one delta.
+fn responses_text(text: &str) -> Vec<Value> {
+    vec![
+        json!({"type":"response.created","response":{"id":"resp_synthetic","status":"in_progress"}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up","role":"assistant","content":[]}}),
+        json!({"type":"response.output_text.delta","output_index":0,"item_id":"msg_up","delta":text}),
+        json!({"type":"response.output_text.done","output_index":0,"item_id":"msg_up","text":text}),
+        json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_up","role":"assistant","status":"completed"}}),
+        responses_completed(),
+    ]
+}
+
+/// A complete Responses stream calling `read_file` on `src/a.rs`.
+fn responses_tool_call() -> Vec<Value> {
+    let arguments = r#"{"path":"src/a.rs"}"#;
+    vec![
+        json!({"type":"response.created","response":{"id":"resp_synthetic","status":"in_progress"}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":{
+            "type":"function_call","id":"fc_up","call_id":"call_synthetic_1","name":"read_file","arguments":""
+        }}),
+        json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_up","delta":r#"{"path":"#}),
+        json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_up","delta":r#""src/a.rs"}"#}),
+        json!({"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_up","arguments":arguments}),
+        json!({"type":"response.output_item.done","output_index":0,"item":{
+            "type":"function_call","id":"fc_up","call_id":"call_synthetic_1","name":"read_file","arguments":arguments
+        }}),
+        responses_completed(),
+    ]
+}
+
+fn responses_request(model: &str, stream: bool) -> Value {
+    json!({
+        "model": model,
+        "max_tokens": 200_000,
+        "stream": stream,
+        "system": "Be brief.",
+        "output_config": {"effort": "high"},
+        "tools": [read_file_tool()],
+        "messages": [{"role":"user","content":"Say hello"}]
+    })
+}
+
+/// Asserts the client got the text `expected` as a complete message.
+fn assert_text_answer(stream: bool, body: &str, model: &str, expected: &str) {
+    if stream {
+        let events = sse_events(body);
+        assert_eq!(
+            events.last().map(|(name, _)| name.as_str()),
+            Some("message_stop"),
+            "{body}"
+        );
+        assert!(!events.iter().any(|(name, _)| name == "error"), "{body}");
+        assert_eq!(events[0].1["message"]["model"], model, "{body}");
+        assert_eq!(
+            streamed_content(&events),
+            vec![json!({"type":"text","text":expected})],
+            "{body}"
+        );
+        assert_eq!(stop_reason(&events).as_deref(), Some("end_turn"), "{body}");
+    } else {
+        let message: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(message["model"], model, "{body}");
+        assert_eq!(
+            message["content"],
+            json!([{"type":"text","text":expected}]),
+            "{body}"
+        );
+        assert_eq!(message["stop_reason"], "end_turn", "{body}");
+    }
+}
+
+#[tokio::test]
+async fn vertex_responses_synthetic_requests_follow_each_publishers_documented_shape() {
+    for family in &RESPONSES_FAMILIES {
+        let upstream = FakeVertex::start(vec![
+            Answer::sse(&responses_text("Hello")),
+            Answer::sse(&responses_text("Hello")),
+        ])
+        .await;
+        let registry = registry(provider(&upstream, family.env));
+        for stream in [false, true] {
+            let (status, _, body) = send(
+                app_with_monitor(registry.clone(), None),
+                "/v1/messages",
+                &responses_request(family.model, stream),
+                &[],
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{} stream={stream}: {body}",
+                family.model
+            );
+            assert_text_answer(stream, &body, family.model, "Hello");
+        }
+
+        let requests = upstream.requests();
+        assert_eq!(requests.len(), 2, "{}", family.model);
+        for sent in &requests {
+            let model = family.model;
+            let body = &sent.body;
+            assert_eq!(sent.path_and_query, family.path, "{model}");
+            // The upstream is asked for a stream in both modes.
+            assert_eq!(sent.accept.as_deref(), Some("text/event-stream"), "{model}");
+            assert_eq!(body["stream"], true, "{model}: {body}");
+            assert_eq!(body["model"], family.upstream_model, "{model}: {body}");
+            assert_eq!(body["store"], false, "{model}: {body}");
+            assert_eq!(body["instructions"], "Be brief.", "{model}: {body}");
+            for absent in ["include", "prompt_cache_key"] {
+                assert!(body.get(absent).is_none(), "{model}: {absent} in {body}");
+            }
+            for absent in ["/text/verbosity", "/reasoning/summary"] {
+                assert!(
+                    body.pointer(absent).is_none(),
+                    "{model}: {absent} in {body}"
+                );
+            }
+            assert_eq!(body["tools"][0]["type"], "function", "{model}: {body}");
+            assert_eq!(body["tools"][0]["name"], "read_file", "{model}: {body}");
+            if family.upstream_model == "gpt-6.1-sol" {
+                // OpenAI documents an adjustable effort and an output limit
+                // of 128,000 tokens.
+                assert_eq!(body["reasoning"]["effort"], "high", "{model}: {body}");
+                assert_eq!(body["max_output_tokens"], 128_000, "{model}: {body}");
+            } else {
+                assert!(body.get("reasoning").is_none(), "{model}: {body}");
+                assert_eq!(body["max_output_tokens"], 200_000, "{model}: {body}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn vertex_responses_synthetic_thinking_from_the_history_is_not_replayed() {
+    for family in &RESPONSES_FAMILIES {
+        let upstream = FakeVertex::start(vec![Answer::sse(&responses_text("Shorter."))]).await;
+        let request = json!({
+            "model": family.model,
+            "max_tokens": 256,
+            "messages": [
+                {"role":"user","content":"Define proxy."},
+                {"role":"assistant","content":[
+                    {"type":"thinking","thinking":"Codex reasoning","signature":PROXY_SIGNATURE},
+                    {"type":"thinking","thinking":"Claude reasoning","signature":ANTHROPIC_SIGNATURE},
+                    {"type":"redacted_thinking","data":"synthetic-redacted-thinking"},
+                    {"type":"text","text":"A go-between."}
+                ]},
+                {"role":"user","content":"Shorter."}
+            ]
+        });
+        let (status, _, body) = send(
+            app_with_monitor(registry(provider(&upstream, family.env)), None),
+            "/v1/messages",
+            &request,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}: {body}", family.model);
+        let requests = upstream.requests();
+        assert_eq!(requests.len(), 1);
+        let sent = &requests[0].body;
+        let text = sent.to_string();
+        let input = sent["input"].as_array().expect("input items");
+        assert!(
+            input.iter().all(|item| item["type"] != "reasoning"),
+            "{}: {sent}",
+            family.model
+        );
+        for leaked in [
+            "encrypted_content",
+            "gAAAAABsyntheticEncryptedReasoning",
+            ANTHROPIC_SIGNATURE,
+            "Codex reasoning",
+            "Claude reasoning",
+            "synthetic-redacted-thinking",
+        ] {
+            assert!(
+                !text.contains(leaked),
+                "{} sent {leaked}: {sent}",
+                family.model
+            );
+        }
+        // The visible text of that turn still goes.
+        assert!(text.contains("A go-between."), "{}: {sent}", family.model);
+    }
+}
+
+#[tokio::test]
+async fn vertex_responses_synthetic_hosted_web_search_is_refused_without_an_upstream_request() {
+    for family in &RESPONSES_FAMILIES {
+        let upstream = FakeVertex::start(Vec::new()).await;
+        let registry = registry(provider(&upstream, family.env));
+        for stream in [false, true] {
+            let request = json!({
+                "model": family.model,
+                "max_tokens": 256,
+                "stream": stream,
+                "tools": [{"type":"web_search_20250305","name":"web_search","max_uses":5}],
+                "messages": [{"role":"user","content":"Any news?"}]
+            });
+            let (status, _, body) = send(
+                app_with_monitor(registry.clone(), None),
+                "/v1/messages",
+                &request,
+                &[],
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{} stream={stream}: {body}",
+                family.model
+            );
+            let value: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["error"]["type"], "invalid_request_error", "{body}");
+            let message = error_message(&body);
+            assert!(message.contains("web_search"), "{message}");
+            assert!(message.contains("remove the web search tool"), "{message}");
+        }
+        assert!(upstream.requests().is_empty(), "{}", family.model);
+    }
+}
+
+#[tokio::test]
+async fn vertex_responses_synthetic_tool_call_goes_out_and_its_result_comes_back() {
+    for family in &RESPONSES_FAMILIES {
+        let upstream = FakeVertex::start(vec![
+            Answer::sse(&responses_tool_call()),
+            Answer::sse(&responses_text("It defines a.")),
+        ])
+        .await;
+        let registry = registry(provider(&upstream, family.env));
+        let first_turn = json!({
+            "model": family.model,
+            "max_tokens": 256,
+            "tools": [read_file_tool()],
+            "messages": [{"role":"user","content":"Read src/a.rs"}]
+        });
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages",
+            &first_turn,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}: {body}", family.model);
+        let first: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(first["stop_reason"], "tool_use", "{body}");
+        let content = first["content"].as_array().unwrap().clone();
+        let calls: Vec<&Value> = content
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .collect();
+        assert_eq!(calls.len(), 1, "{body}");
+        assert_eq!(calls[0]["id"], "call_synthetic_1", "{body}");
+        assert_eq!(calls[0]["name"], "read_file", "{body}");
+        assert_eq!(calls[0]["input"], json!({"path":"src/a.rs"}), "{body}");
+
+        // Claude Code sends the call back with its result, and streams the
+        // answer this time.
+        let second_turn = json!({
+            "model": family.model,
+            "max_tokens": 256,
+            "stream": true,
+            "tools": [read_file_tool()],
+            "messages": [
+                {"role":"user","content":"Read src/a.rs"},
+                {"role":"assistant","content":content},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_synthetic_1","content":"fn a() {}"}
+                ]}
+            ]
+        });
+        let (status, _, body) = send(
+            app_with_monitor(registry, None),
+            "/v1/messages",
+            &second_turn,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}: {body}", family.model);
+        assert_text_answer(true, &body, family.model, "It defines a.");
+
+        let requests = upstream.requests();
+        assert_eq!(requests.len(), 2);
+        let input = requests[1].body["input"].as_array().expect("input items");
+        let call = input
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap_or_else(|| panic!("no function_call: {}", requests[1].body));
+        assert_eq!(call["call_id"], "call_synthetic_1", "{call}");
+        assert_eq!(call["name"], "read_file", "{call}");
+        let arguments: Value = serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments, json!({"path":"src/a.rs"}), "{call}");
+        let output = input
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .unwrap_or_else(|| panic!("no function_call_output: {}", requests[1].body));
+        assert_eq!(output["call_id"], "call_synthetic_1", "{output}");
+        assert!(
+            output["output"].to_string().contains("fn a() {}"),
+            "{output}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn vertex_responses_synthetic_unlisted_or_late_events_end_in_the_fixed_error() {
+    let mut unlisted = responses_text("Hello");
+    unlisted.insert(
+        2,
+        json!({"type":"response.refusal.delta","output_index":0,"item_id":"msg_up","delta":"No."}),
+    );
+    let mut late = responses_text("Hello");
+    late.push(json!({"type":"response.output_text.delta","output_index":0,"item_id":"msg_up","delta":"late"}));
+    let cases = [
+        ("unlisted_event_type", unlisted),
+        ("event_after_completion", late),
+    ];
+    for family in &RESPONSES_FAMILIES {
+        let answers = cases
+            .iter()
+            .flat_map(|(_, frames)| [Answer::sse(frames), Answer::sse(frames)])
+            .collect();
+        let upstream = FakeVertex::start(answers).await;
+        let registry = registry(provider(&upstream, family.env));
+        for (kind, _) in &cases {
+            for stream in [false, true] {
+                let (status, _, body) = send(
+                    app_with_monitor(registry.clone(), None),
+                    "/v1/messages",
+                    &message_request(family.model, stream),
+                    &[],
+                )
+                .await;
+                if stream {
+                    assert_stream_failed_with(status, &body, RESPONSES_STREAM_INVALID);
+                } else {
+                    assert_eq!(
+                        status,
+                        StatusCode::BAD_GATEWAY,
+                        "{} {kind}: {body}",
+                        family.model
+                    );
+                    let value: Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(value["error"]["type"], "api_error", "{body}");
+                    let message = error_message(&body);
+                    assert!(
+                        message.contains(&format!("{RESPONSES_STREAM_INVALID}: {kind}")),
+                        "{} {kind}: {message}",
+                        family.model
+                    );
+                }
+            }
+        }
+        assert_eq!(upstream.requests().len(), 4, "{}", family.model);
+    }
+}
+
+#[tokio::test]
+async fn vertex_responses_synthetic_upstream_left_open_after_the_completion_completes_both_modes() {
+    for family in &RESPONSES_FAMILIES {
+        let upstream = FakeVertex::start(vec![
+            Answer::sse_held_open(&responses_text("Hello")),
+            Answer::sse_held_open(&responses_text("Hello")),
+        ])
+        .await;
+        let registry = registry(provider(&upstream, family.env));
+        for stream in [false, true] {
+            let started = Instant::now();
+            let (status, _, body) = send(
+                app_with_monitor(registry.clone(), None),
+                "/v1/messages",
+                &message_request(family.model, stream),
+                &[],
+            )
+            .await;
+            let elapsed = started.elapsed();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{} stream={stream}: {body}",
+                family.model
+            );
+            // Nothing may follow the completion, so the proxy waits out its
+            // two-second limit before it settles the message.
+            assert!(
+                elapsed >= Duration::from_millis(1900),
+                "{} stream={stream}: completed after {elapsed:?}, before the read limit",
+                family.model
+            );
+            assert_text_answer(stream, &body, family.model, "Hello");
+        }
+    }
+}
+
+#[tokio::test]
+async fn vertex_responses_synthetic_snapshot_text_that_no_delta_delivered_is_an_error() {
+    let frames = vec![
+        json!({"type":"response.created","response":{"id":"resp_synthetic","status":"in_progress"}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up","role":"assistant","content":[]}}),
+        json!({"type":"response.output_text.done","output_index":0,"item_id":"msg_up","text":"Text only in a snapshot"}),
+        json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_up","role":"assistant","status":"completed"}}),
+        responses_completed(),
+    ];
+    for family in &RESPONSES_FAMILIES {
+        let upstream = FakeVertex::start(vec![Answer::sse(&frames), Answer::sse(&frames)]).await;
+        let registry = registry(provider(&upstream, family.env));
+        for stream in [false, true] {
+            let (status, _, body) = send(
+                app_with_monitor(registry.clone(), None),
+                "/v1/messages",
+                &message_request(family.model, stream),
+                &[],
+            )
+            .await;
+            if stream {
+                assert_stream_failed_with(status, &body, RESPONSES_STREAM_INVALID);
+            } else {
+                assert_eq!(status, StatusCode::BAD_GATEWAY, "{}: {body}", family.model);
+                assert!(
+                    error_message(&body).contains("snapshot_without_delta"),
+                    "{}: {body}",
+                    family.model
+                );
+            }
+            // The text was never given to the client as if it were complete.
+            assert!(!body.contains("message_stop"), "{body}");
+        }
+    }
+}
+
+// Mistral: Chat-Completions-shaped `streamRawPredict`.
+
+const MISTRAL_MODEL: &str = "vertex/mistralai/mistral-medium-3";
+
+/// Mistral is served in `us-central1` and `europe-west4` only.
+const MISTRAL_LOCATION: (&str, &str) = ("CCP_VERTEX_LOCATION", "us-central1");
+
+const MISTRAL_PATH: &str = "/v1/projects/ccp-project/locations/us-central1/publishers/mistralai/models/mistral-medium-3:streamRawPredict";
+
+/// The fixed message a client sees when a Mistral stream fails.
+const MISTRAL_STREAM_INVALID: &str = "Vertex AI Mistral stream is invalid";
+
+/// One `chat.completion.chunk` as Google's Mistral example shows it.
+fn mistral_chunk(delta: Value, finish_reason: Option<&str>) -> Value {
+    json!({
+        "id":"synthetic-mistral","object":"chat.completion.chunk","model":"mistral-medium-3",
+        "choices":[{"index":0,"delta":delta,"finish_reason":finish_reason}]
+    })
+}
+
+/// A Mistral stream answering `text`. Google does not show an end marker
+/// for Mistral, so there is no `[DONE]`.
+fn mistral_text(text: &str) -> Vec<Value> {
+    let mut finish = mistral_chunk(json!({}), Some("stop"));
+    finish["usage"] = json!({"prompt_tokens":7,"total_tokens":9,"completion_tokens":2});
+    vec![
+        mistral_chunk(json!({"role":"assistant","content":text}), None),
+        finish,
+    ]
+}
+
+#[tokio::test]
+async fn vertex_mistral_synthetic_requests_reach_stream_raw_predict_and_complete_without_done() {
+    let upstream = FakeVertex::start(vec![
+        Answer::sse(&mistral_text("Hello")),
+        Answer::sse(&mistral_text("Hello")),
+    ])
+    .await;
+    let registry = registry(provider(&upstream, &[MISTRAL_LOCATION]));
+    for stream in [false, true] {
+        let request = json!({
+            "model": MISTRAL_MODEL,
+            "max_tokens": 256,
+            "stream": stream,
+            "output_config": {"effort": "high"},
+            "tools": [read_file_tool()],
+            "messages": [{"role":"user","content":"Say hello"}]
+        });
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages",
+            &request,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "stream={stream}: {body}");
+        assert_text_answer(stream, &body, MISTRAL_MODEL, "Hello");
+        if !stream {
+            let message: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(message["usage"]["input_tokens"], 7, "{body}");
+            assert_eq!(message["usage"]["output_tokens"], 2, "{body}");
+        }
+    }
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 2);
+    for sent in &requests {
+        let body = &sent.body;
+        // The streaming method and flag for both client modes.
+        assert_eq!(sent.path_and_query, MISTRAL_PATH);
+        assert_eq!(sent.accept.as_deref(), Some("text/event-stream"));
+        assert_eq!(body["stream"], true, "{body}");
+        assert_eq!(body["model"], "mistral-medium-3", "{body}");
+        assert_eq!(body["max_tokens"], 256, "{body}");
+        for absent in ["stream_options", "reasoning_effort"] {
+            assert!(body.get(absent).is_none(), "{absent} in {body}");
+        }
+        assert_eq!(body["messages"].as_array().map(Vec::len), Some(1), "{body}");
+        assert_eq!(body["tools"][0]["function"]["name"], "read_file", "{body}");
+    }
+}
+
+#[tokio::test]
+async fn vertex_mistral_synthetic_global_location_is_refused_naming_the_settings() {
+    let upstream = FakeVertex::start(Vec::new()).await;
+    // No location set: the default is global, where Mistral is not served.
+    let registry = registry(provider(&upstream, &[]));
+    for stream in [false, true] {
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages",
+            &message_request(MISTRAL_MODEL, stream),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "stream={stream}: {body}");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["error"]["type"], "invalid_request_error", "{body}");
+        let message = error_message(&body);
+        for needle in [
+            "mistralai",
+            "global",
+            "CCP_VERTEX_LOCATION_OVERRIDES",
+            "vertex.locationOverrides",
+            "CCP_VERTEX_LOCATION",
+            "us-central1",
+            "europe-west4",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?}: {message}");
+        }
+    }
+    assert!(upstream.requests().is_empty());
+}
+
+#[tokio::test]
+async fn vertex_mistral_synthetic_content_after_the_finish_reason_is_an_error() {
+    let mut frames = mistral_text("Hello");
+    frames.push(mistral_chunk(json!({"content":"late"}), None));
+    let upstream = FakeVertex::start(vec![Answer::sse(&frames), Answer::sse(&frames)]).await;
+    let registry = registry(provider(&upstream, &[MISTRAL_LOCATION]));
+    for stream in [false, true] {
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages",
+            &message_request(MISTRAL_MODEL, stream),
+            &[],
+        )
+        .await;
+        if stream {
+            assert_stream_failed_with(status, &body, MISTRAL_STREAM_INVALID);
+        } else {
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+            let value: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["error"]["type"], "api_error", "{body}");
+            assert!(
+                error_message(&body).contains("content after finish_reason"),
+                "{body}"
+            );
+        }
+    }
+    assert_eq!(upstream.requests().len(), 2);
+}
+
+// Every family together.
+
+/// Every name the provider advertises, as Google's model pages spell them.
+const VERTEX_NAMES: [&str; 47] = [
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-pro-preview",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
+    "gemini-4-argon",
+    "gemini-4-carbon",
+    "vertex/gemini-3-flash-preview",
+    "vertex/gemini-3.1-flash-lite",
+    "vertex/gemini-3.1-pro-preview",
+    "vertex/gemini-3.5-flash",
+    "vertex/gemini-3.5-flash-lite",
+    "vertex/gemini-3.7-flash",
+    "vertex/gemini-3.8-flash",
+    "vertex/gemini-4-argon",
+    "vertex/gemini-4-carbon",
+    "vertex/anthropic/claude-fable-5-2",
+    "vertex/anthropic/claude-fable-5-1",
+    "vertex/anthropic/claude-fable-5",
+    "vertex/anthropic/claude-opus-5-5",
+    "vertex/anthropic/claude-opus-5",
+    "vertex/anthropic/claude-opus-4-8",
+    "vertex/anthropic/claude-opus-4-7",
+    "vertex/anthropic/claude-sonnet-5-5",
+    "vertex/anthropic/claude-sonnet-5",
+    "vertex/anthropic/claude-haiku-5-5",
+    "vertex/anthropic/claude-opus-4-6",
+    "vertex/anthropic/claude-sonnet-4-6",
+    "vertex/anthropic/claude-opus-4-5@20251101",
+    "vertex/anthropic/claude-haiku-4-5@20251001",
+    "vertex/xai/grok-4.7",
+    "vertex/xai/grok-4.6",
+    "vertex/xai/grok-4.20-reasoning",
+    "vertex/xai/grok-4.20-non-reasoning",
+    "vertex/xai/grok-4.3",
+    "vertex/meta/muse-spark-1.3",
+    "vertex/meta/muse-wonder-1.0",
+    "vertex/meta/muse-ember-1.0",
+    "vertex/openai/gpt-6-astra",
+    "vertex/openai/gpt-6.1-sol",
+    "vertex/openai/gpt-6.1-terra",
+    "vertex/openai/gpt-6-luna",
+    "vertex/mistralai/mistral-medium-3",
+    "vertex/mistralai/mistral-small-2503",
+    "vertex/mistralai/codestral-2",
+];
+
+#[tokio::test]
+async fn vertex_models_route_lists_every_name_of_every_served_family() {
+    let upstream = FakeVertex::start(Vec::new()).await;
+    let response = app_with_monitor(registry(provider(&upstream, &[])), None)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    let mut listed: Vec<&str> = value["data"]
+        .as_array()
+        .expect("a model list")
+        .iter()
+        .map(|model| model["id"].as_str().expect("a model ID"))
+        .collect();
+    listed.sort_unstable();
+    let mut expected = VERTEX_NAMES.to_vec();
+    expected.sort_unstable();
+    assert_eq!(listed, expected);
+    assert!(upstream.requests().is_empty());
+}
+
+#[test]
+fn vertex_partner_names_route_to_vertex_and_bare_ids_stay_with_their_providers() {
+    let registry = Registry::new(AliasProvider::Codex);
+    let owner = |model: &str| {
+        registry
+            .provider_for_model(model, None)
+            .map(|provider| provider.name())
+    };
+    for model in VERTEX_NAMES {
+        assert_eq!(owner(model), Some("vertex"), "{model}");
+    }
+    // The partner IDs without the prefix belong to the providers that
+    // already serve them, or to nobody; never to Vertex.
+    for model in VERTEX_NAMES
+        .iter()
+        .filter_map(|name| name.strip_prefix("vertex/"))
+        .filter(|name| name.contains('/'))
+    {
+        let (publisher, id) = model.split_once('/').unwrap();
+        for bare in [model, id] {
+            assert_ne!(owner(bare), Some("vertex"), "{publisher}: {bare}");
+        }
+    }
+    for (model, provider) in [
+        ("claude-opus-5-5", "codex"),
+        ("claude-sonnet-5", "codex"),
+        ("grok-4.7", "grok"),
+        ("muse-spark-1.3", "muse"),
+    ] {
+        assert_eq!(owner(model), Some(provider), "{model}");
+    }
+}
+
+#[tokio::test]
+async fn vertex_location_overrides_synthetic_model_key_beats_publisher_key_and_muse_stays_global() {
+    let upstream = FakeVertex::start(vec![
+        claude_json(claude_message("opus")),
+        claude_json(claude_message("sonnet")),
+        Answer::sse(&responses_text("muse")),
+        Answer::sse(&mistral_text("codestral")),
+        Answer::sse(&mistral_text("medium")),
+    ])
+    .await;
+    let registry = registry(provider(
+        &upstream,
+        &[(
+            "CCP_VERTEX_LOCATION_OVERRIDES",
+            "anthropic=us, anthropic/claude-opus-5-5=eu, meta=us, mistralai=us-central1, mistralai/codestral-2=europe-west4",
+        )],
+    ));
+    let cases = [
+        (
+            "vertex/anthropic/claude-opus-5-5",
+            "/v1/projects/ccp-project/locations/eu/publishers/anthropic/models/claude-opus-5-5:rawPredict",
+        ),
+        (
+            "vertex/anthropic/claude-sonnet-5",
+            "/v1/projects/ccp-project/locations/us/publishers/anthropic/models/claude-sonnet-5:rawPredict",
+        ),
+        (
+            "vertex/meta/muse-spark-1.3",
+            "/v1/projects/ccp-project/locations/global/publishers/meta/v1/responses",
+        ),
+        (
+            "vertex/mistralai/codestral-2",
+            "/v1/projects/ccp-project/locations/europe-west4/publishers/mistralai/models/codestral-2:streamRawPredict",
+        ),
+        (
+            "vertex/mistralai/mistral-medium-3",
+            "/v1/projects/ccp-project/locations/us-central1/publishers/mistralai/models/mistral-medium-3:streamRawPredict",
+        ),
+    ];
+    for (model, _) in &cases {
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages",
+            &message_request(model, false),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{model}: {body}");
+    }
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), cases.len());
+    for (request, (model, path)) in requests.iter().zip(&cases) {
+        assert_eq!(request.path_and_query, *path, "{model}");
+    }
+}
+
+#[tokio::test]
+async fn vertex_partner_synthetic_echoed_secrets_are_redacted_in_responses_and_the_monitor() {
+    let echo = format!("saw token {SYNTHETIC_TOKEN} for synthetic.person@example.com");
+    let echo = echo.as_str();
+    let upstream = FakeVertex::start(vec![
+        // Claude: an Anthropic error body, and an error event in a stream.
+        Answer::error(
+            400,
+            json!({"type":"error","error":{"type":"invalid_request_error","message":echo}}),
+        ),
+        claude_sse(vec![
+            claude_stream("unused").remove(0),
+            claude_event(&json!({"type":"error","error":{"type":"api_error","message":echo}})),
+        ]),
+        // Grok: an OpenAI error body, and a failed response in both modes.
+        Answer::error(
+            400,
+            json!({"error":{"message":echo,"type":"invalid_request_error","code":null}}),
+        ),
+        Answer::sse(&[json!({"type":"response.failed","response":{
+            "status":"failed","error":{"code":"server_error","message":echo}
+        }})]),
+        Answer::sse(&[
+            json!({"type":"response.created","response":{"id":"resp_synthetic","status":"in_progress"}}),
+            json!({"type":"response.failed","response":{
+                "status":"failed","error":{"code":"server_error","message":echo}
+            }}),
+        ]),
+        // Mistral: its own error body, which has no `error` object, and an
+        // error chunk in both modes.
+        Answer::error(
+            400,
+            json!({"object":"error","message":echo,"type":"invalid_request_error","code":null}),
+        ),
+        Answer::sse(&[json!({"error":{"message":echo}})]),
+        Answer::sse(&[
+            mistral_chunk(json!({"role":"assistant","content":"partial"}), None),
+            json!({"error":{"message":echo}}),
+        ]),
+    ])
+    .await;
+    let registry = registry(provider(
+        &upstream,
+        &[("CCP_VERTEX_LOCATION_OVERRIDES", "mistralai=us-central1")],
+    ));
+    let monitor = MonitorHandle::new(20);
+    let requests = [
+        (CLAUDE_MODEL, false),
+        (CLAUDE_MODEL, true),
+        ("vertex/xai/grok-4.7", false),
+        ("vertex/xai/grok-4.7", false),
+        ("vertex/xai/grok-4.7", true),
+        (MISTRAL_MODEL, false),
+        (MISTRAL_MODEL, false),
+        (MISTRAL_MODEL, true),
+    ];
+    let mut downstream = String::new();
+    for (model, stream) in requests {
+        let (status, _, body) = send(
+            app_with_monitor(registry.clone(), Some(monitor.clone())),
+            "/v1/messages",
+            &message_request(model, stream),
+            &[],
+        )
+        .await;
+        if stream {
+            assert_eq!(status, StatusCode::OK, "{model}: {body}");
+            let events = sse_events(&body);
+            assert_eq!(
+                events.last().map(|(name, _)| name.as_str()),
+                Some("error"),
+                "{model}: {body}"
+            );
+        } else {
+            assert_ne!(status, StatusCode::OK, "{model}: {body}");
+            // The upstream message is kept, with the secrets taken out.
+            assert!(
+                error_message(&body).contains("[redacted]"),
+                "{model}: {body}"
+            );
+        }
+        downstream.push_str(&body);
+    }
+    assert_eq!(upstream.requests().len(), requests.len());
+
+    let state = monitor.snapshot();
+    assert_eq!(state.recent.len(), requests.len());
+    let mut monitored = String::new();
+    for request in &state.recent {
+        assert_eq!(request.status, RequestStatus::Failed, "{request:?}");
+        monitored.push_str(request.error.as_deref().unwrap_or_default());
+        monitored.push('\n');
+    }
+    let snapshot = serde_json::to_string(&MonitorSnapshot::from(state.clone()))
+        .expect("the monitor snapshot serialises");
+    for (place, text) in [
+        ("responses", &downstream),
+        ("monitor errors", &monitored),
+        ("monitor snapshot", &snapshot),
+    ] {
+        for secret in [SYNTHETIC_TOKEN, "synthetic.person@example.com"] {
+            assert!(!text.contains(secret), "{place} leaked {secret}: {text}");
+        }
     }
 }

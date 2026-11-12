@@ -812,6 +812,7 @@ const VERTEX_REAL_ENV: &[&str] = &[
     "CLOUDSDK_CONFIG",
     "CCP_VERTEX_PROJECT",
     "CCP_VERTEX_LOCATION",
+    "CCP_VERTEX_LOCATION_OVERRIDES",
     "CCP_VERTEX_BASE_URL",
 ];
 
@@ -1493,6 +1494,261 @@ fn vertex_server_synthetic_echoed_secrets_leak_nothing_into_logs_or_captures()
             VERTEX_REFRESH_TOKEN,
             VERTEX_SIGNATURE,
             VERTEX_IMAGE_DATA,
+            VERTEX_EMAIL,
+            "@example.com",
+        ] {
+            assert!(!text.contains(secret), "{place} leaked {secret}: {text}");
+        }
+    }
+    Ok(())
+}
+
+/// Every name Vertex lists, as Google's model pages spell them: the Gemini
+/// IDs bare and prefixed, and each partner model as
+/// `vertex/<publisher>/<model-id>`.
+#[test]
+fn models_lists_every_vertex_name_of_every_served_family() -> Result<(), Box<dyn std::error::Error>>
+{
+    let output = Command::cargo_bin("claude-code-proxy")?
+        .args(["models"])
+        .output()?;
+    let out = String::from_utf8(output.stdout)?;
+    let vertex = out
+        .lines()
+        .find(|line| line.starts_with("vertex:"))
+        .ok_or_else(|| format!("no vertex line: {out}"))?;
+    let mut listed: Vec<&str> = vertex
+        .trim_start_matches("vertex:")
+        .split(',')
+        .map(str::trim)
+        .collect();
+    listed.sort_unstable();
+    let gemini = [
+        "gemini-3-flash-preview",
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-pro-preview",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.7-flash",
+        "gemini-3.8-flash",
+        "gemini-4-argon",
+        "gemini-4-carbon",
+    ];
+    let partners = [
+        "anthropic/claude-fable-5-2",
+        "anthropic/claude-fable-5-1",
+        "anthropic/claude-fable-5",
+        "anthropic/claude-opus-5-5",
+        "anthropic/claude-opus-5",
+        "anthropic/claude-opus-4-8",
+        "anthropic/claude-opus-4-7",
+        "anthropic/claude-sonnet-5-5",
+        "anthropic/claude-sonnet-5",
+        "anthropic/claude-haiku-5-5",
+        "anthropic/claude-opus-4-6",
+        "anthropic/claude-sonnet-4-6",
+        "anthropic/claude-opus-4-5@20251101",
+        "anthropic/claude-haiku-4-5@20251001",
+        "xai/grok-4.7",
+        "xai/grok-4.6",
+        "xai/grok-4.20-reasoning",
+        "xai/grok-4.20-non-reasoning",
+        "xai/grok-4.3",
+        "meta/muse-spark-1.3",
+        "meta/muse-wonder-1.0",
+        "meta/muse-ember-1.0",
+        "openai/gpt-6-astra",
+        "openai/gpt-6.1-sol",
+        "openai/gpt-6.1-terra",
+        "openai/gpt-6-luna",
+        "mistralai/mistral-medium-3",
+        "mistralai/mistral-small-2503",
+        "mistralai/codestral-2",
+    ];
+    let mut expected: Vec<String> = gemini.iter().map(|model| (*model).to_string()).collect();
+    expected.extend(gemini.iter().map(|model| format!("vertex/{model}")));
+    expected.extend(partners.iter().map(|model| format!("vertex/{model}")));
+    expected.sort_unstable();
+    assert_eq!(expected.len(), 47);
+    assert_eq!(listed, expected, "{vertex}");
+    Ok(())
+}
+
+/// One partner family per wire (Claude's Messages pass-through, Grok's
+/// Responses, Mistral's Chat Completions) whose upstream echoes the access
+/// token and an email address in an HTTP error body, in a failed buffered
+/// response and in a failed stream. Nothing may reach a response, the log,
+/// an error record, a capture or stderr.
+#[cfg(unix)]
+#[test]
+fn vertex_server_synthetic_partner_errors_echoing_the_token_leak_nothing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let echo = format!("saw token {VERTEX_ACCESS_TOKEN} for {VERTEX_EMAIL}");
+    let sse_frame = |value: serde_json::Value| format!("data: {value}\n\n");
+    let claude_start = serde_json::json!({"type": "message_start", "message": {
+        "id": "msg_vrtx_01Synthetic", "type": "message", "role": "assistant",
+        "model": "claude-opus-5-5", "content": [], "stop_reason": null, "stop_sequence": null,
+        "usage": {"input_tokens": 12, "output_tokens": 1}
+    }});
+    let claude_error =
+        serde_json::json!({"type": "error", "error": {"type": "api_error", "message": echo}});
+    let responses_failed = serde_json::json!({"type": "response.failed", "response": {
+        "status": "failed", "error": {"code": "server_error", "message": echo}
+    }});
+    let responses_created = serde_json::json!({
+        "type": "response.created", "response": {"id": "resp_synthetic", "status": "in_progress"}
+    });
+    let mistral_partial = serde_json::json!({
+        "id": "synthetic-mistral", "object": "chat.completion.chunk", "model": "mistral-medium-3",
+        "choices": [{"index": 0, "delta": {"role": "assistant", "content": "partial"}, "finish_reason": null}]
+    });
+    let mistral_error = serde_json::json!({"error": {"message": echo}});
+    let json = "application/json";
+    let sse = "text/event-stream";
+    let fixture = vertex_fixture(vec![
+        (
+            400,
+            json,
+            serde_json::json!({"type": "error", "error": {"type": "invalid_request_error", "message": echo}})
+                .to_string(),
+        ),
+        (
+            200,
+            sse,
+            format!("event: message_start\ndata: {claude_start}\n\nevent: error\ndata: {claude_error}\n\n"),
+        ),
+        (
+            400,
+            json,
+            serde_json::json!({"error": {"message": echo, "type": "invalid_request_error", "code": null}})
+                .to_string(),
+        ),
+        (200, sse, sse_frame(responses_failed.clone())),
+        (
+            200,
+            sse,
+            format!("{}{}", sse_frame(responses_created), sse_frame(responses_failed)),
+        ),
+        (
+            400,
+            json,
+            serde_json::json!({"object": "error", "message": echo, "type": "invalid_request_error", "code": null})
+                .to_string(),
+        ),
+        (200, sse, sse_frame(mistral_error.clone())),
+        (
+            200,
+            sse,
+            format!("{}{}", sse_frame(mistral_partial), sse_frame(mistral_error)),
+        ),
+    ]);
+
+    let home = TempDir::new()?;
+    let credentials = write_vertex_credentials(&home, &fixture);
+    let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let mut child = vertex_server(
+        &home,
+        &fixture,
+        port,
+        &[
+            ("GOOGLE_APPLICATION_CREDENTIALS", credentials.as_os_str()),
+            ("CCP_TRAFFIC_LOG", std::ffi::OsStr::new("1")),
+            (
+                "CCP_VERTEX_LOCATION_OVERRIDES",
+                std::ffi::OsStr::new("mistralai=us-central1"),
+            ),
+        ],
+    )?;
+    let requests = [
+        ("vertex/anthropic/claude-opus-5-5", false),
+        ("vertex/anthropic/claude-opus-5-5", true),
+        ("vertex/xai/grok-4.7", false),
+        ("vertex/xai/grok-4.7", false),
+        ("vertex/xai/grok-4.7", true),
+        ("vertex/mistralai/mistral-medium-3", false),
+        ("vertex/mistralai/mistral-medium-3", false),
+        ("vertex/mistralai/mistral-medium-3", true),
+    ];
+    let mut downstream = String::new();
+    for (model, stream) in requests {
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": 64,
+            "stream": stream,
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+        .to_string();
+        let response = post_raw(port, &body)?;
+        if stream {
+            assert!(response.starts_with("HTTP/1.1 200"), "{model}: {response}");
+            assert!(response.contains("event: error"), "{model}: {response}");
+        } else {
+            assert!(!response.starts_with("HTTP/1.1 200"), "{model}: {response}");
+            assert!(response.contains("[redacted]"), "{model}: {response}");
+        }
+        downstream.push_str(&response);
+    }
+    thread::sleep(Duration::from_millis(500));
+    child.0.kill()?;
+    child.0.wait()?;
+    let stderr = std::fs::read_to_string(vertex_server_stderr(&home))?;
+
+    // The scan below is only meaningful if every path was exercised: five
+    // answers that are not 200 and three streams that end in an error.
+    assert_eq!(
+        downstream.matches("HTTP/1.1 200").count(),
+        3,
+        "{downstream}"
+    );
+    let state_dir = home.path().join("state").join("claude-code-proxy");
+    let log = std::fs::read_to_string(state_dir.join("proxy.log"))?;
+    assert_eq!(log.matches("\"request_failed\"").count(), 5, "{log}");
+    assert!(log.contains("[redacted]"), "{log}");
+    let errors = std::fs::read_dir(state_dir.join("errors"))?.count();
+    assert_eq!(errors, 5);
+    let mut names = Vec::new();
+    let mut pending = vec![state_dir.join("traffic")];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    for expected in [
+        "020-upstream-request.json",
+        "060-vertex-claude-messages-stream-error.json",
+        "061-vertex-claude-messages-stream-summary.json",
+        "060-vertex-responses-stream-error.json",
+        "061-vertex-responses-stream-summary.json",
+        "061-vertex-mistral-stream-summary.json",
+        "061-vertex-buffered-summary.json",
+    ] {
+        assert!(
+            names.iter().any(|name| name.ends_with(expected)),
+            "missing {expected}: {names:?}"
+        );
+    }
+    assert!(
+        fixture
+            .token_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 1
+    );
+
+    let files = all_files_text(&state_dir);
+    for (place, text) in [
+        ("state files", &files),
+        ("stderr", &stderr),
+        ("responses", &downstream),
+    ] {
+        for secret in [
+            VERTEX_ACCESS_TOKEN,
+            VERTEX_CLIENT_SECRET,
+            VERTEX_REFRESH_TOKEN,
             VERTEX_EMAIL,
             "@example.com",
         ] {
