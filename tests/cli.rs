@@ -1156,7 +1156,13 @@ fn models_lists_vertex_after_opencode_with_its_served_models()
         .split(',')
         .map(str::trim)
         .collect();
-    assert_eq!(models.len(), 53, "{vertex}");
+    // The listing also names the endpoints of this machine's config.json,
+    // which the test does not control.
+    let registered = models
+        .iter()
+        .filter(|model| !model.starts_with("vertex/endpoint/"))
+        .count();
+    assert_eq!(registered, 53, "{vertex}");
     for model in [
         "gemini-4-argon",
         "gemini-4-carbon",
@@ -2086,5 +2092,45 @@ fn vertex_server_synthetic_token_outside_message_fields_stays_out_of_every_file(
         !files.contains(VERTEX_ACCESS_TOKEN),
         "a file the proxy wrote holds the token: {files}"
     );
+    Ok(())
+}
+
+#[test]
+fn models_lists_the_configured_vertex_endpoints_synthetic() -> Result<(), Box<dyn std::error::Error>>
+{
+    let vertex_line = |config_dir: &std::path::Path| -> Result<String, Box<dyn std::error::Error>> {
+        let output = Command::cargo_bin("claude-code-proxy")?
+            .env("CCP_CONFIG_DIR", config_dir)
+            .args(["models"])
+            .output()?;
+        let out = String::from_utf8(output.stdout)?;
+        Ok(out
+            .lines()
+            .find(|line| line.starts_with("vertex:"))
+            .unwrap_or_default()
+            .to_string())
+    };
+    let configured = TempDir::new()?;
+    std::fs::write(
+        configured.path().join("config.json"),
+        r#"{"vertex":{"endpoints":{
+            "my-llm":{"endpoint":"1234567890123456789","location":"us-central1","model":"gemma-2-9b-it"},
+            "in-global":{"endpoint":"1","location":"global","model":"m"}
+        }}}"#,
+    )?;
+    let line = vertex_line(configured.path())?;
+    let names: Vec<&str> = line
+        .trim_start_matches("vertex:")
+        .split(',')
+        .map(str::trim)
+        .collect();
+    assert!(names.contains(&"vertex/endpoint/my-llm"), "{line}");
+    // An entry whose settings are invalid is not listed.
+    assert!(!line.contains("in-global"), "{line}");
+    assert_eq!(names.len(), 54, "{line}");
+
+    let empty = TempDir::new()?;
+    let line = vertex_line(empty.path())?;
+    assert!(!line.contains("vertex/endpoint/"), "{line}");
     Ok(())
 }
