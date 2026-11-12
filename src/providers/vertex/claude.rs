@@ -26,6 +26,7 @@ use crate::anthropic::schema::MessagesRequest;
 use crate::provider::{
     Generation, GenerationBody, ProviderError, ProviderErrorKind, RequestContext,
 };
+use crate::providers::codex::native::NativeResponseOutcome;
 use crate::providers::opencode::chat::{ReceivePolicy, StreamLabels, StreamWiring, TerminalPolicy};
 use crate::providers::opencode::messages;
 
@@ -34,7 +35,8 @@ use super::models::ResolvedModel;
 use super::sanitize::sanitize_vertex_text;
 use super::translate::stream::{Sanitizer, sanitize_capture};
 use super::{
-    MAX_BUFFERED_RESPONSE_BYTES, VertexProvider, error_response, invalid_request, sse_response,
+    MAX_BUFFERED_RESPONSE_BYTES, VertexProvider, error_response, invalid_request,
+    report_error_events, sse_response,
 };
 
 /// The `anthropic_version` put in a body that has none. Vertex AI also
@@ -289,7 +291,16 @@ pub(super) async fn handle_messages(
         Err(error) => return error_response(error),
     };
     if body.stream {
-        sse_response(stream_body(started, &ctx))
+        // A stream that ends in an error event is reported through the
+        // outcome, which the server reads when the body ends, so the request
+        // is recorded as failed. The wiring never forwards an upstream error
+        // event: it answers with its own fixed message, so that is the text
+        // recorded.
+        let outcome = NativeResponseOutcome::default();
+        let body = report_error_events(stream_body(started, &ctx), Some(outcome.clone()));
+        let mut response = sse_response(body);
+        response.extensions_mut().insert(outcome);
+        response
     } else {
         buffered_response(started, &ctx).await
     }
@@ -1018,5 +1029,65 @@ mod tests {
         assert_eq!(value, json!({"input_tokens": expected}));
         // Counting needs no settings, credentials or upstream.
         assert!(provider.ready.get().is_none());
+    }
+
+    const SYNTHETIC_ERROR_SSE: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_vrtx_synthetic\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+    );
+
+    /// A local upstream that answers every request with `sse`.
+    async fn spawn_sse_upstream(sse: &'static str) -> String {
+        let app = Router::new().route(
+            "/{*path}",
+            post(move || async move {
+                ([(http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn streaming_synthetic_error_event_is_recorded_as_a_failure_and_a_clean_stream_is_not() {
+        let base = spawn_sse_upstream(SYNTHETIC_ERROR_SSE).await;
+        let response = local_provider(&base)
+            .handle_messages(claude_request(true), context())
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let outcome = response
+            .extensions()
+            .get::<NativeResponseOutcome>()
+            .cloned()
+            .expect("a streaming answer carries an outcome");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("event: error"), "{text}");
+        assert!(!text.contains("Overloaded"), "{text}");
+        assert_eq!(
+            outcome.failure().as_deref(),
+            Some("Vertex AI Messages stream is invalid")
+        );
+
+        let base = spawn_sse_upstream(SYNTHETIC_SSE).await;
+        let response = local_provider(&base)
+            .handle_messages(claude_request(true), context())
+            .await;
+        let outcome = response
+            .extensions()
+            .get::<NativeResponseOutcome>()
+            .cloned()
+            .expect("a streaming answer carries an outcome");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), SYNTHETIC_SSE);
+        assert_eq!(outcome.failure(), None);
     }
 }

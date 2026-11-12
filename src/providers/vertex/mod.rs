@@ -460,8 +460,10 @@ fn stream_response_body(
 }
 
 /// Records the message of the first `error` event of `body` in `outcome`,
-/// for the translators that do not report to it themselves. Their output
-/// chunks hold whole events, so each chunk is decoded on its own.
+/// for the shared wirings, which do not report to it themselves. Each chunk
+/// is decoded on its own: every error event those wirings write is a whole
+/// chunk, and a forwarded upstream chunk never carries a complete one (the
+/// Messages pass-through replaces an upstream error event with its own).
 fn report_error_events(body: Body, outcome: Option<NativeResponseOutcome>) -> Body {
     let Some(outcome) = outcome else {
         return body;
