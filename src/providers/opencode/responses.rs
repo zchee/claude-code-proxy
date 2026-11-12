@@ -16,8 +16,8 @@ use crate::providers::grok::translate::stream::SseDecoder;
 use crate::traffic::{StreamTrafficCapture, TrafficCapture};
 
 use super::chat::{
-    FrameScanner, POST_TERMINAL_MAX_BYTES, ReceiveContext, StreamLabels, StreamWiring,
-    TerminalPolicy, UpstreamStream, box_upstream,
+    FrameScanner, POST_TERMINAL_MAX_BYTES, RawFrameEnds, ReceiveContext, StreamLabels,
+    StreamWiring, TerminalPolicy, UpstreamStream, box_upstream,
 };
 use super::client::{OpenCodeError, OpenCodeResponse};
 
@@ -215,7 +215,8 @@ fn check_buffered_frames(upstream: &[u8], labels: &StreamLabels) -> anyhow::Resu
     let mut done_seen = false;
     let mut start = 0;
     for end in frames
-        .frame_ends(upstream)
+        .raw_frame_ends(upstream)
+        .ends
         .into_iter()
         .chain([upstream.len()])
     {
@@ -545,13 +546,14 @@ where
         context: &mut ReceiveContext,
         strict: &mut StrictResponses,
     ) -> Result<Vec<u8>, (&'static str, &'static str)> {
+        let RawFrameEnds { continued, ends } = context.raw_frame_ends(chunk);
         let mut terminal = self.pending_completion.is_some();
-        if terminal && context.exceeds_post_terminal_bytes(chunk.len()) {
+        if terminal && context.charge_after_terminal(chunk, continued) {
             return Err(("protocol", "post_terminal_limit"));
         }
         let mut output = Vec::new();
         let mut start = 0;
-        for end in context.frame_ends(chunk).into_iter().chain([chunk.len()]) {
+        for end in ends.into_iter().chain([chunk.len()]) {
             if end == start {
                 continue;
             }
@@ -568,7 +570,7 @@ where
             }
             if !terminal && self.pending_completion.is_some() {
                 terminal = true;
-                if context.exceeds_post_terminal_bytes(chunk.len() - end) {
+                if context.terminal_frame_ended(chunk, end) {
                     return Err(("protocol", "post_terminal_limit"));
                 }
             }
@@ -1487,5 +1489,47 @@ mod tests {
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(2));
         assert!(text.contains("message_stop"), "{text}");
         assert!(!text.contains("api_error"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_charges_no_byte_of_a_crlf_completion_frame_to_the_tail() {
+        let completion = COMPLETION.replace('\n', "\r\n");
+        let at_limit = synthetic_comment_tail_of_sixteen_mib();
+        let over_limit = format!("{at_limit}\n");
+        for (tail, accepted) in [(at_limit.as_str(), true), (over_limit.as_str(), false)] {
+            let wire = format!("{completion}{tail}");
+            let terminal_end = completion.len();
+            let between_cr_and_lf = terminal_end - 1;
+            let inside_tail = terminal_end + 4096 + 7;
+            for (split, parts) in [
+                ("whole", vec![wire.as_str()]),
+                (
+                    "after the frame",
+                    vec![&wire[..terminal_end], &wire[terminal_end..]],
+                ),
+                (
+                    "between its CR and LF",
+                    vec![&wire[..between_cr_and_lf], &wire[between_cr_and_lf..]],
+                ),
+                (
+                    "inside the tail",
+                    vec![&wire[..inside_tail], &wire[inside_tail..]],
+                ),
+            ] {
+                let upstream = futures_util::stream::iter(chunks(&parts));
+                let text = body_text(strict_body(upstream)).await;
+                let case = format!("{} tail bytes, split {split}", tail.len());
+                assert_eq!(text.contains("message_stop"), accepted, "{case}");
+                assert_eq!(text.contains(INVALID), !accepted, "{case}");
+            }
+            let buffered =
+                accumulate_response_with(wire.as_bytes(), "msg", "model", &strict_wiring());
+            assert_eq!(
+                buffered.is_ok(),
+                accepted,
+                "{} tail bytes: {buffered:?}",
+                tail.len()
+            );
+        }
     }
 }

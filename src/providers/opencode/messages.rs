@@ -11,7 +11,9 @@ use crate::monitor::MonitorHandle;
 use crate::providers::grok::translate::stream::SseDecoder;
 use crate::traffic::{StreamTrafficCapture, TrafficCapture};
 
-use super::chat::{ReceiveContext, StreamLabels, StreamWiring, UpstreamStream, box_upstream};
+use super::chat::{
+    RawFrameEnds, ReceiveContext, StreamLabels, StreamWiring, UpstreamStream, box_upstream,
+};
 use super::client::{OpenCodeError, OpenCodeResponse};
 
 const DEFAULT_MAX_TOKENS: u32 = 32_000;
@@ -125,8 +127,10 @@ struct StrictPassThrough {
     /// The start of a frame that has not ended yet.
     partial: Vec<u8>,
     /// Everything not yet forwarded up to the end of the `message_stop`
-    /// frame, held until the read window after it has passed.
-    held: Option<Bytes>,
+    /// frame, held until the read window after it has passed. When that
+    /// frame ends with a CRLF whose LF arrives in a later chunk, the LF is
+    /// added here.
+    held: Option<Vec<u8>>,
 }
 
 impl Drop for WiredMessagesStream {
@@ -305,8 +309,11 @@ where
         context: &mut ReceiveContext,
         strict: &mut StrictPassThrough,
     ) -> Result<Option<Bytes>, (&'static str, &'static str)> {
-        let ends = context.frame_ends(chunk);
-        let last_end = ends.last().copied().unwrap_or(0);
+        let RawFrameEnds { continued, ends } = context.raw_frame_ends(chunk);
+        // An LF that completes the CRLF of a frame released with the
+        // previous chunk is released now, so every frame reaches the client
+        // with both bytes of its line ending.
+        let last_end = ends.last().copied().unwrap_or(0).max(continued);
         let mut start = 0;
         for end in ends {
             let events = self
@@ -334,7 +341,7 @@ where
             if !terminal {
                 continue;
             }
-            if context.exceeds_post_terminal_bytes(chunk.len() - end) {
+            if context.terminal_frame_ended(chunk, end) {
                 return Err(("protocol", "post_terminal_limit"));
             }
             let events = self
@@ -347,7 +354,7 @@ where
             }
             let mut held = std::mem::take(&mut strict.partial);
             held.extend_from_slice(&chunk[..end]);
-            strict.held = Some(Bytes::from(held));
+            strict.held = Some(held);
             return Ok(None);
         }
         self.decoder
@@ -442,7 +449,12 @@ where
             };
             self.bytes = self.bytes.saturating_add(chunk.len() as u64);
             self.chunks = self.chunks.saturating_add(1);
-            if context.exceeds_post_terminal_bytes(chunk.len()) {
+            let continued = context.raw_frame_ends(&chunk).continued;
+            let own = context.terminal_lf(&chunk, continued);
+            if let Some(held) = strict.held.as_mut() {
+                held.extend_from_slice(&chunk[..own]);
+            }
+            if context.exceeds_post_terminal_bytes(chunk.len() - own) {
                 return Some(self.fail_at("protocol", "post_terminal_limit", context));
             }
             let events = match self.decoder.push(&chunk) {
@@ -454,7 +466,7 @@ where
                 return Some(self.fail_at("protocol", "event_after_message_stop", context));
             }
         }
-        let held = strict.held.take()?;
+        let held = Bytes::from(strict.held.take()?);
         self.record_released(&held, context);
         self.terminal = true;
         self.finish_capture(true, context);
@@ -1001,5 +1013,74 @@ mod tests {
         assert_eq!(downstream, ["message_start"]);
         assert_eq!(summary["completion"]["kind"], "stream_abandoned");
         assert_eq!(summary["downstream_events"]["captured"], 1);
+    }
+
+    /// [`MESSAGE`] with every line ended by a CRLF.
+    fn synthetic_crlf_message() -> String {
+        MESSAGE.replace('\n', "\r\n")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_passes_a_crlf_message_through_byte_for_byte_in_any_split() {
+        let message = synthetic_crlf_message();
+        for split in 0..=message.len() {
+            for open in [false, true] {
+                let items = chunks(&[&message[..split], &message[split..]]);
+                let case = format!(
+                    "split at {split}, upstream {}",
+                    if open { "left open" } else { "closed" }
+                );
+                let text = if open {
+                    let upstream =
+                        futures_util::stream::iter(items).chain(futures_util::stream::pending());
+                    body_text(strict_body(upstream)).await
+                } else {
+                    body_text(strict_body(futures_util::stream::iter(items))).await
+                };
+                assert_eq!(text, message, "{case}");
+            }
+        }
+        // The LF of the final CRLF alone in the last item, after the CR.
+        let between_cr_and_lf = message.len() - 1;
+        let upstream = futures_util::stream::iter(chunks(&[
+            &message[..between_cr_and_lf],
+            "\n",
+            ": keepalive\r\n\r\n",
+        ]));
+        assert_eq!(body_text(strict_body(upstream)).await, message);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_charges_no_byte_of_a_crlf_message_stop_frame_to_the_tail() {
+        let message = synthetic_crlf_message();
+        let at_limit = synthetic_comment_tail_of_sixteen_mib();
+        let over_limit = format!("{at_limit}\n");
+        for (tail, accepted) in [(at_limit.as_str(), true), (over_limit.as_str(), false)] {
+            let wire = format!("{message}{tail}");
+            let between_cr_and_lf = message.len() - 1;
+            let inside_tail = message.len() + 4096 + 7;
+            for (split, parts) in [
+                ("whole", vec![wire.as_str()]),
+                ("after the frame", vec![message.as_str(), tail]),
+                (
+                    "between its CR and LF",
+                    vec![&wire[..between_cr_and_lf], &wire[between_cr_and_lf..]],
+                ),
+                (
+                    "inside the tail",
+                    vec![&wire[..inside_tail], &wire[inside_tail..]],
+                ),
+            ] {
+                let upstream = futures_util::stream::iter(chunks(&parts));
+                let text = body_text(strict_body(upstream)).await;
+                let case = format!("{} tail bytes, split {split}", tail.len());
+                if accepted {
+                    assert_eq!(text, message, "{case}");
+                } else {
+                    assert!(text.contains(INVALID), "{case}");
+                    assert!(!text.contains("message_stop"), "{case}");
+                }
+            }
+        }
     }
 }

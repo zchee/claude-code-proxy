@@ -189,6 +189,9 @@ pub(super) struct ReceiveContext {
     read_deadline: Option<tokio::time::Instant>,
     post_terminal_bytes: usize,
     frames: FrameScanner,
+    /// The terminal frame ended at the CR of a CRLF that was the last byte
+    /// of its chunk, so the LF may still arrive as the next byte.
+    terminal_lf_pending: bool,
 }
 
 impl ReceiveContext {
@@ -198,6 +201,7 @@ impl ReceiveContext {
             read_deadline: None,
             post_terminal_bytes: 0,
             frames: FrameScanner::default(),
+            terminal_lf_pending: false,
         }
     }
 
@@ -240,12 +244,53 @@ impl ReceiveContext {
         self.post_terminal_bytes > POST_TERMINAL_MAX_BYTES
     }
 
-    /// The offsets in `chunk` just after each byte that ends an SSE frame,
-    /// carried across the chunks of one stream. A strict stream feeds every
-    /// chunk through here and through its decoder, so the two agree.
-    pub(super) fn frame_ends(&mut self, chunk: &[u8]) -> Vec<usize> {
-        self.frames.frame_ends(chunk)
+    /// [`FrameScanner::raw_frame_ends`] carried across the chunks of one
+    /// stream. A strict stream feeds every chunk through here and through
+    /// its decoder.
+    pub(super) fn raw_frame_ends(&mut self, chunk: &[u8]) -> RawFrameEnds {
+        self.frames.raw_frame_ends(chunk)
     }
+
+    /// Charges `chunk`, read after the chunk that held the terminal frame,
+    /// and returns `true` once more than [`POST_TERMINAL_MAX_BYTES`] have
+    /// been read after that frame. `continued` is
+    /// [`RawFrameEnds::continued`] of the chunk: an LF that completes the
+    /// terminal frame's CRLF is part of that frame and is not charged.
+    pub(super) fn charge_after_terminal(&mut self, chunk: &[u8], continued: usize) -> bool {
+        let own = self.terminal_lf(chunk, continued);
+        self.exceeds_post_terminal_bytes(chunk.len() - own)
+    }
+
+    /// Notes where the terminal frame ended in `chunk` and charges the bytes
+    /// after it, as [`Self::charge_after_terminal`].
+    pub(super) fn terminal_frame_ended(&mut self, chunk: &[u8], end: usize) -> bool {
+        self.terminal_lf_pending = end == chunk.len() && chunk.last() == Some(&b'\r');
+        self.exceeds_post_terminal_bytes(chunk.len() - end)
+    }
+
+    /// How many leading bytes of `chunk` complete the terminal frame: 1 when
+    /// it ended at a CR that closed the previous chunk and `chunk` opens
+    /// with the LF of that CRLF, otherwise 0. Only the first chunk after
+    /// the terminal frame is asked.
+    pub(super) fn terminal_lf(&mut self, chunk: &[u8], continued: usize) -> usize {
+        if chunk.is_empty() || !std::mem::take(&mut self.terminal_lf_pending) {
+            return 0;
+        }
+        continued
+    }
+}
+
+/// Where frames end in one chunk, the raw bytes of each frame counted
+/// whole.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct RawFrameEnds {
+    /// 1 when the chunk opens with the LF of a CRLF whose CR ended a frame
+    /// at the end of the previous chunk: that byte belongs to that frame.
+    /// Otherwise 0.
+    pub(super) continued: usize,
+    /// The offset just after the last byte of each frame that ends in the
+    /// chunk: after the LF of a CRLF when that LF is in the chunk.
+    pub(super) ends: Vec<usize>,
 }
 
 /// Finds where SSE frames end the way [`SseDecoder`] does: a line ends at
@@ -254,6 +299,8 @@ impl ReceiveContext {
 pub(super) struct FrameScanner {
     line_empty: bool,
     skip_lf: bool,
+    /// The last byte scanned was a CR that ended a frame.
+    frame_cr: bool,
 }
 
 impl Default for FrameScanner {
@@ -261,6 +308,7 @@ impl Default for FrameScanner {
         Self {
             line_empty: true,
             skip_lf: false,
+            frame_cr: false,
         }
     }
 }
@@ -287,6 +335,27 @@ impl FrameScanner {
             }
         }
         ends
+    }
+
+    /// The frames that end in `chunk`, each up to its last raw byte: unlike
+    /// [`Self::frame_ends`], a frame that ends with a CRLF ends after the
+    /// LF when the LF is in `chunk`, and an LF that opens `chunk` after a
+    /// frame-ending CR at the end of the previous chunk is reported in
+    /// [`RawFrameEnds::continued`]. Feeding the decoder up to these ends
+    /// dispatches the same events as up to [`Self::frame_ends`].
+    pub(super) fn raw_frame_ends(&mut self, chunk: &[u8]) -> RawFrameEnds {
+        if chunk.is_empty() {
+            return RawFrameEnds::default();
+        }
+        let continued = usize::from(std::mem::take(&mut self.frame_cr) && chunk[0] == b'\n');
+        let mut ends = self.frame_ends(chunk);
+        for end in &mut ends {
+            if chunk[*end - 1] == b'\r' && chunk.get(*end) == Some(&b'\n') {
+                *end += 1;
+            }
+        }
+        self.frame_cr = ends.last() == Some(&chunk.len()) && chunk[chunk.len() - 1] == b'\r';
+        RawFrameEnds { continued, ends }
     }
 }
 
@@ -1587,7 +1656,12 @@ fn push_buffered_strict(translator: &mut LiveStreamTranslator, input: &[u8]) -> 
     let mut frames = FrameScanner::default();
     let mut terminal = false;
     let mut start = 0;
-    for end in frames.frame_ends(input).into_iter().chain([input.len()]) {
+    for end in frames
+        .raw_frame_ends(input)
+        .ends
+        .into_iter()
+        .chain([input.len()])
+    {
         if end == start {
             continue;
         }
@@ -1826,13 +1900,14 @@ where
         chunk: &[u8],
         context: &mut ReceiveContext,
     ) -> Result<Vec<u8>, (&'static str, &'static str)> {
+        let RawFrameEnds { continued, ends } = context.raw_frame_ends(chunk);
         let mut terminal = self.translator.is_terminal();
-        if terminal && context.exceeds_post_terminal_bytes(chunk.len()) {
+        if terminal && context.charge_after_terminal(chunk, continued) {
             return Err(("protocol", "post_terminal_limit"));
         }
         let mut output = Vec::new();
         let mut start = 0;
-        for end in context.frame_ends(chunk).into_iter().chain([chunk.len()]) {
+        for end in ends.into_iter().chain([chunk.len()]) {
             if end == start {
                 continue;
             }
@@ -1847,7 +1922,7 @@ where
             }
             if !terminal && self.translator.is_terminal() {
                 terminal = true;
-                if context.exceeds_post_terminal_bytes(chunk.len() - end) {
+                if context.terminal_frame_ended(chunk, end) {
                     return Err(("protocol", "post_terminal_limit"));
                 }
             }
@@ -3142,5 +3217,105 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(error, "Grok SSE stream ended with an incomplete frame");
+    }
+
+    #[test]
+    fn synthetic_raw_frame_ends_keep_both_bytes_of_a_crlf_in_any_split() {
+        let tests: [(&str, &str, &[usize]); 5] = [
+            ("lf", "data: a\n\n: c\n\n", &[9, 14]),
+            ("cr", "data: a\r\rdata: b\r\r", &[9, 18]),
+            ("crlf", "data: a\r\n\r\ndata: b\r\n\r\n", &[11, 22]),
+            ("cr then crlf", "data: a\r\rdata: b\r\n\r\n", &[9, 20]),
+            (
+                "crlf then partial frame",
+                "data: a\r\n\r\ndata: b\r\n",
+                &[11],
+            ),
+        ];
+        for (name, input, expected) in tests {
+            let input = input.as_bytes();
+            let whole = FrameScanner::default().raw_frame_ends(input);
+            assert_eq!(whole.continued, 0, "{name}: whole");
+            assert_eq!(whole.ends, expected, "{name}: whole");
+            for split in 0..=input.len() {
+                let mut scanner = FrameScanner::default();
+                let first = scanner.raw_frame_ends(&input[..split]);
+                let second = scanner.raw_frame_ends(&input[split..]);
+                assert_eq!(first.continued, 0, "{name}: split at {split}");
+                let mut ends = first.ends;
+                if second.continued == 1 {
+                    // The LF that opens the second part completes the frame
+                    // that ended at the CR closing the first.
+                    assert_eq!(ends.pop(), Some(split), "{name}: split at {split}");
+                    ends.push(split + 1);
+                }
+                ends.extend(second.ends.into_iter().map(|end| end + split));
+                assert_eq!(ends, expected, "{name}: split at {split}");
+            }
+        }
+        // An empty chunk between the CR and the LF changes nothing.
+        let mut scanner = FrameScanner::default();
+        assert_eq!(scanner.raw_frame_ends(b"data: a\r\n\r").ends, [10]);
+        assert_eq!(scanner.raw_frame_ends(b""), RawFrameEnds::default());
+        let rest = scanner.raw_frame_ends(b"\ndata: b\r\n\r\n");
+        assert_eq!(rest.continued, 1);
+        assert_eq!(rest.ends, [12]);
+        // An LF after a CR that only ended a line is not a frame's.
+        let mut scanner = FrameScanner::default();
+        assert_eq!(
+            scanner.raw_frame_ends(b"data: a\r").ends,
+            Vec::<usize>::new()
+        );
+        assert_eq!(scanner.raw_frame_ends(b"\n\r\n").continued, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_charges_no_byte_of_a_crlf_terminal_frame_to_the_tail() {
+        let message = TEXT_THEN_STOP.replace('\n', "\r\n");
+        let at_limit = synthetic_comment_tail_of_sixteen_mib();
+        let over_limit = format!("{at_limit}\n");
+        for (tail, accepted) in [(at_limit.as_str(), true), (over_limit.as_str(), false)] {
+            let wire = format!("{message}{tail}");
+            let terminal_end = message.len();
+            let between_cr_and_lf = terminal_end - 1;
+            let inside_tail = terminal_end + 4096 + 7;
+            for (split, parts) in [
+                ("whole", vec![wire.as_str()]),
+                (
+                    "after the frame",
+                    vec![&wire[..terminal_end], &wire[terminal_end..]],
+                ),
+                (
+                    "between its CR and LF",
+                    vec![&wire[..between_cr_and_lf], &wire[between_cr_and_lf..]],
+                ),
+                (
+                    "inside the tail",
+                    vec![&wire[..inside_tail], &wire[inside_tail..]],
+                ),
+            ] {
+                let upstream = futures_util::stream::iter(chunks(&parts));
+                let text = body_text(strict_body(upstream)).await;
+                let case = format!("{} tail bytes, split {split}", tail.len());
+                assert_eq!(
+                    text.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+                    accepted,
+                    "{case}"
+                );
+                assert_eq!(
+                    text.contains("Synthetic Gateway stream is invalid"),
+                    !accepted,
+                    "{case}"
+                );
+            }
+            let buffered =
+                accumulate_response_with(wire.as_bytes(), "msg", "model", &strict_wiring());
+            assert_eq!(
+                buffered.is_ok(),
+                accepted,
+                "{} tail bytes: {buffered:?}",
+                tail.len()
+            );
+        }
     }
 }
