@@ -52,18 +52,33 @@ later login needs a restart. When gcloud runs with
 `CLOUDSDK_CONFIG`, point `GOOGLE_APPLICATION_CREDENTIALS` at
 `$CLOUDSDK_CONFIG/application_default_credentials.json`, because the lookup does
 not follow that variable. An HTTP 500 with `Invalid Vertex configuration` names
-the missing or invalid setting, usually the project.
+the missing or invalid setting, usually the project or a location override; see
+[Vertex AI returns 400 or 500](#vertex-ai-returns-400-or-500).
 
 ## Vertex AI returns 401, 403, 404, or 429
 
 Each message ends with `(upstream HTTP <status>)` and names what to check:
 
 - **401**: Google rejected the access token. Run `gcloud auth application-default login` again, or check the key file named by `GOOGLE_APPLICATION_CREDENTIALS`, then restart the proxy: it keeps the credentials from the first Vertex AI request that obtained an access token.
-- **403**: the account needs `roles/aiplatform.user` on the project, the Vertex AI API (`aiplatform.googleapis.com`) must be enabled there, and user credentials may need a quota project. Set one with `gcloud auth application-default set-quota-project PROJECT_ID`.
-- **404**: the model is not available in that project and location. Check the model ID, then try `global` or a region where the model is offered, through `CCP_VERTEX_LOCATION`, `GOOGLE_CLOUD_LOCATION`, or `vertex.location`.
+- **403**: the account needs `roles/aiplatform.user` on the project, the Vertex AI API (`aiplatform.googleapis.com`) must be enabled there, and user credentials may need a quota project. Set one with `gcloud auth application-default set-quota-project PROJECT_ID`. For a Claude, Grok, OpenAI, Muse, or Mistral model, also check that the model is enabled in Model Garden for the project, and for OpenAI that the project has Private Preview access.
+- **404**: the model is not available in that project and location, or a partner model is not enabled in Model Garden. Check the model ID, then try `global` or a location where the model is offered, through `CCP_VERTEX_LOCATION`, `GOOGLE_CLOUD_LOCATION`, or `vertex.location`, or for one publisher or model through `CCP_VERTEX_LOCATION_OVERRIDES`. Claude 4.7 and later need `global`, `us`, or `eu`; Muse always uses `global`.
 - **429**: the project's quota or Google's shared capacity for the model in that location is used up. The response carries `retry-after` when Google sends a delay.
 
 See [Vertex AI errors](/providers/vertex/#errors) for the full table.
+
+## Vertex AI returns 400 or 500
+
+These answers come from the proxy before Vertex AI is called:
+
+- **500 `Invalid Vertex configuration: Invalid Vertex setting CCP_VERTEX_LOCATION_OVERRIDES: ...`**, or the same with `vertex.locationOverrides in config.json`: a location override is malformed, and every Vertex AI request fails until it is fixed. An entry is `<key>=<location>` in the variable and `"<key>": "<location>"` in `config.json`; a key is `<publisher>` or `<publisher>/<model-id>`, listed once, and never `endpoint`. `vertex auth status` does not check the overrides.
+- **400 `Vertex AI models of publisher mistralai are not served in location global: ...`**: Mistral needs `us-central1` or `europe-west4`. Start the proxy with `CCP_VERTEX_LOCATION_OVERRIDES=mistralai=us-central1`, or set the location itself.
+- **400 `Vertex AI does not serve the hosted web_search tool for <family> models; ...`**: Grok, OpenAI, and Muse on Vertex AI do not take the web search tool. Remove it from the request.
+- **400 `this version of claude-code-proxy does not support the ... model family on Vertex AI`**: managed open models (`-maas`) and deployed endpoints are not supported.
+- **400 `unsupported Vertex AI model ...`**: the name matches no accepted form. Partner models need the publisher, such as `vertex/anthropic/claude-opus-5-5` or `vertex/openai/gpt-6.1-sol`; `gpt-*` names go under `openai` and `muse-*` names under `meta`. A `vertex/<model-id>` name without a publisher is always sent to Gemini, so `vertex/gpt-6.1-sol` fails upstream with a 404.
+
+A stream that ends with `Vertex AI Messages stream is invalid` (Claude), `Vertex AI Responses stream is invalid` (Grok, OpenAI, Muse), or `Vertex AI Mistral stream is invalid` (Mistral) means the upstream stream failed or contained something the proxy does not accept. For Grok, OpenAI, and Muse, an event type the proxy does not know is the likely cause. Capture the request with `CCP_TRAFFIC_LOG=1`; the `060-vertex-*-stream-error` file names the reason, and the upstream events show what arrived. See [Strict stream checks](/providers/vertex/#strict-stream-checks).
+
+A Claude request that fails with a 400 naming a feature or a beta may use something Vertex AI does not accept. Start Claude Code with `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`. After switching a conversation to Claude from another provider, a 400 about thinking blocks is fixed by starting a new conversation; see [Thinking blocks from other providers](/providers/vertex/#thinking-blocks-from-other-providers).
 
 ## Model returns HTTP 400
 

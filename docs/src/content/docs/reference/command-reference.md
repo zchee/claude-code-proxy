@@ -82,7 +82,7 @@ claude-code-proxy kimi auth status
 claude-code-proxy cursor auth logout
 ```
 
-A missing credential makes `auth status` exit with status 1. For Muse, a stored login that Meta no longer accepts also exits with status 1 and prints the `claude-code-proxy muse auth login` hint. For Vertex AI, a missing or invalid project, location, or base URL setting exits with status 2, even when credentials are also missing. Other provider command failures exit with status 2. Successful commands exit with status 0.
+A missing credential makes `auth status` exit with status 1. For Muse, a stored login that Meta no longer accepts also exits with status 1 and prints the `claude-code-proxy muse auth login` hint. For Vertex AI, a missing or invalid project, location, or base URL setting exits with status 2, even when credentials are also missing; the location overrides are not read. Other provider command failures exit with status 2. Successful commands exit with status 0.
 
 Logout removes the local proxy-owned credential. It does not call the provider to revoke a refresh token. `muse auth logout` also leaves the Muse CLI's login and the API key it shares with the proxy untouched. `muse auth status` contacts Meta's key service to report the current subscription and usage.
 

@@ -19,6 +19,19 @@ description: Release notes for claude-code-proxy.
   `CCP_VERTEX_PROJECT` or `GOOGLE_CLOUD_PROJECT`, and check the setup with
   `claude-code-proxy vertex auth status`. Requests are billed to that project.
   See the [Vertex AI provider page](https://claude-code-proxy.raine.dev/providers/vertex/).
+- Vertex AI also serves Anthropic Claude, xAI Grok, OpenAI, Meta Muse, and
+  Mistral models enabled in Model Garden, named
+  `vertex/<publisher>/<model-id>`, such as `vertex/anthropic/claude-opus-5-5`,
+  `vertex/xai/grok-4.7`, `vertex/openai/gpt-6.1-sol`,
+  `vertex/meta/muse-spark-1.3`, and `vertex/mistralai/mistral-medium-3`. Bare
+  `claude-*`, `gpt-*`, `grok-*`, and `muse-*` IDs keep their own providers.
+  `CCP_VERTEX_LOCATION_OVERRIDES` or `vertex.locationOverrides` sets the
+  location per publisher or model; Mistral needs `us-central1` or
+  `europe-west4`. Claude requests pass through and keep only the
+  `anthropic-beta` values Claude Code itself sends to Vertex AI; Grok, OpenAI,
+  Muse, and Mistral do not carry reasoning across turns. Requests are billed
+  to the Google Cloud project.
+  See the [Vertex AI provider page](https://claude-code-proxy.raine.dev/providers/vertex/).
 
 ## v0.1.48 (2026-11-01)
 

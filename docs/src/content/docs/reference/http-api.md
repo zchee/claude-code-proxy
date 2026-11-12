@@ -93,7 +93,7 @@ For Grok, `reasoning_effort` accepts `none`, `low`, `medium`, `high`, `xhigh`, a
 
 For Muse, `reasoning_effort` accepts `low`, `medium`, `high`, `xhigh`, and `max`. `max` is sent as `xhigh` for `muse-spark-1.2`.
 
-For Vertex AI, `reasoning_effort` accepts `low`, `medium`, `high`, `xhigh`, and `max`. They are sent as Gemini thinking levels `LOW`, `MEDIUM`, and `HIGH`; `xhigh` and `max` become `HIGH`.
+For Vertex AI, `reasoning_effort` accepts `low`, `medium`, `high`, `xhigh`, and `max` for every model. Gemini models receive them as thinking levels `LOW`, `MEDIUM`, and `HIGH`, with `xhigh` and `max` becoming `HIGH`. Claude models on Vertex AI receive the value as `output_config.effort` and OpenAI models on Vertex AI as `reasoning.effort`; Grok, Muse, and Mistral models on Vertex AI receive no effort. See [Vertex AI](/providers/vertex/#openai-compatible-apis).
 
 Codex uses its own compatibility path. It supports text messages, `reasoning_effort`, `response_format`, `stream_options.include_usage`, `temperature`, `top_p`, and `user`. Reasoning effort defaults to `medium`, and the proxy-wide Codex effort setting takes precedence. Function calls, images, audio, log probabilities, multiple choices, storage, and output token limits are not supported on the Codex Chat Completions path.
 
@@ -147,7 +147,7 @@ Codex models use native Responses passthrough, including native JSON and SSE out
 - `reasoning.effort`
 - streaming or non-streaming output
 
-For Grok, `reasoning.effort` accepts `none`, `low`, `medium`, `high`, `xhigh`, and `max`, with model-specific mapping for the highest levels. For Muse, it accepts `low`, `medium`, `high`, `xhigh`, and `max`, and `max` is sent as `xhigh` for `muse-spark-1.2`. For Vertex AI, it accepts the same five values, sent as Gemini thinking levels; `xhigh` and `max` become `HIGH`.
+For Grok, `reasoning.effort` accepts `none`, `low`, `medium`, `high`, `xhigh`, and `max`, with model-specific mapping for the highest levels. For Muse, it accepts `low`, `medium`, `high`, `xhigh`, and `max`, and `max` is sent as `xhigh` for `muse-spark-1.2`. For Vertex AI, it accepts the same five values, mapped per model family as on Chat Completions.
 
 Responses include the accepted tool settings. Grok search appears as a `web_search_call`, with sources in URL citation annotations. When a provider reaches its output token limit, the response status is `incomplete` and the reason is `max_output_tokens`.
 
@@ -157,7 +157,7 @@ Responses include the accepted tool settings. Grok search appears as a `web_sear
 
 The shared Kimi, Grok, Muse, Vertex AI, and Cursor ingress accepts boolean `parallel_tool_calls` on both OpenAI routes. `false` preserves serial tool execution through translation, while `true` selects the existing parallel default. Omitting the field leaves the provider default unchanged. Non-boolean values return an `invalid_request_error` with `parallel_tool_calls` in `error.param`.
 
-The setting applies without changing the requested `tool_choice` mode. This includes omitted or `auto` choices, `none`, `required`, and named functions. Internally, an explicit OpenAI setting determines the equivalent Anthropic `tool_choice.disable_parallel_tool_use` value. Anthropic Messages requests can set `disable_parallel_tool_use` directly. Kimi, Grok, and Muse receive the corresponding upstream `parallel_tool_calls` value, Vertex AI drops the setting because Gemini has no equivalent, and Cursor's bridged tool loop remains serial between client tool results.
+The setting applies without changing the requested `tool_choice` mode. This includes omitted or `auto` choices, `none`, `required`, and named functions. Internally, an explicit OpenAI setting determines the equivalent Anthropic `tool_choice.disable_parallel_tool_use` value. Anthropic Messages requests can set `disable_parallel_tool_use` directly. Kimi, Grok, and Muse receive the corresponding upstream `parallel_tool_calls` value. On Vertex AI, Gemini drops the setting because it has no equivalent, Claude receives `disable_parallel_tool_use`, and Grok, OpenAI, Muse, and Mistral receive `parallel_tool_calls` from the translator. Cursor's bridged tool loop remains serial between client tool results.
 
 Codex Responses uses native passthrough and forwards `parallel_tool_calls` unchanged. Codex Chat Completions has its own field allowlist and rejects `parallel_tool_calls` because that path does not support function tools.
 

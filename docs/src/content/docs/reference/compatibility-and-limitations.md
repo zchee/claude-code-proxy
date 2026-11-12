@@ -85,11 +85,14 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 
 ## Vertex AI
 
-- Only Gemini models are supported. Claude, partner and open models, and deployed endpoints on Vertex AI are not; `vertex/<publisher>/<model-id>` for any publisher other than `google` is rejected.
+- Gemini, Anthropic Claude, xAI Grok, OpenAI, Meta Muse, and Mistral models are supported. Partner models are reached only as `vertex/<publisher>/<model-id>` and must be enabled in Model Garden first. Managed open models (`-maas`) and deployed endpoints are rejected with HTTP 400.
 - The proxy stores no Google credentials and has no login of its own. Application Default Credentials do not follow `CLOUDSDK_CONFIG`.
 - The provider was built from Google's API reference without observing live traffic. The [provider page](/providers/vertex/#implemented-from-documentation-only) lists the assumptions and the symptom of each.
-- Thought signatures travel in Claude Code thinking blocks. When one is missing, the proxy sends Google's `skip_thought_signature_validator` placeholder, which Google says can lower answer quality.
-- Tool schemas are sent unchanged; a schema Gemini rejects fails the request with HTTP 400. Anthropic server tools, Gemini's built-in tools, structured output, document blocks, and image URLs are not supported.
+- Each family is served only in some locations. Mistral needs `us-central1` or `europe-west4`, Muse always uses `global`, and `CCP_VERTEX_LOCATION_OVERRIDES` or `vertex.locationOverrides` sets the location per publisher or model.
+- Gemini thought signatures travel in Claude Code thinking blocks. When one is missing, the proxy sends Google's `skip_thought_signature_validator` placeholder, which Google says can lower answer quality.
+- For Gemini, tool schemas are sent unchanged; a schema Gemini rejects fails the request with HTTP 400. Anthropic server tools, Gemini's built-in tools, structured output, document blocks, and image URLs are not supported.
+- Claude requests are passed through. Only `anthropic-beta` values on the list Claude Code uses for Vertex AI are sent, others are dropped without an error, and thinking blocks from other providers are removed. Features Vertex AI does not accept are not checked; the upstream error is returned.
+- Grok, OpenAI, Muse, and Mistral do not carry reasoning across turns, the hosted web search tool is refused with HTTP 400, and their streams end with an error on any event the proxy does not recognise.
 - Requests are not retried and there is no model fallback.
 
 ## Cursor Agent
@@ -107,7 +110,7 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 - Error captures contain complete redacted failed responses.
 - Traffic captures intentionally preserve prompts and tool content for message/Responses diagnostics. Image payloads, encrypted reasoning, and the proxy's reasoning signatures are replaced with length markers.
 - Muse traffic captures also replace the request's login token and API key wherever they appear, and scrub Muse error text, `code`, and `param` before writing them.
-- Vertex AI traffic captures show the `authorization` header as `[redacted]` and keep the quota project in `x-goog-user-project`. Gemini `thoughtSignature` values and inline image data are replaced with length markers. The upstream response is recorded as decoded events with Google's error and finish messages cleaned, including in `032-upstream-response-body.sse`, never as the raw bytes.
+- Vertex AI traffic captures show the `authorization` header as `[redacted]` and keep the quota project in `x-goog-user-project`. Gemini `thoughtSignature` values and inline image data are replaced with length markers. The upstream response is recorded as decoded events with Google's error and finish messages cleaned, including in `032-upstream-response-body.sse`, never as the raw bytes. A non-streaming Claude response is recorded as cleaned JSON in `032-upstream-response-body`.
 - Image generation and edit routes never create traffic captures or persist prompts, uploads, data URLs, generated base64, or upstream error bodies.
 - Verbose logging and traffic capture should be scoped to a focused local investigation.
 

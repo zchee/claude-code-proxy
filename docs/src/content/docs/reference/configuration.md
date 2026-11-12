@@ -53,7 +53,10 @@ These settings configure the proxy process. Claude Code client settings such as 
   },
   "vertex": {
     "project": "YOUR_GOOGLE_CLOUD_PROJECT_ID",
-    "location": "global"
+    "location": "global",
+    "locationOverrides": {
+      "mistralai": "us-central1"
+    }
   },
   "cursor": {
     "baseUrl": "https://api2.cursor.sh",
@@ -178,8 +181,11 @@ The three URL settings must use `https` (plain `http` only for a loopback host) 
 | `CCP_VERTEX_LOCATION` | `vertex.location` | `global` | Vertex AI location, such as `global`, `us`, `eu`, or `us-central1`. Takes precedence over `GOOGLE_CLOUD_LOCATION` and config. |
 | `GOOGLE_CLOUD_LOCATION` | `vertex.location` | `global` | Standard Google Cloud location variable, used when `CCP_VERTEX_LOCATION` is unset. |
 | `CCP_VERTEX_BASE_URL` | `vertex.baseUrl` | Derived from the location | Replaces `https://<host>`, for a relay or a local test server. Its path prefix is kept and `/v1/projects/...` is appended. |
+| `CCP_VERTEX_LOCATION_OVERRIDES` | `vertex.locationOverrides` | unset | Locations for single publishers or models, as `<key>=<location>` entries separated by commas in the variable and an object of `"<key>": "<location>"` members in config. A key is `<publisher>` or `<publisher>/<model-id>`, such as `mistralai` or `anthropic/claude-opus-4-6`; Gemini uses the publisher `google`. The variable replaces the config value as a whole. |
 
 The precedence is `CCP_VERTEX_*`, then `GOOGLE_CLOUD_PROJECT` or `GOOGLE_CLOUD_LOCATION`, then `config.json`. An empty or blank value counts as not set. A project may contain letters, digits, `.`, `_`, `:`, and `-`, starting with a letter or digit; a location may contain lowercase letters, digits, and `-`. The base URL receives the Google access token, so it must use `https` (plain `http` only for a loopback host) and must not contain a user name or password. A non-empty invalid value is an error that names the setting, not a fallback to the default. The startup summary lists a project or location taken from the Google variables as `vertex.project (Google env)` or `vertex.location (Google env)`.
+
+A location override names the model's location in place of `vertex.location`. An override that names the model wins over everything else; then Meta Muse models keep their fixed `global`; then an override that names the publisher applies; then the configured location. Mistral needs `us-central1` or `europe-west4` from an override or the configured location, and is a 400 otherwise. An override key that is malformed or listed twice, the key `endpoint`, an entry without a valid location, or a `vertex.locationOverrides` value that is not an object makes every Vertex AI request fail with a 500 naming the setting. The startup summary lists `vertex.locationOverrides (env)` or the file's entries. See [Location overrides](/providers/vertex/#location-overrides).
 
 The server reads these settings on the first Vertex AI request and keeps them until it exits, so restart the proxy after changing them. When they are invalid, for example because no project is set, nothing is kept, and the next request reads `config.json` again. A request that fails only because no access token could be obtained keeps the settings and leaves the credentials to be looked up again; see [Vertex AI](/providers/vertex/#project-and-location).
 
