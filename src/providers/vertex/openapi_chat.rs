@@ -24,7 +24,7 @@ use crate::providers::opencode::chat::{
 use crate::providers::translate_shared::read_effort;
 
 use super::BufferedCapture;
-use super::buffered::{BufferedFailure, EventStreamSink, TerminalRule, read_upstream};
+use super::buffered::{BufferedFailure, EventStreamSink, read_upstream};
 use super::client::{OpenApiPath, VertexError, VertexTarget};
 use super::models::{OpenModelControls, ResolvedModel, ThinkingControl, ToolChoiceRule};
 use super::translate::stream::Sanitizer;
@@ -214,7 +214,11 @@ where
 }
 
 /// Reads the whole upstream stream with the shared buffered limits and
-/// accumulates it into one Anthropic message.
+/// accumulates it into one Anthropic message. The chunks are checked as
+/// they arrive ([`translator::StrictChatObserver`]): a frame the streaming
+/// path rejects, such as an upstream error event, ends the read at once,
+/// even while the upstream stays open. Silence before the terminal event
+/// is not cut.
 ///
 /// # Errors
 ///
@@ -231,7 +235,7 @@ pub(super) async fn read_response<S, E>(
 where
     S: Stream<Item = Result<Bytes, E>>,
 {
-    let mut sink = EventStreamSink::new(TerminalRule::ChatCompletions);
+    let mut sink = EventStreamSink::observed(translator::StrictChatObserver::new(LABELS));
     let end = read_upstream(upstream, &mut sink, sanitize, capture)
         .await
         .map_err(BufferedFailure::Read)?;
@@ -753,6 +757,143 @@ mod tests {
             message.starts_with("Vertex AI open model upstream error: saw [redacted]"),
             "{message}"
         );
+    }
+
+    /// `items`, then `after` (an endless repetition of one chunk, or an
+    /// upstream left open when `None`), and the count of items handed out.
+    fn synthetic_counted_upstream(
+        items: Vec<Result<Bytes, std::io::Error>>,
+        after: Option<String>,
+    ) -> (
+        impl Stream<Item = Result<Bytes, std::io::Error>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&pulled);
+        let tail: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+            match after {
+                Some(part) => Box::pin(stream::repeat_with(move || Ok(Bytes::from(part.clone())))),
+                None => Box::pin(stream::pending()),
+            };
+        let upstream = stream::iter(items).chain(tail).inspect(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        (upstream, pulled)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_synthetic_a_rejected_frame_ends_the_read_while_the_upstream_stays_open() {
+        let keep_alive = ": keep-alive\n\n".to_string();
+        let overloaded = frame(json!({
+            "error": {"message": format!("overloaded, saw {SYNTHETIC_TOKEN}")}
+        }));
+        let malformed = "data: {\"choices\":[\n\n".to_string();
+        let late = chunk(json!({"content": "late"}), None);
+        let upstream_error = "Vertex AI open model upstream error: overloaded, saw [redacted]";
+        let not_json = "malformed Vertex AI open model SSE event";
+        let mut after_done = thinking_wire();
+        after_done.push(late.clone());
+        // The streaming path fails at these frames as soon as it reads them,
+        // within the read window after a terminal event too, so the
+        // buffered read must not wait for that window to pass.
+        let tests = [
+            (
+                "upstream error before any finish_reason, upstream open",
+                vec![thinking_wire()[0].clone(), overloaded.clone()],
+                None,
+                upstream_error,
+            ),
+            (
+                "upstream error alone, then keep-alives",
+                vec![keep_alive.clone(), overloaded.clone()],
+                Some(keep_alive.clone()),
+                upstream_error,
+            ),
+            (
+                "malformed event, upstream open",
+                vec![thinking_wire()[0].clone(), malformed.clone()],
+                None,
+                not_json,
+            ),
+            (
+                "malformed event, then keep-alives",
+                vec![malformed],
+                Some(keep_alive.clone()),
+                not_json,
+            ),
+            (
+                "content after finish_reason, upstream open",
+                vec![
+                    thinking_wire()[0].clone(),
+                    thinking_wire()[2].clone(),
+                    late.clone(),
+                ],
+                None,
+                "Vertex AI open model stream sent content after finish_reason",
+            ),
+            (
+                "an event after [DONE], upstream open",
+                after_done,
+                None,
+                "Vertex AI open model event after [DONE]",
+            ),
+        ];
+        for (case, parts, after, expected) in tests {
+            let count = parts.len();
+            let (upstream, pulled) = synthetic_counted_upstream(chunks(parts), after);
+            let started = tokio::time::Instant::now();
+            let failure = tokio::time::timeout(
+                Duration::from_secs(60),
+                read_response(upstream, "msg_synthetic", MODEL, &sanitizer(), None),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{case}: the read did not end at the rejected frame"))
+            .expect_err("a rejected frame is not a message");
+            // A clock that moved means the read waited for a deadline;
+            // more items pulled means it read past the rejected frame.
+            assert_eq!(started.elapsed(), Duration::ZERO, "{case}");
+            assert_eq!(
+                pulled.load(std::sync::atomic::Ordering::SeqCst),
+                count,
+                "{case}: the upstream was read after the rejected frame"
+            );
+            let BufferedFailure::Translate(error) = failure else {
+                panic!(
+                    "{case}: expected a translation failure, got {}",
+                    failure.kind()
+                );
+            };
+            assert_eq!(error.to_string(), expected, "{case}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_synthetic_silence_before_the_finish_reason_is_not_cut() {
+        for (case, after) in [
+            ("reasoning, then silence", None),
+            (
+                "reasoning, then keep-alives",
+                Some(": keep-alive\n\n".to_string()),
+            ),
+        ] {
+            let parts = chunks(thinking_wire()[..2].to_vec());
+            let (upstream, _) = synthetic_counted_upstream(parts, after);
+            // Keep-alives that never stop would keep the read busy without
+            // the clock moving; a small pause between them lets it move.
+            let upstream = upstream.then(|item| async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                item
+            });
+            let pending = tokio::time::timeout(
+                Duration::from_secs(600),
+                read_response(upstream, "msg_synthetic", MODEL, &sanitizer(), None),
+            )
+            .await;
+            assert!(
+                pending.is_err(),
+                "{case}: the read ended without a finish_reason"
+            );
+        }
     }
 
     #[tokio::test]

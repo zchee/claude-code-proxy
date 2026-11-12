@@ -8,7 +8,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 
 use crate::providers::grok::translate::stream::SseDecoder;
-use crate::providers::opencode::chat::complete_frames_prefix;
+use crate::providers::opencode::chat::{StrictChatObserver, complete_frames_prefix};
 use crate::providers::opencode::responses::{ObservedChunk, StrictResponsesObserver};
 
 use super::translate::stream::{POST_TERMINAL_READ_LIMIT, Sanitizer, StreamError};
@@ -158,6 +158,47 @@ pub(super) enum TerminalRule {
     ChatCompletions,
 }
 
+/// The strict frame rules an [`EventStreamSink`] made with
+/// [`EventStreamSink::observed`] applies to the body as it arrives. Both
+/// observers are boxed: they differ in size by hundreds of bytes.
+pub(super) enum FrameObserver {
+    /// OpenAI Responses.
+    Responses(Box<StrictResponsesObserver>),
+    /// Chat Completions.
+    Chat(Box<StrictChatObserver>),
+}
+
+impl FrameObserver {
+    /// Which events of the observed wire are terminal.
+    fn rule(&self) -> TerminalRule {
+        match self {
+            Self::Responses(_) => TerminalRule::Responses,
+            Self::Chat(_) => TerminalRule::ChatCompletions,
+        }
+    }
+
+    /// Checks the next chunk. A Chat body is never settled early, only
+    /// rejected.
+    fn push(&mut self, chunk: &[u8]) -> anyhow::Result<ObservedChunk> {
+        match self {
+            Self::Responses(observer) => observer.push(chunk),
+            Self::Chat(observer) => observer.push(chunk).map(|()| ObservedChunk::Reading),
+        }
+    }
+}
+
+impl From<StrictResponsesObserver> for FrameObserver {
+    fn from(observer: StrictResponsesObserver) -> Self {
+        Self::Responses(Box::new(observer))
+    }
+}
+
+impl From<StrictChatObserver> for FrameObserver {
+    fn from(observer: StrictChatObserver) -> Self {
+        Self::Chat(Box::new(observer))
+    }
+}
+
 /// Keeps an event-stream body whole for a translator that takes the whole
 /// body at once, and counts its terminal events for [`read_upstream`].
 /// Validation is the translator's: this sink only reads what it needs to
@@ -170,8 +211,8 @@ pub(super) struct EventStreamSink {
     finished: bool,
     /// `[DONE]`, counted for [`TerminalRule::ChatCompletions`] only.
     done: bool,
-    /// Checks a strict Responses body as it arrives.
-    observer: Option<StrictResponsesObserver>,
+    /// Checks a strict body as it arrives.
+    observer: Option<FrameObserver>,
     /// The observer settled the body or rejected it.
     settled: bool,
     /// The observer rejected a frame of the chunk it accepted last.
@@ -194,20 +235,25 @@ impl EventStreamSink {
         }
     }
 
-    /// A [`TerminalRule::Responses`] sink that also feeds every chunk to
+    /// A sink for the observer's wire ([`TerminalRule::Responses`] or
+    /// [`TerminalRule::ChatCompletions`]) that also feeds every chunk to
     /// `observer` before anything else reads it, so the read ends where the
-    /// streaming path ends: at the frame where the translator closes the
-    /// message by itself or the upstream reports a failure, only the bytes
-    /// up to the end of that frame are accepted, kept and decoded, and the
-    /// body is settled; whatever follows in the same chunk is neither
-    /// counted against the cap nor checked. At a frame the strict policy
-    /// rejects, the whole chunk is kept without being decoded again and the
-    /// body is settled; translating it gives the observer's error, which
-    /// the bytes after the rejected frame cannot change.
-    pub(super) fn observed(observer: StrictResponsesObserver) -> Self {
+    /// streaming path ends. At a frame where the Responses translator
+    /// closes the message by itself or the upstream reports a failure, only
+    /// the bytes up to the end of that frame are accepted, kept and
+    /// decoded, and the body is settled; whatever follows in the same chunk
+    /// is neither counted against the cap nor checked. At a frame the
+    /// strict policy rejects, on either wire, the whole chunk is kept
+    /// without being decoded again and the body is settled; translating it
+    /// gives the observer's error, which the bytes after the rejected frame
+    /// cannot change. Silence before a terminal event still has no
+    /// deadline: only a frame ends the read early.
+    pub(super) fn observed(observer: impl Into<FrameObserver>) -> Self {
+        let observer = observer.into();
+        let rule = observer.rule();
         Self {
             observer: Some(observer),
-            ..Self::new(TerminalRule::Responses)
+            ..Self::new(rule)
         }
     }
 

@@ -2641,6 +2641,51 @@ async fn vertex_open_models_synthetic_content_after_the_finish_reason_is_an_erro
 }
 
 #[tokio::test]
+async fn vertex_chat_completions_synthetic_upstream_error_with_the_upstream_left_open_answers_at_once()
+ {
+    // A non-streaming request whose upstream sends an error event and then
+    // keeps the connection open. The streaming path fails at that event; the
+    // buffered path must too, instead of waiting for a terminal event that
+    // never comes.
+    let cases = [
+        (
+            "vertex/zai-org/glm-5.2-maas",
+            &[][..],
+            "Vertex AI open model upstream error: overloaded",
+        ),
+        (
+            MISTRAL_MODEL,
+            &[MISTRAL_LOCATION][..],
+            "Vertex AI Mistral upstream error: overloaded",
+        ),
+    ];
+    for (model, extra_env, expected) in cases {
+        let upstream = FakeVertex::start(vec![Answer::sse_held_open(&[
+            json!({"error":{"message":"overloaded"}}),
+        ])])
+        .await;
+        let app = app_with_monitor(registry(provider(&upstream, extra_env)), None);
+        let started = Instant::now();
+        let (status, _, body) = tokio::time::timeout(
+            Duration::from_millis(1_500),
+            post(app, "/v1/messages", &message_request(model, false)),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{model}: no answer within 1500 ms of an upstream error"));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "{model}: answered after {elapsed:?}"
+        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{model}: {body}");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["error"]["type"], "api_error", "{model}: {body}");
+        assert_eq!(error_message(&body), expected, "{model}");
+        assert_eq!(upstream.requests().len(), 1, "{model}");
+    }
+}
+
+#[tokio::test]
 async fn vertex_open_models_synthetic_404_names_model_garden_with_the_model_project_and_location() {
     let not_found = google_error(404, "NOT_FOUND", "Publisher Model was not found.");
     let upstream = FakeVertex::start(
