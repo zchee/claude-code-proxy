@@ -322,6 +322,23 @@ pub fn endpoint_lines(endpoints: &VertexEndpoints, config: &ResolvedVertexConfig
         .collect()
 }
 
+/// How `status` ends once the endpoints are known. A broken endpoint entry
+/// fails the command like any other setting: after a setting the report
+/// found broken, and before a missing login, because no request to that
+/// endpoint can be sent either way.
+fn with_endpoint_failure(
+    failure: Option<StatusFailure>,
+    endpoints: &VertexEndpoints,
+) -> Option<StatusFailure> {
+    match failure {
+        Some(StatusFailure::Configuration(error)) => Some(StatusFailure::Configuration(error)),
+        other => endpoints
+            .first_error()
+            .map(StatusFailure::Configuration)
+            .or(other),
+    }
+}
+
 fn metadata_server_line(well_known: &Path) -> String {
     format!(
         "Credentials: no file at {}; the library falls back to the metadata server, which exists only on Google Cloud",
@@ -470,12 +487,7 @@ impl CliHandlers for VertexCli {
         for line in endpoint_lines(&endpoints, &config) {
             println!("{line}");
         }
-        // A broken endpoint entry fails the command like any other setting,
-        // after a problem the report found itself.
-        let failure = report
-            .failure
-            .or_else(|| endpoints.first_error().map(StatusFailure::Configuration));
-        let Some(failure) = failure else {
+        let Some(failure) = with_endpoint_failure(report.failure, &endpoints) else {
             return Ok(());
         };
         let (guidance, error) = failure.into_guidance_and_error();
@@ -1142,5 +1154,51 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    #[test]
+    fn endpoint_failure_synthetic_comes_after_a_broken_setting_and_before_a_missing_login() {
+        let broken = synthetic_endpoints(
+            r#"{"vertex":{"endpoints":{"bad":{"endpoint":"1","location":"global","model":"m"}}}}"#,
+        );
+        let endpoint_error = "Invalid Vertex setting vertex.endpoints in config.json: endpoint \"bad\": location must be the endpoint's region, such as us-central1; an endpoint is never in global";
+        let message = |failure: Option<StatusFailure>| match failure {
+            Some(StatusFailure::Configuration(error)) => Some(error.to_string()),
+            Some(StatusFailure::NotAuthenticated) => Some(NOT_AUTHENTICATED.to_string()),
+            None => None,
+        };
+        let setting = || {
+            Some(StatusFailure::Configuration(anyhow::anyhow!(
+                "Vertex project is not set"
+            )))
+        };
+        assert_eq!(
+            message(with_endpoint_failure(setting(), &broken)).as_deref(),
+            Some("Vertex project is not set")
+        );
+        assert_eq!(
+            message(with_endpoint_failure(
+                Some(StatusFailure::NotAuthenticated),
+                &broken
+            ))
+            .as_deref(),
+            Some(endpoint_error)
+        );
+        assert_eq!(
+            message(with_endpoint_failure(None, &broken)).as_deref(),
+            Some(endpoint_error)
+        );
+        let fine = synthetic_endpoints(
+            r#"{"vertex":{"endpoints":{"ok":{"endpoint":"1","location":"us-central1","model":"m"}}}}"#,
+        );
+        assert_eq!(
+            message(with_endpoint_failure(
+                Some(StatusFailure::NotAuthenticated),
+                &fine
+            ))
+            .as_deref(),
+            Some(NOT_AUTHENTICATED)
+        );
+        assert!(with_endpoint_failure(None, &fine).is_none());
     }
 }
