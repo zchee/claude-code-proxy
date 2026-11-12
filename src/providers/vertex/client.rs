@@ -301,13 +301,25 @@ impl UpstreamErrorDetail {
     /// `/error/message`, which is where Google
     /// (`{"error": {"code", "message", "status"}}`), Anthropic
     /// (`{"type": "error", "error": {"type", "message"}}`) and OpenAI
-    /// (`{"error": {"message", "type", "code"}}`) put it. When the body gave
-    /// neither a message nor a status, the body itself becomes the message,
+    /// (`{"error": {"message", "type", "code"}}`) put it. Without one, a
+    /// string `message` at the top level of a JSON object is the message:
+    /// Mistral's own error body is `{"object": "error", "message", ...}`.
+    /// When the body gave neither a message nor a status, the body itself
+    /// becomes the message,
     /// passed through [`sanitize_vertex_text`], which also cuts it to 500
     /// characters. Only a complete body may be used that way: in one cut
     /// short, a secret may have lost the end the sanitiser recognises it by.
     pub fn read(body: &[u8], retry_after_header: Option<&str>, secrets: &[&str]) -> Self {
         let mut detail = Self::parse(body, retry_after_header, secrets);
+        if detail.message.is_none() {
+            detail.message = serde_json::from_slice::<serde_json::Value>(body)
+                .ok()
+                .as_ref()
+                .and_then(|value| value.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|message| !message.trim().is_empty())
+                .map(|message| sanitize_vertex_text(message, secrets));
+        }
         if detail.message.is_none() && detail.status.is_none() {
             let text = sanitize_vertex_text(&String::from_utf8_lossy(body), secrets);
             let text = text.trim();
@@ -1634,7 +1646,7 @@ mod tests {
                 b"<html><body>502 Bad Gateway</body></html>".as_slice(),
                 Some("<html><body>502 Bad Gateway</body></html>"),
             ),
-            (br#"{"message":"x"}"#.as_slice(), Some(r#"{"message":"x"}"#)),
+            (br#"{"message":"x"}"#.as_slice(), Some("x")),
             (
                 br#"{"error":"overloaded"}"#.as_slice(),
                 Some(r#"{"error":"overloaded"}"#),
@@ -2046,5 +2058,48 @@ mod tests {
                 .with_partner_guidance(&target, "xai/grok-4.7"),
             unreachable
         );
+    }
+
+    #[test]
+    fn error_detail_synthetic_reads_a_top_level_message_such_as_mistrals() {
+        let body = format!(
+            r#"{{"object":"error","message":"saw {SYNTHETIC_TOKEN} in the request","type":"invalid_request_error","code":null}}"#
+        );
+        let detail = UpstreamErrorDetail::read(body.as_bytes(), None, &[SYNTHETIC_TOKEN]);
+        assert_eq!(
+            detail.message.as_deref(),
+            Some("saw [redacted] in the request")
+        );
+        assert_eq!(detail.status, None);
+        let mapped = VertexError::from_upstream(
+            StatusCode::BAD_REQUEST,
+            detail,
+            &target("us-central1"),
+            "mistral-medium-3",
+        )
+        .message_with_status();
+        assert_eq!(mapped, "saw [redacted] in the request (upstream HTTP 400)");
+
+        // `/error/message` comes first; a top-level message that is blank or
+        // not a string is not one.
+        let both = br#"{"error":{"message":"nested"},"message":"top"}"#;
+        assert_eq!(
+            UpstreamErrorDetail::read(both, None, &[])
+                .message
+                .as_deref(),
+            Some("nested")
+        );
+        for body in [
+            br#"{"message":"  "}"#.as_slice(),
+            br#"{"message":{"text":"x"}}"#.as_slice(),
+        ] {
+            assert_eq!(
+                UpstreamErrorDetail::read(body, None, &[])
+                    .message
+                    .as_deref(),
+                Some(std::str::from_utf8(body).unwrap()),
+                "{body:?}"
+            );
+        }
     }
 }
