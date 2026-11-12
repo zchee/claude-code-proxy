@@ -191,6 +191,27 @@ impl VertexError {
         error
     }
 
+    /// The error of a request for a partner model (every family but
+    /// Gemini). A 403 or 404 from Vertex AI also names the model, project
+    /// and location and says to check that the model is enabled in Model
+    /// Garden for the project and, for a preview model, that the project
+    /// has been granted access: a partner model can be refused for that
+    /// reason as well as for the ones the message already gives, and the
+    /// status does not say which applies. Every other error is returned
+    /// unchanged.
+    pub fn with_partner_guidance(mut self, target: &VertexTarget, model: &str) -> Self {
+        if matches!(
+            self.upstream_status.map(|status| status.as_u16()),
+            Some(403 | 404)
+        ) {
+            self.message.push_str(&format!(
+                ". Also check that model {model} is enabled in Model Garden for project {} in location {} and, for a preview model, that the project has been granted access; the status alone does not say which of these is the cause",
+                target.project, target.location
+            ));
+        }
+        self
+    }
+
     /// The message as clients see it, ending with `(upstream HTTP <status>)`
     /// whenever Vertex AI answered.
     pub fn message_with_status(&self) -> String {
@@ -1978,6 +1999,52 @@ mod tests {
         assert_eq!(
             error.message_with_status(),
             "upstream connect error or disconnect/reset before headers; token [redacted] (upstream HTTP 503)"
+        );
+    }
+
+    #[test]
+    fn partner_403_404_synthetic_messages_also_name_model_garden() {
+        let target = target("us-central1");
+        let partner = |status: u16| {
+            VertexError::from_upstream(
+                StatusCode::from_u16(status).unwrap(),
+                detail("synthetic upstream text", "SYNTHETIC"),
+                &target,
+                "xai/grok-4.7",
+            )
+            .with_partner_guidance(&target, "xai/grok-4.7")
+            .message_with_status()
+        };
+        assert_eq!(
+            partner(403),
+            "SYNTHETIC: synthetic upstream text. Check that the account has the role roles/aiplatform.user on project synthetic-project, that the Vertex AI API (aiplatform.googleapis.com) is enabled there, and, for user credentials, that a quota project is set: gcloud auth application-default set-quota-project synthetic-project. Also check that model xai/grok-4.7 is enabled in Model Garden for project synthetic-project in location us-central1 and, for a preview model, that the project has been granted access; the status alone does not say which of these is the cause (upstream HTTP 403)"
+        );
+        assert_eq!(
+            partner(404),
+            "Model xai/grok-4.7 is not available in project synthetic-project / location us-central1: SYNTHETIC: synthetic upstream text. Check the model ID and that the model is offered in that location (CCP_VERTEX_LOCATION, GOOGLE_CLOUD_LOCATION or vertex.location). Also check that model xai/grok-4.7 is enabled in Model Garden for project synthetic-project in location us-central1 and, for a preview model, that the project has been granted access; the status alone does not say which of these is the cause (upstream HTTP 404)"
+        );
+
+        // Every other status, and an error with no upstream status, is left
+        // as it was.
+        for status in [400, 401, 429, 500] {
+            let plain = VertexError::from_upstream(
+                StatusCode::from_u16(status).unwrap(),
+                detail("synthetic upstream text", "SYNTHETIC"),
+                &target,
+                "xai/grok-4.7",
+            );
+            assert_eq!(
+                plain.clone().with_partner_guidance(&target, "xai/grok-4.7"),
+                plain,
+                "{status}"
+            );
+        }
+        let unreachable = VertexError::unreachable();
+        assert_eq!(
+            unreachable
+                .clone()
+                .with_partner_guidance(&target, "xai/grok-4.7"),
+            unreachable
         );
     }
 }

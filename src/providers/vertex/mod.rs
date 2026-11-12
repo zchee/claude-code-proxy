@@ -287,7 +287,8 @@ impl VertexProvider {
     /// model's target. The target is chosen before credentials are looked
     /// up, so a model that is not served in the configured location gets
     /// its 400, naming the settings, without a credential lookup or an
-    /// upstream call.
+    /// upstream call. A 403 or 404 carries
+    /// [`VertexError::with_partner_guidance`].
     async fn send_partner(
         &self,
         model: &ResolvedModel,
@@ -314,7 +315,11 @@ impl VertexProvider {
                 ctx.traffic.as_deref(),
             )
             .await
-            .map_err(VertexError::into_provider_error)
+            .map_err(|error| {
+                error
+                    .with_partner_guidance(&target, &model.upstream_model)
+                    .into_provider_error()
+            })
     }
 }
 

@@ -234,7 +234,8 @@ fn token_sanitizer(upstream: &VertexResponse) -> Sanitizer {
 }
 
 /// Builds and sends the request. The location comes from the model's rule;
-/// a setting problem is reported before credentials are looked up.
+/// a setting problem is reported before credentials are looked up. A 403 or
+/// 404 carries [`VertexError::with_partner_guidance`].
 async fn start(
     provider: &VertexProvider,
     body: &MessagesRequest,
@@ -275,7 +276,11 @@ async fn start(
             ctx.traffic.as_deref(),
         )
         .await
-        .map_err(VertexError::into_provider_error)?;
+        .map_err(|error| {
+            error
+                .with_partner_guidance(&target, &model.upstream_model)
+                .into_provider_error()
+        })?;
     let sanitize = token_sanitizer(&upstream);
     Ok(Started { upstream, sanitize })
 }
