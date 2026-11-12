@@ -111,8 +111,12 @@ pub const fn method(stream: bool) -> &'static str {
 /// The upstream body: the client's request without `model`, with
 /// [`ANTHROPIC_VERSION`] when it has no `anthropic_version`, with
 /// [`DEFAULT_MAX_TOKENS`] when it has no `max_tokens`, and without the
-/// thinking blocks this proxy signed (see [`is_proxy_signature`]). Every
-/// other field, `stream` included, is the client's.
+/// thinking blocks Claude cannot verify: those this proxy signed (see
+/// [`is_proxy_signature`]) and those with no signature, an empty or
+/// whitespace-only one, or one that is not a string. Other providers behind
+/// this proxy emit thinking blocks with an empty signature. A thinking block
+/// with any other signature, and every `redacted_thinking` block, is sent
+/// unchanged. Every other field, `stream` included, is the client's.
 ///
 /// An assistant message whose content was only such thinking blocks is left
 /// out. The Messages API combines consecutive turns of the same role, so the
@@ -132,31 +136,33 @@ pub fn prepare_request(body: &MessagesRequest) -> Result<Value, serde_json::Erro
             object.insert("max_tokens".to_string(), DEFAULT_MAX_TOKENS.into());
         }
         if let Some(Value::Array(messages)) = object.get_mut("messages") {
-            drop_proxy_thinking(messages);
+            drop_unverifiable_thinking(messages);
         }
     }
     Ok(translated)
 }
 
-/// Removes every thinking block with a signature from this proxy, and every
-/// message that this removal left without content.
-fn drop_proxy_thinking(messages: &mut Vec<Value>) {
+/// Removes every thinking block Claude cannot verify, and every message
+/// that this removal left without content.
+fn drop_unverifiable_thinking(messages: &mut Vec<Value>) {
     messages.retain_mut(|message| {
         let Some(Value::Array(content)) = message.get_mut("content") else {
             return true;
         };
         let before = content.len();
-        content.retain(|block| !is_proxy_thinking(block));
+        content.retain(|block| !is_unverifiable_thinking(block));
         !(content.is_empty() && before > 0)
     });
 }
 
-fn is_proxy_thinking(block: &Value) -> bool {
+/// A thinking block whose signature is missing, not a string, blank, or
+/// made by this proxy.
+fn is_unverifiable_thinking(block: &Value) -> bool {
     block.get("type").and_then(Value::as_str) == Some("thinking")
         && block
             .get("signature")
             .and_then(Value::as_str)
-            .is_some_and(is_proxy_signature)
+            .is_none_or(|signature| signature.trim().is_empty() || is_proxy_signature(signature))
 }
 
 /// Whether this proxy made a thinking signature: it starts with `ccp:`
@@ -654,6 +660,53 @@ mod tests {
                 {"role": "assistant", "content": [
                     {"type": "thinking", "thinking": "claude reasoning", "signature": anthropic},
                     {"type": "redacted_thinking", "data": "synthetic-redacted"},
+                    {"type": "text", "text": "done"}
+                ]}
+            ])
+        );
+    }
+
+    #[test]
+    fn unsigned_thinking_synthetic_is_removed_and_signed_thinking_is_kept() {
+        let anthropic = "ErUBCkYIBRgCIkA+synthetic/AnthropicSignature0123456789==";
+        let body = request(json!({
+            "model": "vertex/anthropic/claude-opus-5-5",
+            "max_tokens": 256,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "grok reasoning", "signature": ""},
+                    {"type": "thinking", "thinking": "no signature field"},
+                    {"type": "thinking", "thinking": "blank signature", "signature": " \t\n"},
+                    {"type": "thinking", "thinking": "null signature", "signature": null},
+                    {"type": "thinking", "thinking": "numeric signature", "signature": 7},
+                    {"type": "text", "text": "first"}
+                ]},
+                {"role": "user", "content": "next"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "only unsigned reasoning", "signature": ""}
+                ]},
+                {"role": "user", "content": "again"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "claude reasoning", "signature": anthropic},
+                    {"type": "redacted_thinking", "data": "synthetic-redacted"},
+                    {"type": "redacted_thinking", "data": ""},
+                    {"type": "text", "text": "done"}
+                ]}
+            ]
+        }));
+        let translated = prepare_request(&body).expect("serialisable");
+        assert_eq!(
+            translated["messages"],
+            json!([
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": [{"type": "text", "text": "first"}]},
+                {"role": "user", "content": "next"},
+                {"role": "user", "content": "again"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "claude reasoning", "signature": anthropic},
+                    {"type": "redacted_thinking", "data": "synthetic-redacted"},
+                    {"type": "redacted_thinking", "data": ""},
                     {"type": "text", "text": "done"}
                 ]}
             ])
