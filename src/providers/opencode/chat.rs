@@ -1771,14 +1771,132 @@ fn push_buffered_strict(translator: &mut LiveStreamTranslator, input: &[u8]) -> 
         if !terminal && translator.is_terminal() {
             terminal = true;
             if input.len() - end > POST_TERMINAL_MAX_BYTES {
-                anyhow::bail!(
-                    "{} stream sent more than {POST_TERMINAL_MAX_BYTES} bytes after its terminal event",
-                    translator.state.provider
-                );
+                return Err(post_terminal_limit_error(translator.state.provider));
             }
         }
     }
     Ok(())
+}
+
+/// The error a strict body gives when more than [`POST_TERMINAL_MAX_BYTES`]
+/// follow its terminal frame.
+fn post_terminal_limit_error(provider: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{provider} stream sent more than {POST_TERMINAL_MAX_BYTES} bytes after its terminal event"
+    )
+}
+
+/// Why [`push_strict_frames`] rejected a chunk.
+enum StrictRejection {
+    /// The translator rejected a frame, with its error.
+    Translation(anyhow::Error),
+    /// More than [`POST_TERMINAL_MAX_BYTES`] followed the terminal frame.
+    PostTerminalLimit,
+}
+
+/// Pushes a chunk of a strict stream through `translator` one frame at a
+/// time. The bytes after the frame that made the stream terminal are
+/// charged to [`POST_TERMINAL_MAX_BYTES`] by position, so a tail counts the
+/// same in the terminal frame's chunk as in later ones. The read window of
+/// `context` starts again at the terminal frame and at a `[DONE]` that
+/// follows it. These are the frame rules of the strict streaming path and
+/// of [`StrictChatObserver`].
+fn push_strict_frames(
+    translator: &mut LiveStreamTranslator,
+    context: &mut ReceiveContext,
+    chunk: &[u8],
+) -> Result<Vec<u8>, StrictRejection> {
+    let RawFrameEnds { continued, ends } = context.raw_frame_ends(chunk);
+    let mut terminal = translator.is_terminal();
+    if terminal && context.charge_after_terminal(chunk, continued) {
+        return Err(StrictRejection::PostTerminalLimit);
+    }
+    let mut output = Vec::new();
+    let mut start = 0;
+    for end in ends.into_iter().chain([chunk.len()]) {
+        if end == start {
+            continue;
+        }
+        let done_before = translator.has_seen_done();
+        match translator.push(&chunk[start..end]) {
+            Ok(translated) => output.extend(translated),
+            Err(error) => return Err(StrictRejection::Translation(error)),
+        }
+        start = end;
+        if !done_before && translator.has_seen_done() {
+            context.start_read_window();
+        }
+        if !terminal && translator.is_terminal() {
+            terminal = true;
+            context.start_read_window();
+            if context.terminal_frame_ended(chunk, end) {
+                return Err(StrictRejection::PostTerminalLimit);
+            }
+        }
+    }
+    Ok(output)
+}
+
+/// The strict frame rules of the streaming path, applied chunk by chunk
+/// while a buffered Chat Completions body is still being read, so that the
+/// reader stops at the frame where the streaming path fails instead of
+/// waiting for the upstream to close or for a terminal event that may
+/// never come.
+///
+/// [`Self::push`] fails at the first frame the strict streaming path
+/// rejects: an SSE frame the decoder cannot read, an event that is not
+/// JSON, an upstream `error` event, more than one choice, a
+/// `finish_reason` that is unknown, reports a content filter or changes,
+/// content after the `finish_reason`, `[DONE]` twice, any event after
+/// `[DONE]`, or more than [`POST_TERMINAL_MAX_BYTES`] after the terminal
+/// frame. The error is the translator's, unsanitised. Under
+/// [`TerminalPolicy::Strict`], [`accumulate_response_with`] over the bytes
+/// read up to the end of the rejected chunk fails with the same error,
+/// sanitised by its wiring, so a reader may stop reading there and let the
+/// accumulator report it. A body that is only incomplete is not rejected:
+/// that is decided when the read ends. Unlike the Responses observer,
+/// nothing settles the body early: the strict translator completes the
+/// message only when the read ends, so a rejection is the only way this
+/// observer ends a read. After an error the observer is not fed again.
+pub struct StrictChatObserver {
+    translator: LiveStreamTranslator,
+    context: ReceiveContext,
+}
+
+impl StrictChatObserver {
+    /// An observer whose errors name `labels.provider`.
+    pub fn new(labels: StreamLabels) -> Self {
+        Self {
+            translator: LiveStreamTranslator::with_wiring(
+                String::new(),
+                String::new(),
+                labels,
+                TerminalPolicy::Strict,
+            ),
+            context: ReceiveContext::new(StreamWiring {
+                labels,
+                receive: ReceivePolicy {
+                    terminal: TerminalPolicy::Strict,
+                    sanitize: None,
+                },
+            }),
+        }
+    }
+
+    /// Checks the next chunk of the body, one frame at a time.
+    ///
+    /// # Errors
+    ///
+    /// The first frame the strict policy rejects, as listed on the type.
+    pub fn push(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
+        match push_strict_frames(&mut self.translator, &mut self.context, chunk) {
+            Ok(_) => Ok(()),
+            Err(StrictRejection::Translation(error)) => Err(error),
+            Err(StrictRejection::PostTerminalLimit) => {
+                Err(post_terminal_limit_error(self.translator.state.provider))
+            }
+        }
+    }
 }
 
 pub fn stream_error(message: &str) -> Vec<u8> {
@@ -2024,44 +2142,19 @@ where
         }
     }
 
-    /// Pushes a chunk of a strict stream one frame at a time. The bytes after
-    /// the frame that made the stream terminal are charged to
-    /// [`POST_TERMINAL_MAX_BYTES`] by position, so a tail counts the same in
-    /// the terminal frame's chunk as in later ones.
+    /// Pushes a chunk of a strict stream with [`push_strict_frames`]; a
+    /// rejection becomes the stage and kind the stream error records.
     fn push_strict(
         &mut self,
         chunk: &[u8],
         context: &mut ReceiveContext,
     ) -> Result<Vec<u8>, (&'static str, &'static str)> {
-        let RawFrameEnds { continued, ends } = context.raw_frame_ends(chunk);
-        let mut terminal = self.translator.is_terminal();
-        if terminal && context.charge_after_terminal(chunk, continued) {
-            return Err(("protocol", "post_terminal_limit"));
-        }
-        let mut output = Vec::new();
-        let mut start = 0;
-        for end in ends.into_iter().chain([chunk.len()]) {
-            if end == start {
-                continue;
-            }
-            let done_before = self.translator.has_seen_done();
-            match self.translator.push(&chunk[start..end]) {
-                Ok(translated) => output.extend(translated),
-                Err(_) => return Err(("translation", "invalid_event")),
-            }
-            start = end;
-            if !done_before && self.translator.has_seen_done() {
-                context.start_read_window();
-            }
-            if !terminal && self.translator.is_terminal() {
-                terminal = true;
-                context.start_read_window();
-                if context.terminal_frame_ended(chunk, end) {
-                    return Err(("protocol", "post_terminal_limit"));
-                }
-            }
-        }
-        Ok(output)
+        push_strict_frames(&mut self.translator, context, chunk).map_err(
+            |rejection| match rejection {
+                StrictRejection::Translation(_) => ("translation", "invalid_event"),
+                StrictRejection::PostTerminalLimit => ("protocol", "post_terminal_limit"),
+            },
+        )
     }
 
     /// Ends a strict stream with the closing events, or with an error event
@@ -3683,6 +3776,120 @@ mod tests {
                 redacted,
                 "redacted {redacted}: {texts:?}"
             );
+        }
+    }
+
+    #[test]
+    fn synthetic_chat_observer_rejects_where_the_whole_body_check_does_in_any_split() {
+        let done = format!("{TEXT_THEN_STOP}data: [DONE]\n\n");
+        let upstream_error = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+            "data: {\"error\":{\"message\":\"overloaded\"}}\n\n",
+            ": keep-alive\n\n",
+        );
+        let content_after_finish = format!(
+            "{TEXT_THEN_STOP}data: {{\"choices\":[{{\"delta\":{{\"content\":\"late\"}}}}]}}\n\n"
+        );
+        let event_after_done = format!("{done}data: {{\"choices\":[]}}\n\n");
+        let done_twice = format!("{done}data: [DONE]\n\n");
+        let changed_finish =
+            format!("{TEXT_THEN_STOP}data: {{\"choices\":[{{\"finish_reason\":\"length\"}}]}}\n\n");
+        let tests = [
+            (
+                "upstream error event",
+                upstream_error.as_bytes().to_vec(),
+                Some("Synthetic Gateway upstream error: overloaded"),
+                Err("Synthetic Gateway upstream error: overloaded"),
+            ),
+            (
+                "event that is not JSON",
+                b"data: {\"choices\":[\n\n: keep-alive\n\n".to_vec(),
+                Some("malformed Synthetic Gateway SSE event"),
+                Err("malformed Synthetic Gateway SSE event"),
+            ),
+            (
+                "frame that is not UTF-8",
+                b"data: \xff\xfe\n\n".to_vec(),
+                Some(
+                    "Synthetic Gateway stream sent an SSE frame that is too large or not valid UTF-8",
+                ),
+                Err(
+                    "Synthetic Gateway stream sent an SSE frame that is too large or not valid UTF-8",
+                ),
+            ),
+            (
+                "content after finish_reason",
+                content_after_finish.into_bytes(),
+                Some("Synthetic Gateway stream sent content after finish_reason"),
+                Err("Synthetic Gateway stream sent content after finish_reason"),
+            ),
+            (
+                "event after [DONE]",
+                event_after_done.into_bytes(),
+                Some("Synthetic Gateway event after [DONE]"),
+                Err("Synthetic Gateway event after [DONE]"),
+            ),
+            (
+                "[DONE] twice",
+                done_twice.into_bytes(),
+                Some("Synthetic Gateway stream sent [DONE] twice"),
+                Err("Synthetic Gateway stream sent [DONE] twice"),
+            ),
+            (
+                "two choices",
+                b"data: {\"choices\":[{\"delta\":{}},{\"delta\":{}}]}\n\n".to_vec(),
+                Some("Synthetic Gateway stream returned multiple choices"),
+                Err("Synthetic Gateway stream returned multiple choices"),
+            ),
+            (
+                "changed finish_reason",
+                changed_finish.into_bytes(),
+                Some("Synthetic Gateway stream changed finish_reason"),
+                Err("Synthetic Gateway stream changed finish_reason"),
+            ),
+            ("complete body", done.into_bytes(), None, Ok(())),
+            (
+                "body without a terminal event",
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n".to_vec(),
+                None,
+                Err("Synthetic Gateway stream ended without [DONE] or finish_reason"),
+            ),
+        ];
+        let accumulate = |bytes: &[u8]| {
+            accumulate_response_with(bytes, "msg", "model", &strict_wiring())
+                .map(drop)
+                .map_err(|error| error.to_string())
+        };
+        for (name, bytes, rejected, whole) in tests {
+            assert_eq!(
+                accumulate(&bytes),
+                whole.map_err(str::to_string),
+                "{name}: the whole-body check"
+            );
+            for split in 0..=bytes.len() {
+                let mut observer = StrictChatObserver::new(SYNTHETIC_LABELS);
+                // The bytes a reader keeps: up to the end of the chunk the
+                // observer rejected, or everything when it rejected nothing.
+                let (outcome, kept) = match observer.push(&bytes[..split]) {
+                    Err(error) => (Some(error.to_string()), split),
+                    Ok(()) => match observer.push(&bytes[split..]) {
+                        Err(error) => (Some(error.to_string()), bytes.len()),
+                        Ok(()) => (None, bytes.len()),
+                    },
+                };
+                assert_eq!(
+                    outcome.as_deref(),
+                    rejected,
+                    "{name}: observer, split at {split}"
+                );
+                if let Some(message) = rejected {
+                    assert_eq!(
+                        accumulate(&bytes[..kept]),
+                        Err(message.to_string()),
+                        "{name}: the body kept at split {split}"
+                    );
+                }
+            }
         }
     }
 }
