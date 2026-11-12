@@ -1339,6 +1339,9 @@ pub struct LiveStreamTranslator {
     state: TranslationState,
     terminal: TerminalPolicy,
     done_seen: bool,
+    /// Whether SSE decoding errors name the provider. OpenCode Go keeps the
+    /// shared decoder's own wording.
+    labelled_decoder_errors: bool,
 }
 
 impl LiveStreamTranslator {
@@ -1358,7 +1361,10 @@ impl LiveStreamTranslator {
     /// Between a `finish_reason` and `[DONE]` only chunks without content
     /// are accepted (usage, or a choice with an empty delta and the same
     /// finish reason); text, reasoning, a tool-call delta or a different
-    /// finish reason there is an error.
+    /// finish reason there is an error. When `labels` are not
+    /// [`StreamLabels::OPENCODE_GO`], an SSE framing error also names
+    /// `labels.provider`, as in `<provider> stream ended with an incomplete
+    /// frame`.
     pub fn with_wiring(
         message_id: String,
         model: String,
@@ -1370,12 +1376,22 @@ impl LiveStreamTranslator {
             state: TranslationState::new(message_id, model, labels.provider),
             terminal,
             done_seen: false,
+            labelled_decoder_errors: labels != StreamLabels::OPENCODE_GO,
         }
     }
 
     pub fn push(&mut self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         let mut out = Vec::new();
-        for event in self.decoder.push(input)? {
+        let events = match self.decoder.push(input) {
+            Ok(events) => events,
+            Err(error) => {
+                return Err(self.decoder_error(
+                    error,
+                    "stream sent an SSE frame that is too large or not valid UTF-8",
+                ));
+            }
+        };
+        for event in events {
             let data = event.data.trim();
             if self.terminal == TerminalPolicy::Strict {
                 if data == "[DONE]" {
@@ -1408,7 +1424,9 @@ impl LiveStreamTranslator {
     }
 
     pub fn finish(&mut self) -> anyhow::Result<Vec<u8>> {
-        self.decoder.finish()?;
+        if let Err(error) = self.decoder.finish() {
+            return Err(self.decoder_error(error, "stream ended with an incomplete frame"));
+        }
         if self.state.finished {
             return Ok(Vec::new());
         }
@@ -1448,6 +1466,16 @@ impl LiveStreamTranslator {
     /// again from `[DONE]` when it follows the `finish_reason`.
     pub fn is_terminal(&self) -> bool {
         self.state.finished || self.done_seen || self.state.pending_stop.is_some()
+    }
+
+    /// `error` from the shared SSE decoder, or `<provider> <labelled>` when
+    /// the labels are not OpenCode Go's.
+    fn decoder_error(&self, error: anyhow::Error, labelled: &str) -> anyhow::Error {
+        if self.labelled_decoder_errors {
+            anyhow::anyhow!("{} {labelled}", self.state.provider)
+        } else {
+            error
+        }
     }
 
     fn has_seen_done(&self) -> bool {
@@ -3053,5 +3081,61 @@ mod tests {
         );
         let response = accumulate_response(upstream.as_bytes(), "msg", "glm-5.2").unwrap();
         assert_eq!(response["content"][0]["text"], "hellolate");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_labels_name_the_provider_in_sse_framing_errors() {
+        let oversized = format!("data: {}\n\n", "x".repeat(1024 * 1024));
+        let tests: [(&str, &[u8], &str); 3] = [
+            (
+                "incomplete frame at the end",
+                b"data: {\"choices\":[]}",
+                "Synthetic Gateway stream ended with an incomplete frame",
+            ),
+            (
+                "frame over the decoder's size limit",
+                oversized.as_bytes(),
+                "Synthetic Gateway stream sent an SSE frame that is too large or not valid UTF-8",
+            ),
+            (
+                "invalid UTF-8",
+                b"data: \xff\n\n",
+                "Synthetic Gateway stream sent an SSE frame that is too large or not valid UTF-8",
+            ),
+        ];
+        for (name, upstream, expected) in tests {
+            for receive in [ReceivePolicy::default(), strict_wiring().receive] {
+                let wiring = StreamWiring {
+                    labels: SYNTHETIC_LABELS,
+                    receive,
+                };
+                let error = accumulate_response_with(upstream, "msg", "model", &wiring)
+                    .unwrap_err()
+                    .to_string();
+                assert_eq!(error, expected, "{name}, {:?}", wiring.receive.terminal);
+
+                let body = stream_body_with(
+                    futures_util::stream::iter([Ok::<Bytes, std::io::Error>(
+                        Bytes::copy_from_slice(upstream),
+                    )]),
+                    "msg".into(),
+                    "model".into(),
+                    None,
+                    "req".into(),
+                    None,
+                    wiring,
+                );
+                let text = body_text(body).await;
+                assert!(
+                    text.contains("Synthetic Gateway stream is invalid"),
+                    "{name}: {text}"
+                );
+                assert!(!text.contains("Grok"), "{name}: {text}");
+            }
+        }
+        let error = accumulate_response(b"data: {\"choices\":[]}", "msg", "model")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "Grok SSE stream ended with an incomplete frame");
     }
 }
