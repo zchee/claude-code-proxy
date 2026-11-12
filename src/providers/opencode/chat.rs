@@ -215,6 +215,12 @@ impl ReceiveContext {
             .ok()
     }
 
+    /// Starts the read window again at the next read, for a terminal event
+    /// that follows an earlier one (`[DONE]` after a `finish_reason`).
+    pub(super) fn restart_read_window(&mut self) {
+        self.read_deadline = None;
+    }
+
     /// Counts bytes read after the terminal event; `true` once they exceed
     /// [`POST_TERMINAL_MAX_BYTES`].
     pub(super) fn exceeds_post_terminal_bytes(&mut self, len: usize) -> bool {
@@ -1351,9 +1357,14 @@ impl LiveStreamTranslator {
     }
 
     /// Whether `[DONE]` or a `finish_reason` has arrived; from then on a
-    /// strict caller reads for at most [`POST_TERMINAL_READ_LIMIT`].
+    /// strict caller reads for at most [`POST_TERMINAL_READ_LIMIT`], counted
+    /// again from `[DONE]` when it follows the `finish_reason`.
     pub fn is_terminal(&self) -> bool {
         self.state.finished || self.done_seen || self.state.pending_stop.is_some()
+    }
+
+    fn has_seen_done(&self) -> bool {
+        self.done_seen
     }
 }
 
@@ -1600,10 +1611,14 @@ where
                 return Some(self.fail_at("protocol", "post_terminal_limit", context));
             }
 
+            let done_before = self.translator.has_seen_done();
             let output = match self.translator.push(&chunk) {
                 Ok(output) => output,
                 Err(_) => return Some(self.fail_at("translation", "invalid_event", context)),
             };
+            if !done_before && self.translator.has_seen_done() {
+                context.restart_read_window();
+            }
             if !output.is_empty() {
                 self.report_progress(&output);
                 self.capture_downstream(&output);
@@ -2568,6 +2583,48 @@ mod tests {
         assert_eq!(
             serde_json::to_value(prepare_request(&req, "deepseek-v4-pro").unwrap()).unwrap(),
             default
+        );
+    }
+
+    fn paced_upstream(
+        steps: Vec<(u64, &'static str)>,
+    ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+        futures_util::stream::unfold(steps.into_iter(), |mut steps| async move {
+            let (delay_ms, part) = steps.next()?;
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            Some((Ok(Bytes::from_static(part.as_bytes())), steps))
+        })
+        .chain(futures_util::stream::pending())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_stream_counts_the_read_window_again_from_a_late_done() {
+        let late = "data: {\"choices\":[],\"cost\":\"0\"}\n\n";
+        let text = body_text(strict_body(paced_upstream(vec![
+            (0, TEXT_THEN_STOP),
+            (1_500, "data: [DONE]\n\n"),
+            (1_500, late),
+        ])))
+        .await;
+        assert!(
+            text.contains("Synthetic Gateway stream is invalid"),
+            "{text}"
+        );
+        assert!(!text.contains("message_stop"), "{text}");
+
+        let started = tokio::time::Instant::now();
+        let text = body_text(strict_body(paced_upstream(vec![
+            (0, TEXT_THEN_STOP),
+            (1_500, "data: [DONE]\n\n"),
+            (2_500, late),
+        ])))
+        .await;
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(1_500) + POST_TERMINAL_READ_LIMIT
+        );
+        assert!(
+            text.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+            "{text}"
         );
     }
 }
