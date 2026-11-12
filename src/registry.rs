@@ -102,6 +102,10 @@ impl Registry {
             "opencode".into(),
             crate::providers::opencode::advertised_models(),
         );
+        models.insert(
+            "vertex".into(),
+            crate::providers::vertex::models::advertised_models(),
+        );
 
         let mut handlers = BTreeMap::new();
         for (name, entries) in &models {
@@ -112,6 +116,7 @@ impl Registry {
                 "grok" => Arc::new(crate::providers::grok::GrokProvider::new()),
                 "muse" => Arc::new(crate::providers::muse::MuseProvider::new()),
                 "opencode" => Arc::new(crate::providers::opencode::OpenCodeProvider::new()),
+                "vertex" => Arc::new(crate::providers::vertex::VertexProvider::new()),
                 _ => Arc::new(PlaceholderProvider::new(name, entries.clone())),
             };
             handlers.insert(name.clone(), handler);
@@ -205,6 +210,11 @@ impl Registry {
         }
         if is_cursor_model(&normalized) {
             return self.handlers.get("cursor").cloned();
+        }
+        // Any `vertex/` name, registered or not: the provider decides whether
+        // it can serve it and answers 400 when it cannot.
+        if normalized.starts_with(crate::providers::vertex::models::MODEL_PREFIX) {
+            return self.handlers.get("vertex").cloned();
         }
 
         for (name, models) in &self.models {
@@ -563,6 +573,71 @@ mod tests {
                 "codex"
             );
         }
+    }
+
+    #[test]
+    fn vertex_models_route_to_vertex_without_stealing_existing_provider_ids() {
+        let registry = Registry::new(AliasProvider::Codex);
+        let advertised = registry.supported_models_for("vertex");
+        assert_eq!(advertised.len(), 18, "{advertised:?}");
+        for model in &advertised {
+            assert_eq!(
+                registry.provider_for_model(model, None).unwrap().name(),
+                "vertex",
+                "{model}"
+            );
+        }
+        for model in [
+            "gemini-3.5-flash",
+            "gemini-3.5-flash[1m]",
+            "vertex/gemini-4-argon",
+            "vertex/google/gemini-3.5-flash",
+            // Not registered: the prefix still routes, and the provider
+            // decides whether it can serve the name.
+            "vertex/gemini-9-unreleased",
+            "vertex/anthropic/claude-sonnet-5",
+        ] {
+            assert_eq!(
+                registry.provider_for_model(model, None).unwrap().name(),
+                "vertex",
+                "{model}"
+            );
+        }
+        // A bare unregistered Gemini ID is not claimed by anyone.
+        assert!(
+            registry
+                .provider_for_model("gemini-9-unreleased", None)
+                .is_none()
+        );
+        // Cursor's Gemini entries keep their prefix.
+        assert_eq!(
+            registry
+                .provider_for_model("cursor:gemini-3.8-flash", None)
+                .unwrap()
+                .name(),
+            "cursor"
+        );
+        for (model, owner) in [
+            ("gpt-6-sol", "codex"),
+            ("kimi-k2.6", "kimi"),
+            ("grok-4.7", "grok"),
+            ("muse-spark-1.3", "muse"),
+            ("kimi-k2.7-code", "opencode"),
+            ("opencode-go/kimi-k2.6", "opencode"),
+            ("cursor:gpt-5.5", "cursor"),
+            ("haiku", "codex"),
+        ] {
+            assert_eq!(
+                registry.provider_for_model(model, None).unwrap().name(),
+                owner,
+                "{model}"
+            );
+        }
+        assert!(
+            registry
+                .list_provider_names()
+                .contains(&"vertex".to_string())
+        );
     }
 
     #[test]

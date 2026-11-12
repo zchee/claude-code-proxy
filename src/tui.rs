@@ -698,6 +698,7 @@ fn provider_cell(value: Option<&str>) -> Cell<'static> {
         "kimi" => Color::Rgb(190, 150, 220),
         "cursor" => Color::Rgb(140, 170, 230),
         "muse" => Color::Rgb(230, 160, 120),
+        "vertex" => Color::Rgb(120, 200, 150),
         "-" => DIM,
         _ => DIM_WHITE,
     };

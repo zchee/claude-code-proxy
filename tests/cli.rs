@@ -787,3 +787,494 @@ fn help_lists_the_muse_command_and_its_auth_actions() -> Result<(), Box<dyn std:
     }
     Ok(())
 }
+
+/// Shaped like a Google OAuth access token.
+const VERTEX_ACCESS_TOKEN: &str =
+    "ya29.synthetic-access-token-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJ";
+const VERTEX_CLIENT_SECRET: &str = "synthetic-client-secret-d41d8cd98f00b204";
+const VERTEX_REFRESH_TOKEN: &str = "1//synthetic-refresh-token-e9800998ecf8427e";
+/// A Gemini thought signature: opaque base64, long enough to be redacted.
+const VERTEX_SIGNATURE: &str =
+    "CiQBVKhc7synthetic0signature0AAAAbbbbCCCCddddEEEEffff0123456789GGGGhhhhIIIIjjjjKKKK==";
+const VERTEX_IMAGE_DATA: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg";
+const VERTEX_EMAIL: &str = "synthetic.person@example.com";
+
+/// Variables that would let a Vertex command find the user's real settings
+/// or credentials.
+const VERTEX_REAL_ENV: &[&str] = &[
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+    "GOOGLE_CLOUD_QUOTA_PROJECT",
+    "GOOGLE_CLOUD_UNIVERSE_DOMAIN",
+    "CLOUDSDK_CONFIG",
+    "CCP_VERTEX_PROJECT",
+    "CCP_VERTEX_LOCATION",
+    "CCP_VERTEX_BASE_URL",
+];
+
+/// A loopback address nothing listens on, so a connection fails at once.
+fn closed_loopback_address() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    address.to_string()
+}
+
+/// Settings for a command that may look up Google credentials: every home,
+/// config and state directory is `home`, and the metadata server is a closed
+/// loopback port, so the command can neither read the user's files nor
+/// contact Google. Apply after removing [`VERTEX_REAL_ENV`].
+fn vertex_isolated_env(home: &std::path::Path) -> Vec<(&'static str, String)> {
+    let home_text = home.display().to_string();
+    vec![
+        ("HOME", home_text.clone()),
+        ("USERPROFILE", home_text.clone()),
+        ("APPDATA", home_text.clone()),
+        ("XDG_STATE_HOME", home.join("state").display().to_string()),
+        ("CCP_CONFIG_DIR", home.join("config").display().to_string()),
+        ("GCE_METADATA_HOST", closed_loopback_address()),
+        ("NO_PROXY", "127.0.0.1,localhost".to_string()),
+        ("no_proxy", "127.0.0.1,localhost".to_string()),
+    ]
+}
+
+fn vertex_command(home: &TempDir, args: &[&str]) -> Command {
+    let mut cmd = Command::cargo_bin("claude-code-proxy").unwrap();
+    cmd.args(args);
+    for name in VERTEX_REAL_ENV {
+        cmd.env_remove(name);
+    }
+    for (name, value) in vertex_isolated_env(home.path()) {
+        cmd.env(name, value);
+    }
+    cmd.timeout(std::time::Duration::from_secs(90));
+    cmd
+}
+
+/// Loopback stand-in for Google's OAuth token endpoint (`POST /token`, which
+/// answers with [`VERTEX_ACCESS_TOKEN`]) and for Vertex AI (every other path,
+/// answered with the next of `answers`: status, content type, body).
+struct VertexFixture {
+    base: String,
+    token_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn vertex_fixture(answers: Vec<(u16, &'static str, String)>) -> VertexFixture {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    let queue = Arc::new(Mutex::new(VecDeque::from(answers)));
+    let token_requests = Arc::new(AtomicUsize::new(0));
+    let counted = token_requests.clone();
+    let token_body = serde_json::json!({
+        "access_token": VERTEX_ACCESS_TOKEN,
+        "token_type": "Bearer",
+        "expires_in": 3600
+    })
+    .to_string();
+    let app = axum::Router::new()
+        .route(
+            "/token",
+            axum::routing::post(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let body = token_body.clone();
+                async move { ([("content-type", "application/json")], body) }
+            }),
+        )
+        .fallback(move || {
+            let next = queue.lock().unwrap().pop_front();
+            async move {
+                let (status, content_type, body) = next.unwrap_or((
+                    500,
+                    "application/json",
+                    r#"{"error":{"code":500,"message":"no scripted answer left","status":"INTERNAL"}}"#
+                        .to_string(),
+                ));
+                (
+                    axum::http::StatusCode::from_u16(status).unwrap(),
+                    [("content-type", content_type)],
+                    body,
+                )
+            }
+        });
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            sender.send(listener.local_addr().unwrap()).unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+    VertexFixture {
+        base: format!("http://{}", receiver.recv().unwrap()),
+        token_requests,
+    }
+}
+
+/// A user credential file in gcloud's format whose token endpoint is the
+/// fixture, so the credential library refreshes against loopback.
+fn write_vertex_credentials(home: &TempDir, fixture: &VertexFixture) -> std::path::PathBuf {
+    let path = home.path().join("synthetic-adc.json");
+    let value = serde_json::json!({
+        "type": "authorized_user",
+        "client_id": "synthetic-client-id.apps.googleusercontent.com",
+        "client_secret": VERTEX_CLIENT_SECRET,
+        "refresh_token": VERTEX_REFRESH_TOKEN,
+        "token_uri": format!("{}/token", fixture.base),
+        "universe_domain": "googleapis.com"
+    });
+    std::fs::write(&path, value.to_string()).unwrap();
+    path
+}
+
+#[test]
+fn vertex_auth_login_and_device_point_at_gcloud() -> Result<(), Box<dyn std::error::Error>> {
+    let home = TempDir::new()?;
+    for action in ["login", "device"] {
+        let output = vertex_command(&home, &["vertex", "auth", action]).output()?;
+        assert_eq!(output.status.code(), Some(2), "{action}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains(
+                "Vertex AI uses Google Application Default Credentials, which the proxy does not store. Run `gcloud auth application-default login`, or set GOOGLE_APPLICATION_CREDENTIALS to a service account key file"
+            ),
+            "{action}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn vertex_auth_logout_says_gcloud_manages_the_credentials() -> Result<(), Box<dyn std::error::Error>>
+{
+    let home = TempDir::new()?;
+    let output = vertex_command(&home, &["vertex", "auth", "logout"]).output()?;
+    // The handler's error leaves `main` as an error: exit 1.
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains(
+            "Vertex AI credentials are managed by gcloud, not by the proxy. Run `gcloud auth application-default revoke` to remove them"
+        ),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn vertex_auth_status_without_a_project_exits_two_and_names_the_settings()
+-> Result<(), Box<dyn std::error::Error>> {
+    let home = TempDir::new()?;
+    let output = vertex_command(&home, &["vertex", "auth", "status"]).output()?;
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains(
+            "Vertex project is not set: set CCP_VERTEX_PROJECT, GOOGLE_CLOUD_PROJECT or vertex.project in config.json"
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Location: global (default)"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn vertex_auth_status_without_credentials_exits_one_with_the_gcloud_command()
+-> Result<(), Box<dyn std::error::Error>> {
+    let home = TempDir::new()?;
+    let output = vertex_command(&home, &["vertex", "auth", "status"])
+        .env("CCP_VERTEX_PROJECT", "synthetic-project")
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("Project: synthetic-project (CCP_VERTEX_PROJECT)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Credential type: metadata server"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Access token obtained: false"), "{stdout}");
+    assert!(stdout.contains("Not authenticated"), "{stdout}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("gcloud auth application-default login"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn vertex_auth_status_synthetic_credentials_file_gets_a_token_and_prints_no_secret()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = vertex_fixture(Vec::new());
+    let home = TempDir::new()?;
+    let credentials = write_vertex_credentials(&home, &fixture);
+    let output = vertex_command(&home, &["vertex", "auth", "status"])
+        .env("GOOGLE_APPLICATION_CREDENTIALS", &credentials)
+        .env("CCP_VERTEX_PROJECT", "synthetic-project")
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "Credentials: {} (GOOGLE_APPLICATION_CREDENTIALS)",
+            credentials.display()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Credential type: authorized_user"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Access token obtained: true"), "{stdout}");
+    assert!(
+        stdout.contains("Endpoint: https://aiplatform.googleapis.com (derived from the location)"),
+        "{stdout}"
+    );
+    for secret in [
+        VERTEX_ACCESS_TOKEN,
+        VERTEX_CLIENT_SECRET,
+        VERTEX_REFRESH_TOKEN,
+    ] {
+        assert!(!stdout.contains(secret), "stdout leaked {secret}: {stdout}");
+        assert!(!stderr.contains(secret), "stderr leaked {secret}: {stderr}");
+    }
+    assert!(
+        fixture
+            .token_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 1
+    );
+    Ok(())
+}
+
+#[test]
+fn help_lists_the_vertex_command_and_its_auth_actions() -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::cargo_bin("claude-code-proxy")?
+        .arg("--help")
+        .output()?;
+    assert!(
+        String::from_utf8(output.stdout)?.contains("Manage Google Cloud Vertex AI credentials")
+    );
+    let output = Command::cargo_bin("claude-code-proxy")?
+        .args(["vertex", "auth", "--help"])
+        .output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    for action in ["login", "device", "status", "logout"] {
+        assert!(stdout.contains(action), "missing {action}: {stdout}");
+    }
+    Ok(())
+}
+
+#[test]
+fn models_lists_vertex_after_opencode_with_its_eighteen_models()
+-> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::cargo_bin("claude-code-proxy")?
+        .args(["models"])
+        .output()?;
+    let out = String::from_utf8(output.stdout)?;
+    let position = |label: &str| {
+        out.find(&format!("\n{label}:"))
+            .or_else(|| out.starts_with(&format!("{label}:")).then_some(0))
+    };
+    let order: Vec<_> = [
+        "codex", "kimi", "grok", "muse", "opencode", "vertex", "cursor",
+    ]
+    .iter()
+    .map(|label| position(label).unwrap_or_else(|| panic!("missing {label}: {out}")))
+    .collect();
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{out}");
+    let vertex = out
+        .lines()
+        .find(|line| line.starts_with("vertex:"))
+        .unwrap();
+    let models: Vec<&str> = vertex
+        .trim_start_matches("vertex:")
+        .split(',')
+        .map(str::trim)
+        .collect();
+    assert_eq!(models.len(), 18, "{vertex}");
+    for model in [
+        "gemini-4-argon",
+        "gemini-4-carbon",
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-pro-preview",
+        "gemini-3-flash-preview",
+    ] {
+        assert!(models.contains(&model), "missing {model}: {vertex}");
+        let prefixed = format!("vertex/{model}");
+        assert!(
+            models.contains(&prefixed.as_str()),
+            "missing {prefixed}: {vertex}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn vertex_server_synthetic_echoed_secrets_leak_nothing_into_logs_or_captures()
+-> Result<(), Box<dyn std::error::Error>> {
+    let echo = format!(
+        "token {VERTEX_ACCESS_TOKEN} signature {VERTEX_SIGNATURE} image {VERTEX_IMAGE_DATA} owner {VERTEX_EMAIL}"
+    );
+    let http_error = serde_json::json!({
+        "error": {"code": 400, "message": echo, "status": "INVALID_ARGUMENT",
+                  "details": [{"@type": "type.googleapis.com/google.rpc.DebugInfo", "detail": echo}]}
+    })
+    .to_string();
+    let partial = serde_json::json!({
+        "candidates": [{"content": {"role": "model", "parts": [{"text": "partial"}]}}]
+    });
+    let stream_error = serde_json::json!({
+        "error": {"code": 500, "message": echo, "status": "INTERNAL"}
+    });
+    let stream_error = format!("data: {partial}\n\ndata: {stream_error}\n\n");
+    let blocked = serde_json::json!({
+        "candidates": [{"content": {"role": "model", "parts": []}, "finishReason": "SAFETY", "finishMessage": echo}]
+    });
+    let blocked = format!("data: {partial}\n\ndata: {blocked}\n\n");
+    let sse = "text/event-stream";
+    let fixture = vertex_fixture(vec![
+        (400, "application/json", http_error),
+        (200, sse, stream_error.clone()),
+        (200, sse, stream_error),
+        (200, sse, blocked.clone()),
+        (200, sse, blocked),
+    ]);
+
+    let home = TempDir::new()?;
+    let credentials = write_vertex_credentials(&home, &fixture);
+    let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"));
+    command.args(["serve", "--no-monitor", "--port", &port.to_string()]);
+    for name in VERTEX_REAL_ENV {
+        command.env_remove(name);
+    }
+    for (name, value) in vertex_isolated_env(home.path()) {
+        command.env(name, value);
+    }
+    let child = command
+        .env("GOOGLE_APPLICATION_CREDENTIALS", &credentials)
+        .env("CCP_VERTEX_PROJECT", "synthetic-project")
+        .env("CCP_VERTEX_BASE_URL", &fixture.base)
+        .env("CCP_TRAFFIC_LOG", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut child = ChildGuard(child);
+    drop(wait_for_service(&mut child, port)?);
+
+    // The request carries the same image and a signed tool call, so the
+    // request captures are checked as well as the error paths.
+    let envelope = format!("ccp:vertex:v1:gemini-3.5-flash:{VERTEX_SIGNATURE}");
+    let mut downstream = String::new();
+    for stream in [false, false, true, false, true] {
+        let body = serde_json::json!({
+            "model": "gemini-3.5-flash",
+            "max_tokens": 64,
+            "stream": stream,
+            "tools": [{"name": "read_file", "input_schema": {"type": "object"}}],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Look at this"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": VERTEX_IMAGE_DATA}}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "", "signature": envelope},
+                    {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "a.rs"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "fn a() {}"}
+                ]}
+            ]
+        })
+        .to_string();
+        downstream.push_str(&post_raw(port, &body)?);
+    }
+    thread::sleep(Duration::from_millis(500));
+    child.0.kill()?;
+    child.0.wait()?;
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.0.stderr.take() {
+        pipe.read_to_string(&mut stderr)?;
+    }
+
+    // The scan below is only meaningful if every path was exercised.
+    assert_eq!(
+        downstream.matches("HTTP/1.1 200").count(),
+        2,
+        "{downstream}"
+    );
+    assert!(downstream.contains("event: error"), "{downstream}");
+    assert!(downstream.contains("finishReason SAFETY"), "{downstream}");
+    assert!(downstream.contains("[redacted]"), "{downstream}");
+    let state_dir = home.path().join("state").join("claude-code-proxy");
+    let log = std::fs::read_to_string(state_dir.join("proxy.log"))?;
+    assert_eq!(log.matches("\"request_failed\"").count(), 3, "{log}");
+    assert!(log.contains("[redacted]"), "{log}");
+    let errors = std::fs::read_dir(state_dir.join("errors"))?.count();
+    assert_eq!(errors, 3);
+    let mut names = Vec::new();
+    let mut pending = vec![state_dir.join("traffic")];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    for expected in [
+        "020-upstream-request.json",
+        "061-vertex-buffered-summary.json",
+        "061-vertex-stream-summary.json",
+    ] {
+        assert!(
+            names.iter().any(|name| name.ends_with(expected)),
+            "missing {expected}: {names:?}"
+        );
+    }
+    assert!(
+        fixture
+            .token_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 1
+    );
+
+    let files = all_files_text(&state_dir);
+    for (place, text) in [
+        ("state files", &files),
+        ("stderr", &stderr),
+        ("responses", &downstream),
+    ] {
+        for secret in [
+            VERTEX_ACCESS_TOKEN,
+            VERTEX_CLIENT_SECRET,
+            VERTEX_REFRESH_TOKEN,
+            VERTEX_SIGNATURE,
+            VERTEX_IMAGE_DATA,
+            VERTEX_EMAIL,
+            "@example.com",
+        ] {
+            assert!(!text.contains(secret), "{place} leaked {secret}: {text}");
+        }
+    }
+    Ok(())
+}
