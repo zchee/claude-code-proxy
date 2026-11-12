@@ -5,3 +5,4 @@ pub mod kimi;
 pub mod muse;
 pub mod opencode;
 pub mod translate_shared;
+pub mod vertex;
