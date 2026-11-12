@@ -348,8 +348,12 @@ where
                 let value: serde_json::Value =
                     serde_json::from_str(&event.data).map_err(|_| ("json", "malformed_event"))?;
                 if let Some(capture) = self.stream_capture.as_mut() {
-                    capture
-                        .upstream_event(event.event.as_deref(), &context.captured_upstream(&value));
+                    capture.upstream_event(
+                        context
+                            .captured_event_name(event.event.as_deref())
+                            .as_deref(),
+                        &context.captured_upstream(&value),
+                    );
                 }
                 let kind = value.get("type").and_then(serde_json::Value::as_str);
                 if event.event.as_deref() == Some("error") || kind == Some("error") {
@@ -413,7 +417,10 @@ where
                 .or(output_tokens);
             if let Some(capture) = self.stream_capture.as_mut() {
                 capture.downstream_event(
-                    event.event.as_deref().unwrap_or("message"),
+                    context
+                        .captured_event_name(event.event.as_deref())
+                        .as_deref()
+                        .unwrap_or("message"),
                     context.captured_upstream(&value).into_owned(),
                 );
             }
@@ -436,7 +443,12 @@ where
             self.stream_capture.as_mut(),
             serde_json::from_str::<serde_json::Value>(&event.data),
         ) {
-            capture.upstream_event(event.event.as_deref(), &context.captured_upstream(&value));
+            capture.upstream_event(
+                context
+                    .captured_event_name(event.event.as_deref())
+                    .as_deref(),
+                &context.captured_upstream(&value),
+            );
         }
     }
 

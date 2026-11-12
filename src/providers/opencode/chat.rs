@@ -150,7 +150,8 @@ pub struct RedactedWiring {
 }
 
 /// A copy of `value` with every string, at any depth, passed through
-/// `redact`. Object keys are kept as they are.
+/// `redact`: string values and object keys alike. When two keys of one
+/// object become the same key, only one of their values is kept.
 pub fn redact_every_string(value: &Value, redact: &dyn Fn(&str) -> String) -> Value {
     match value {
         Value::String(text) => Value::String(redact(text)),
@@ -163,7 +164,7 @@ pub fn redact_every_string(value: &Value, redact: &dyn Fn(&str) -> String) -> Va
         Value::Object(object) => Value::Object(
             object
                 .iter()
-                .map(|(key, item)| (key.clone(), redact_every_string(item, redact)))
+                .map(|(key, item)| (redact(key), redact_every_string(item, redact)))
                 .collect(),
         ),
         other => other.clone(),
@@ -274,6 +275,16 @@ impl ReceiveContext {
         match self.redact.as_ref() {
             Some(redact) if self.redacts() => Cow::Owned(redact_every_string(&value, &**redact)),
             _ => value,
+        }
+    }
+
+    /// The SSE event name of an upstream frame, or of a frame passed
+    /// through to the client, as a traffic capture records it: unchanged,
+    /// or, for a strict stream with a redactor, through the redactor.
+    pub(super) fn captured_event_name<'a>(&self, name: Option<&'a str>) -> Option<Cow<'a, str>> {
+        match (name, self.redact.as_ref()) {
+            (Some(name), Some(redact)) if self.redacts() => Some(Cow::Owned(redact(name))),
+            (name, _) => name.map(Cow::Borrowed),
         }
     }
 
@@ -2102,11 +2113,20 @@ where
         for event in events {
             match serde_json::from_str(&event.data) {
                 Ok(value) => {
-                    capture
-                        .upstream_event(event.event.as_deref(), &context.captured_upstream(&value));
+                    capture.upstream_event(
+                        context
+                            .captured_event_name(event.event.as_deref())
+                            .as_deref(),
+                        &context.captured_upstream(&value),
+                    );
                 }
                 Err(_) if event.data.trim() == "[DONE]" => {
-                    capture.upstream_event(event.event.as_deref(), &json!("[DONE]"));
+                    capture.upstream_event(
+                        context
+                            .captured_event_name(event.event.as_deref())
+                            .as_deref(),
+                        &json!("[DONE]"),
+                    );
                 }
                 Err(_) => capture.malformed("json", "malformed_event"),
             }
@@ -3566,6 +3586,100 @@ mod tests {
             );
             assert_eq!(
                 texts.iter().any(|text| text.contains("echo [gone]")),
+                redacted,
+                "redacted {redacted}: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn synthetic_redactor_reaches_object_keys_and_event_names_of_a_strict_stream_only() {
+        let value: Value = serde_json::from_str(&format!(
+            "{{\"{SYNTHETIC_SECRET}\":{{\"items\":[{{\"key {SYNTHETIC_SECRET}\":\"value {SYNTHETIC_SECRET}\"}}]}},\"kept\":1}}"
+        ))
+        .unwrap();
+        let redact = |text: &str| text.replace(SYNTHETIC_SECRET, "[gone]");
+        assert_eq!(
+            redact_every_string(&value, &redact),
+            json!({"[gone]":{"items":[{"key [gone]":"value [gone]"}]},"kept":1})
+        );
+
+        let name = format!("event {SYNTHETIC_SECRET}");
+        let strict = ReceiveContext::redacted(synthetic_redactor());
+        assert_eq!(
+            strict.captured_event_name(Some(&name)).as_deref(),
+            Some("event [gone]")
+        );
+        assert_eq!(strict.captured_event_name(None), None);
+        assert_eq!(
+            strict.captured_upstream(&value).into_owned(),
+            json!({"[gone]":{"items":[{"key [gone]":"value [gone]"}]},"kept":1})
+        );
+
+        // Without the strict policy the redactor is never applied, and the
+        // name is borrowed as it was.
+        let default_policy = ReceiveContext::redacted(RedactedWiring {
+            wiring: StreamWiring::default(),
+            redact: synthetic_redactor().redact,
+        });
+        for context in [default_policy, ReceiveContext::default()] {
+            assert!(
+                matches!(
+                    context.captured_event_name(Some(&name)),
+                    Some(Cow::Borrowed(kept)) if kept == name
+                ),
+                "{name}"
+            );
+            assert!(matches!(
+                context.captured_upstream(&value),
+                Cow::Borrowed(_)
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_strict_redacted_capture_takes_the_secret_out_of_event_names_and_keys() {
+        let wire = format!(
+            "event: {SYNTHETIC_SECRET}\ndata: {{\"choices\":[{{\"delta\":{{\"content\":\"hi\"}}}}],\"{SYNTHETIC_SECRET}\":1}}\n\ndata: {{\"choices\":[{{\"finish_reason\":\"stop\"}}]}}\n\nevent: {SYNTHETIC_SECRET}\ndata: [DONE]\n\n"
+        );
+        for redacted in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("traffic");
+            let traffic = Some(Arc::new(crate::traffic::test_capture(root.clone())));
+            let upstream = futures_util::stream::iter(chunks(&[&wire]));
+            let body = if redacted {
+                stream_body_redacted(
+                    upstream,
+                    "msg_strict".into(),
+                    "synthetic-model".into(),
+                    None,
+                    "req".into(),
+                    traffic,
+                    synthetic_redactor(),
+                )
+            } else {
+                stream_body_with(
+                    upstream,
+                    "msg_strict".into(),
+                    "synthetic-model".into(),
+                    None,
+                    "req".into(),
+                    traffic,
+                    strict_wiring(),
+                )
+            };
+            body_text(body).await;
+            // The secret is only in event names and a key, so a capture
+            // that keeps it got it from one of them.
+            let texts = synthetic_capture_texts(&root);
+            assert!(!texts.is_empty(), "redacted {redacted}");
+            assert_eq!(
+                texts.iter().any(|text| text.contains(SYNTHETIC_SECRET)),
+                !redacted,
+                "redacted {redacted}: {texts:?}"
+            );
+            assert_eq!(
+                texts.iter().any(|text| text.contains("[gone]")),
                 redacted,
                 "redacted {redacted}: {texts:?}"
             );

@@ -757,14 +757,24 @@ where
             }
             self.done_seen = true;
             if let Some(capture) = self.stream_capture.as_mut() {
-                capture.upstream_event(event.event.as_deref(), &serde_json::json!("[DONE]"));
+                capture.upstream_event(
+                    context
+                        .captured_event_name(event.event.as_deref())
+                        .as_deref(),
+                    &serde_json::json!("[DONE]"),
+                );
             }
             return Ok(());
         }
         let value: serde_json::Value =
             serde_json::from_str(data).map_err(|_| ("json", "malformed_event"))?;
         if let Some(capture) = self.stream_capture.as_mut() {
-            capture.upstream_event(event.event.as_deref(), &context.captured_upstream(&value));
+            capture.upstream_event(
+                context
+                    .captured_event_name(event.event.as_deref())
+                    .as_deref(),
+                &context.captured_upstream(&value),
+            );
         }
         if self.pending_completion.is_some() {
             return Err(("protocol", "event_after_completion"));
