@@ -341,7 +341,7 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
 fn print_models(registry: &Registry, full: bool) {
     let grouped = registry.grouped_models();
     for provider in [
-        "codex", "kimi", "grok", "muse", "opencode", "vertex", "cursor",
+        "codex", "kimi", "grok", "muse", "opencode", "vertex", "cursor", "local",
     ] {
         let Some(models) = grouped.get(provider) else {
             continue;

@@ -126,6 +126,11 @@ impl Registry {
             handlers.insert(name.clone(), handler);
         }
 
+        if let Some(local) = crate::providers::local::LocalProvider::configured() {
+            models.insert(local.name().into(), local.supported_models());
+            handlers.insert(local.name().into(), Arc::new(local));
+        }
+
         Self {
             alias_provider,
             dynamic_codex: true,

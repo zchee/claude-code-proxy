@@ -1,7 +1,7 @@
 # claude-code-proxy
 
 Claude Code, powered by **OpenAI Codex**, **Kimi**, **Grok**, **Muse**,
-**OpenCode Go**, **Vertex AI**, or **Cursor Agent**.
+**OpenCode Go**, **Vertex AI**, **Cursor Agent**, or a local **GGUF** model.
 
 Docs: <https://claude-code-proxy.raine.dev>
 
@@ -103,6 +103,7 @@ The opt-in Images API returns base64 image data and consumes the signed-in accou
 | OpenCode Go  | OpenCode Go subscription       | Non-conflicting IDs and `opencode-go/<model-id>` |
 | Vertex AI    | Google Cloud project           | Registered `gemini-*` models, `vertex/<model-id>`, `vertex/<publisher>/<model-id>` |
 | Cursor Agent | Cursor account                 | Cursor aliases and `cursor:<model-id>` prefixes |
+| Local GGUF   | Local llama.cpp server         | `local/gguf` when `CCP_LLAMA_PORT` is set       |
 
 Run `claude-code-proxy models` for the current catalog or
 `claude-code-proxy models --full` for every dynamic Cursor alias.
@@ -113,6 +114,37 @@ Run `claude-code-proxy models` for the current catalog or
 > authenticating reverse proxy. Provider subscriptions, model access, terms,
 > and account enforcement remain under each provider's control. Unofficial
 > clients may carry account risk.
+
+## Run a Hugging Face GGUF model locally
+
+Install a recent llama.cpp build with `llama-server`. Download a GGUF
+instruction model with a tool-capable chat template from Hugging Face.
+Choose a quantization and context size that fit your machine. Start the
+model and the proxy in separate terminals:
+
+```sh
+llama-server -m /path/to/model.gguf --alias gguf --jinja --host 127.0.0.1 --port 8080
+```
+
+```sh
+CCP_LLAMA_PORT=8080 claude-code-proxy serve
+```
+
+Then start Claude Code in a third terminal. These model settings also route
+its standard model tiers and subagents to the local server:
+
+```sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:18765 ANTHROPIC_AUTH_TOKEN=local
+export ANTHROPIC_MODEL=local/gguf ANTHROPIC_SMALL_FAST_MODEL=local/gguf
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=local/gguf ANTHROPIC_DEFAULT_SONNET_MODEL=local/gguf
+export ANTHROPIC_DEFAULT_OPUS_MODEL=local/gguf CLAUDE_CODE_SUBAGENT_MODEL=local/gguf
+claude
+```
+
+The proxy lists `local/gguf` when `CCP_LLAMA_PORT` is set. It forwards Anthropic
+messages, streams, and token counts over loopback. Model inference needs no
+Hugging Face token. Explicit model overrides, including a configured
+`autoReviewModel`, still use their selected provider.
 
 ## Documentation
 
