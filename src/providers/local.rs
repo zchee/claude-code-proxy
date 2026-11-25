@@ -3,17 +3,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use axum::{
-    body::Body,
-    http::{StatusCode, header::CONTENT_TYPE},
-    response::Response,
-};
+use axum::{http::StatusCode, response::Response};
 use reqwest::Client;
-use serde_json::Value;
 
 use crate::{
     anthropic::{json_error, schema::MessagesRequest},
     provider::{CliHandlers, Provider, RequestContext},
+    providers::anthropic_passthrough,
 };
 
 const PUBLIC_MODEL: &str = "local/gguf";
@@ -44,12 +40,7 @@ impl LocalProvider {
         Self { upstream }
     }
 
-    async fn forward(
-        &self,
-        mut body: MessagesRequest,
-        ctx: RequestContext,
-        path: &str,
-    ) -> Response {
+    async fn forward(&self, body: MessagesRequest, ctx: RequestContext, path: &str) -> Response {
         let (client, port) = match &self.upstream {
             Ok(upstream) => upstream,
             Err(error) => {
@@ -60,51 +51,15 @@ impl LocalProvider {
                 );
             }
         };
-        body.model = Some(LLAMA_ALIAS.into());
-        let mut payload = serde_json::json!(body);
-        // llama-server's token counter expects omitted optional fields, not null.
-        if body.max_tokens.is_none()
-            && let Value::Object(fields) = &mut payload
-        {
-            fields.remove("max_tokens");
-        }
-        if let Some(monitor) = &ctx.monitor {
-            monitor.model_resolved(&ctx.req_id, LLAMA_ALIAS);
-            monitor.upstream_started(&ctx.req_id);
-        }
         let url = format!("http://127.0.0.1:{port}/v1/messages{path}");
-        let upstream = match client
-            .post(url)
-            .header("anthropic-version", "2023-06-01")
-            .json(&payload)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                return json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    format!("Could not reach local llama-server on port {port}: {error}"),
-                );
-            }
-        };
-        if upstream.status().is_redirection() {
-            return json_error(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                "Local llama-server returned a redirect",
-            );
-        }
-        let mut response = Response::new(Body::empty());
-        *response.status_mut() = upstream.status();
-        if let Some(content_type) = upstream.headers().get(CONTENT_TYPE) {
-            response
-                .headers_mut()
-                .insert(CONTENT_TYPE, content_type.clone());
-        }
-        *response.body_mut() = Body::from_stream(upstream.bytes_stream());
-        response
+        anthropic_passthrough::forward(
+            client.post(url),
+            body,
+            LLAMA_ALIAS,
+            &ctx,
+            &format!("local llama-server on port {port}"),
+        )
+        .await
     }
 }
 
@@ -153,9 +108,14 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use axum::{Json, Router, http::Request, routing::post};
+    use axum::{
+        Json, Router,
+        body::Body,
+        http::{Request, header::CONTENT_TYPE},
+        routing::post,
+    };
     use http_body_util::BodyExt;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tower::ServiceExt;
 
     #[tokio::test]

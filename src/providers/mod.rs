@@ -1,3 +1,4 @@
+pub(crate) mod anthropic_passthrough;
 pub mod codex;
 pub mod cursor;
 pub mod grok;
