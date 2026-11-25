@@ -1,7 +1,7 @@
 use crate::{
     anthropic::{json_error, schema::MessagesRequest},
     config::AliasProvider,
-    provider::{CliHandlers, Provider, RequestContext},
+    provider::{CatalogNote, CliHandlers, Provider, RequestContext},
     providers::codex::translate::model_allowlist::tier_model_variants,
 };
 use anyhow::{Result, anyhow};
@@ -130,6 +130,10 @@ impl Registry {
             models.insert(local.name().into(), local.supported_models());
             handlers.insert(local.name().into(), Arc::new(local));
         }
+        // Listed live from the running server, so it has no entry in `models`.
+        if let Some(lmstudio) = crate::providers::lmstudio::LmStudioProvider::configured() {
+            handlers.insert(lmstudio.name().into(), Arc::new(lmstudio));
+        }
 
         Self {
             alias_provider,
@@ -151,7 +155,9 @@ impl Registry {
         let mut handlers = BTreeMap::new();
         for provider in providers {
             let name = provider.name().to_string();
-            models.insert(name.clone(), provider.supported_models());
+            if !provider.has_live_catalog() {
+                models.insert(name.clone(), provider.supported_models());
+            }
             handlers.insert(name, provider);
         }
         Self {
@@ -175,8 +181,14 @@ impl Registry {
     pub fn supported_models_for(&self, provider: &str) -> Vec<String> {
         let mut models = if self.dynamic_codex && provider == "codex" {
             expand_codex_models()
+        } else if let Some(models) = self.models.get(provider) {
+            models.clone()
         } else {
-            self.models.get(provider).cloned().unwrap_or_default()
+            // A live catalog: whatever the provider read last.
+            self.handlers
+                .get(provider)
+                .map(|handler| handler.supported_models())
+                .unwrap_or_default()
         };
         if provider == self.alias_provider.as_str() {
             for alias in ANTHROPIC_STYLE_ALIASES {
@@ -187,6 +199,28 @@ impl Registry {
         }
         models.sort_unstable();
         models
+    }
+
+    /// Re-reads every live catalog and returns, per provider, why one could
+    /// not be read or what to know about the models it listed. A provider
+    /// that failed lists no models until it is read again.
+    pub async fn refresh_live_catalogs(&self) -> BTreeMap<String, CatalogNote> {
+        let mut notes = BTreeMap::new();
+        for (name, handler) in &self.handlers {
+            if !handler.has_live_catalog() {
+                continue;
+            }
+            match handler.refresh_models().await {
+                Ok(None) => {}
+                Ok(Some(caveat)) => {
+                    notes.insert(name.clone(), CatalogNote::Caveat(caveat));
+                }
+                Err(error) => {
+                    notes.insert(name.clone(), CatalogNote::Unavailable(error));
+                }
+            }
+        }
+        notes
     }
 
     pub fn all_supported_models(&self) -> Vec<(String, String)> {
@@ -224,6 +258,11 @@ impl Registry {
         // it can serve it and answers 400 when it cannot.
         if normalized.starts_with(crate::providers::vertex::models::MODEL_PREFIX) {
             return self.handlers.get("vertex").cloned();
+        }
+        // Any `lmstudio/` name: LM Studio loads a downloaded model on its
+        // first request and answers for one it does not have.
+        if normalized.starts_with(crate::providers::lmstudio::MODEL_PREFIX) {
+            return self.handlers.get("lmstudio").cloned();
         }
 
         for (name, models) in &self.models {

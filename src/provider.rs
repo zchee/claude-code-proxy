@@ -27,6 +27,23 @@ pub enum AuthCommand {
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
     fn supported_models(&self) -> Vec<String>;
+
+    /// True when `supported_models` reads a catalog that changes while the
+    /// proxy runs, such as the models downloaded into a local server. The
+    /// registry then asks the provider each time instead of keeping the
+    /// list it saw at startup, and routes the provider's models by prefix.
+    fn has_live_catalog(&self) -> bool {
+        false
+    }
+
+    /// Re-reads a live catalog. `Ok(Some(note))` means models were listed
+    /// but the operator should know something about them, such as a server
+    /// that must be started before they can be used. The error is a message
+    /// for the operator, such as an upstream that is not running.
+    async fn refresh_models(&self) -> std::result::Result<Option<String>, String> {
+        Ok(None)
+    }
+
     fn cli(&self) -> &'static dyn CliHandlers;
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response;
 
@@ -56,6 +73,15 @@ pub trait Provider: Send + Sync {
             ),
         ))
     }
+}
+
+/// What a live catalog read left the operator to know, per provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogNote {
+    /// No models could be listed, and why.
+    Unavailable(String),
+    /// Models were listed, with a caveat about using them.
+    Caveat(String),
 }
 
 pub enum GenerationBody {

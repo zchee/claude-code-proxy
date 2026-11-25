@@ -1,7 +1,8 @@
 # claude-code-proxy
 
 Claude Code, powered by **OpenAI Codex**, **Kimi**, **Grok**, **Muse**,
-**OpenCode Go**, **Vertex AI**, **Cursor Agent**, or a local **GGUF** model.
+**OpenCode Go**, **Vertex AI**, **Cursor Agent**, **LM Studio**, or a local
+**GGUF** model.
 
 Docs: <https://claude-code-proxy.raine.dev>
 
@@ -104,6 +105,7 @@ The opt-in Images API returns base64 image data and consumes the signed-in accou
 | Vertex AI    | Google Cloud project           | Registered `gemini-*` models, `vertex/<model-id>`, `vertex/<publisher>/<model-id>` |
 | Cursor Agent | Cursor account                 | Cursor aliases and `cursor:<model-id>` prefixes |
 | Local GGUF   | Local llama.cpp server         | `local/gguf` when `CCP_LLAMA_PORT` is set       |
+| LM Studio    | LM Studio 0.4.1+ local server  | `lmstudio/<model key>`, listed live from LM Studio |
 
 Run `claude-code-proxy models` for the current catalog or
 `claude-code-proxy models --full` for every dynamic Cursor alias.
@@ -145,6 +147,25 @@ The proxy lists `local/gguf` when `CCP_LLAMA_PORT` is set. It forwards Anthropic
 messages, streams, and token counts over loopback. Model inference needs no
 Hugging Face token. Explicit model overrides, including a configured
 `autoReviewModel`, still use their selected provider.
+
+## Use the models downloaded into LM Studio
+
+The proxy lists every LLM downloaded into LM Studio on this machine as
+`lmstudio/<model key>`, without configuration. It reads LM Studio's server
+on port 1234, or, while that server is stopped, the models on disk through
+`lms ls`:
+
+```sh
+claude-code-proxy models
+```
+
+Start the server with `lms server start`, then select a model with
+`ANTHROPIC_MODEL=lmstudio/<model key>`. Requests go to LM
+Studio's Anthropic-compatible `/v1/messages` unchanged. Set
+`CCP_LMSTUDIO_API_KEY` when the server requires authentication,
+`CCP_LMSTUDIO_BASE_URL` for another address, or `CCP_LMSTUDIO_ENABLED=0` to
+turn the provider off. See
+[LM Studio](https://claude-code-proxy.raine.dev/providers/lmstudio/).
 
 ## Documentation
 

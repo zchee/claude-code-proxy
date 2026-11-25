@@ -47,6 +47,16 @@ struct FileConfig {
     pub muse: Option<MuseConfig>,
     pub opencode: Option<OpenCodeConfig>,
     pub vertex: Option<VertexConfig>,
+    pub lmstudio: Option<LmStudioConfig>,
+}
+
+#[derive(Deserialize, Clone)]
+struct LmStudioConfig {
+    pub enabled: Option<bool>,
+    #[serde(rename = "baseUrl")]
+    pub base_url: Option<String>,
+    #[serde(rename = "apiKey")]
+    pub api_key: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -356,6 +366,17 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     }
     if env.contains_key("CCP_OPENCODE_BASE_URL") {
         out.push("opencode.baseUrl (env)".to_string());
+    }
+    if env.contains_key("CCP_LMSTUDIO_ENABLED") {
+        out.push("lmstudio.enabled (env)".to_string());
+    }
+    if env.contains_key("CCP_LMSTUDIO_BASE_URL") {
+        out.push("lmstudio.baseUrl (env)".to_string());
+    }
+    if env.contains_key("CCP_LMSTUDIO_API_KEY") {
+        out.push("lmstudio.apiKey (env)".to_string());
+    } else if env.contains_key("LM_API_TOKEN") {
+        out.push("lmstudio.apiKey (LM Studio env)".to_string());
     }
     for (key, setting) in vertex_settings {
         match setting.map(|setting| setting.source) {
@@ -2062,6 +2083,109 @@ pub fn cursor_agent_bundle() -> Option<String> {
         return Some(bundle);
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// LM Studio config
+// ---------------------------------------------------------------------------
+
+/// Where LM Studio's local server listens when nothing else is configured.
+pub const LMSTUDIO_DEFAULT_BASE_URL: &str = "http://127.0.0.1:1234";
+
+/// The LM Studio server the proxy lists models from and sends requests to.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LmStudioSettings {
+    /// Scheme, host and port only, without a trailing slash.
+    pub base_url: String,
+    /// The token LM Studio asks for when "Require Authentication" is on.
+    pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for LmStudioSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LmStudioSettings")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// The LM Studio settings of this process, or `None` when the provider is
+/// turned off. A setting that is present but invalid is an error naming it.
+pub fn lmstudio_settings() -> Option<anyhow::Result<LmStudioSettings>> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    resolve_lmstudio_settings(&env, &paths::config_dir())
+}
+
+/// Resolves the LM Studio settings with env over config.json over the
+/// defaults. Blank values count as unset, as for the other providers.
+pub fn resolve_lmstudio_settings(
+    env: &HashMap<String, String>,
+    config_dir: &Path,
+) -> Option<anyhow::Result<LmStudioSettings>> {
+    let file = read_file_config(config_dir).and_then(|file| file.lmstudio);
+    let set = |raw: &String| {
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+
+    let env_enabled = env.get("CCP_LMSTUDIO_ENABLED").and_then(|raw| {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    });
+    let enabled = env_enabled
+        .or_else(|| file.as_ref().and_then(|file| file.enabled))
+        .unwrap_or(true);
+    if !enabled {
+        return None;
+    }
+
+    let (base_url, setting) = match env.get("CCP_LMSTUDIO_BASE_URL").and_then(set) {
+        Some(value) => (value, "CCP_LMSTUDIO_BASE_URL".to_string()),
+        None => match file
+            .as_ref()
+            .and_then(|file| file.base_url.as_ref())
+            .and_then(set)
+        {
+            Some(value) => (value, "lmstudio.baseUrl in config.json".to_string()),
+            None => (LMSTUDIO_DEFAULT_BASE_URL.to_string(), String::new()),
+        },
+    };
+    let base_url = match lmstudio_origin(&base_url) {
+        Ok(origin) => origin,
+        Err(reason) => {
+            return Some(Err(anyhow::anyhow!(
+                "Invalid LM Studio setting {setting}: {reason}"
+            )));
+        }
+    };
+
+    // LM_API_TOKEN is the variable LM Studio's own documentation uses.
+    let api_key = env
+        .get("CCP_LMSTUDIO_API_KEY")
+        .and_then(set)
+        .or_else(|| env.get("LM_API_TOKEN").and_then(set))
+        .or_else(|| {
+            file.as_ref()
+                .and_then(|file| file.api_key.as_ref())
+                .and_then(set)
+        });
+    Some(Ok(LmStudioSettings { base_url, api_key }))
+}
+
+/// Accepts the URL of an LM Studio server and returns its origin. The URL may
+/// carry an API key, so it follows the same rule as the other token
+/// endpoints: https, or plain http only to a loopback host.
+fn lmstudio_origin(value: &str) -> Result<String, &'static str> {
+    validate_token_endpoint(value)?;
+    let url = url::Url::parse(value).map_err(|_| "not a valid URL")?;
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Err("must be a scheme, a host and a port only, without a path such as /v1");
+    }
+    Ok(url.origin().ascii_serialization())
 }
 
 #[cfg(test)]
@@ -3955,5 +4079,160 @@ mod tests {
             normalize_vertex_dedicated_host(&doubled).is_err(),
             "{doubled}"
         );
+    }
+
+    fn lmstudio_env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn lmstudio_settings_take_env_over_config_json_over_the_default() {
+        let without_file = tempfile::TempDir::new().unwrap();
+        let with_file = tempfile::TempDir::new().unwrap();
+        fs::write(
+            with_file.path().join("config.json"),
+            r#"{"lmstudio":{"baseUrl":"http://localhost:4321/","apiKey":"from-file"}}"#,
+        )
+        .unwrap();
+        let settings = |base_url: &str, api_key: Option<&str>| LmStudioSettings {
+            base_url: base_url.to_string(),
+            api_key: api_key.map(str::to_string),
+        };
+        // (name, env, config directory, expected settings)
+        type Case<'a> = (
+            &'a str,
+            &'a [(&'a str, &'a str)],
+            &'a tempfile::TempDir,
+            LmStudioSettings,
+        );
+        let tests: [Case<'_>; 6] = [
+            (
+                "default",
+                &[],
+                &without_file,
+                settings("http://127.0.0.1:1234", None),
+            ),
+            (
+                "config.json, trailing slash dropped",
+                &[],
+                &with_file,
+                settings("http://localhost:4321", Some("from-file")),
+            ),
+            (
+                "env over config.json",
+                &[
+                    ("CCP_LMSTUDIO_BASE_URL", "http://[::1]:1235"),
+                    ("CCP_LMSTUDIO_API_KEY", "from-env"),
+                ],
+                &with_file,
+                settings("http://[::1]:1235", Some("from-env")),
+            ),
+            (
+                "LM Studio's own token variable",
+                &[("LM_API_TOKEN", "lm-token")],
+                &with_file,
+                settings("http://localhost:4321", Some("lm-token")),
+            ),
+            (
+                "CCP token over LM Studio's",
+                &[("CCP_LMSTUDIO_API_KEY", "ccp"), ("LM_API_TOKEN", "lm")],
+                &without_file,
+                settings("http://127.0.0.1:1234", Some("ccp")),
+            ),
+            (
+                "blank values fall through",
+                &[
+                    ("CCP_LMSTUDIO_BASE_URL", "  "),
+                    ("CCP_LMSTUDIO_API_KEY", ""),
+                ],
+                &with_file,
+                settings("http://localhost:4321", Some("from-file")),
+            ),
+        ];
+        for (name, env, config, expected) in tests {
+            let resolved = resolve_lmstudio_settings(&lmstudio_env(env), config.path())
+                .unwrap_or_else(|| panic!("{name}: provider turned off"))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(resolved, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn lmstudio_can_be_turned_off_in_env_or_config_json() {
+        let off_in_file = tempfile::TempDir::new().unwrap();
+        fs::write(
+            off_in_file.path().join("config.json"),
+            r#"{"lmstudio":{"enabled":false}}"#,
+        )
+        .unwrap();
+        let empty = tempfile::TempDir::new().unwrap();
+        assert!(resolve_lmstudio_settings(&lmstudio_env(&[]), off_in_file.path()).is_none());
+        for off in ["0", "false", "OFF", " no "] {
+            assert!(
+                resolve_lmstudio_settings(
+                    &lmstudio_env(&[("CCP_LMSTUDIO_ENABLED", off)]),
+                    empty.path()
+                )
+                .is_none(),
+                "{off}"
+            );
+        }
+        // The env turns it back on over config.json.
+        assert!(
+            resolve_lmstudio_settings(
+                &lmstudio_env(&[("CCP_LMSTUDIO_ENABLED", "1")]),
+                off_in_file.path()
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn lmstudio_base_urls_that_could_leak_the_token_or_miss_the_api_are_rejected() {
+        let empty = tempfile::TempDir::new().unwrap();
+        for (base_url, expected) in [
+            (
+                "http://192.168.1.20:1234",
+                "plain http only for a loopback host",
+            ),
+            ("http://user:pw@127.0.0.1:1234", "user name or password"),
+            ("http://127.0.0.1:1234/v1", "without a path"),
+            ("ftp://127.0.0.1:1234", "must use https"),
+            ("not a url", "not a valid URL"),
+        ] {
+            let error = resolve_lmstudio_settings(
+                &lmstudio_env(&[("CCP_LMSTUDIO_BASE_URL", base_url)]),
+                empty.path(),
+            )
+            .expect("enabled")
+            .expect_err(base_url)
+            .to_string();
+            assert!(
+                error.contains("CCP_LMSTUDIO_BASE_URL"),
+                "{base_url}: {error}"
+            );
+            assert!(error.contains(expected), "{base_url}: {error}");
+        }
+        let remote = resolve_lmstudio_settings(
+            &lmstudio_env(&[("CCP_LMSTUDIO_BASE_URL", "https://lmstudio.example:8443")]),
+            empty.path(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(remote.base_url, "https://lmstudio.example:8443");
+    }
+
+    #[test]
+    fn lmstudio_settings_debug_output_hides_the_token() {
+        let settings = LmStudioSettings {
+            base_url: LMSTUDIO_DEFAULT_BASE_URL.to_string(),
+            api_key: Some("sk-lm-very-secret".to_string()),
+        };
+        let printed = format!("{settings:?}");
+        assert!(!printed.contains("very-secret"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
     }
 }

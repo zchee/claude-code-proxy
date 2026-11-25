@@ -4,10 +4,12 @@ use claude_code_proxy::{
     config, logging,
     monitor::MonitorHandle,
     paths,
+    provider::CatalogNote,
     registry::{ANTHROPIC_STYLE_ALIASES, Registry},
     server::{self, ServerConfig},
     tui::{self, MonitorExit, MonitorUiConfig},
 };
+use std::collections::BTreeMap;
 use std::io::IsTerminal;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -118,7 +120,8 @@ fn main() -> Result<()> {
                 .build()?;
             match select_serve_mode(std::io::stdout().is_terminal(), no_monitor) {
                 ServeMode::Plain => {
-                    print_server_banner(&bind_address, effective_port, &registry);
+                    let catalog_notes = runtime.block_on(registry.refresh_live_catalogs());
+                    print_server_banner(&bind_address, effective_port, &registry, &catalog_notes);
                     runtime
                         .block_on(run_service(ServerConfig {
                             bind_address,
@@ -193,7 +196,12 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::Models { full } => {
-            print_models(&Registry::with_default_alias(), full);
+            let registry = Registry::with_default_alias();
+            let catalog_notes = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(registry.refresh_live_catalogs());
+            print_models(&registry, full, &catalog_notes);
             Ok(())
         }
         Commands::Codex { command } => run_provider_cli("codex", command),
@@ -338,18 +346,28 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
     }
 }
 
-fn print_models(registry: &Registry, full: bool) {
+/// Prints each provider's models. `catalog_notes` holds, per provider, why
+/// its live catalog could not be read, shown in place of its models, or a
+/// caveat about the models it listed, shown after them.
+fn print_models(registry: &Registry, full: bool, catalog_notes: &BTreeMap<String, CatalogNote>) {
     let grouped = registry.grouped_models();
     for provider in [
-        "codex", "kimi", "grok", "muse", "opencode", "vertex", "cursor", "local",
+        "codex", "kimi", "grok", "muse", "opencode", "vertex", "cursor", "local", "lmstudio",
     ] {
         let Some(models) = grouped.get(provider) else {
             continue;
         };
-        if full || provider != "cursor" {
+        if let Some(CatalogNote::Unavailable(error)) = catalog_notes.get(provider) {
+            println!("{provider}: (no models: {error})");
+        } else if models.is_empty() {
+            println!("{provider}: (no models)");
+        } else if full || provider != "cursor" {
             println!("{provider}: {}", models.join(", "));
         } else {
             println!("{provider}: {}", compact_cursor_list(models));
+        }
+        if let Some(CatalogNote::Caveat(caveat)) = catalog_notes.get(provider) {
+            println!("  ({caveat})");
         }
     }
 }
@@ -384,14 +402,19 @@ fn listen_url(bind_address: &str, port: u16) -> String {
     }
 }
 
-fn print_server_banner(bind_address: &str, port: u16, registry: &Registry) {
+fn print_server_banner(
+    bind_address: &str,
+    port: u16,
+    registry: &Registry,
+    catalog_notes: &BTreeMap<String, CatalogNote>,
+) {
     println!("Proxy listening on {}", listen_url(bind_address, port));
     println!("Logs: {}", paths::log_file().display());
     let cfg = paths::config_dir();
     if cfg.exists() {
         println!("Config: {}", cfg.display());
     }
-    print_models(registry, false);
+    print_models(registry, false, catalog_notes);
     println!();
     println!("Configure Claude Code (pick a model from above):");
     println!("  export ANTHROPIC_BASE_URL=\"http://localhost:{port}\"");

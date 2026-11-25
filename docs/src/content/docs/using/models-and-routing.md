@@ -16,6 +16,7 @@ The model ID in each request selects its provider. One proxy listener can serve 
 | Non-conflicting registered OpenCode Go IDs and every `opencode-go/<model-id>` | OpenCode Go |
 | `gemini-4-argon`, `gemini-4-carbon`, `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, and every `vertex/<model-id>` or `vertex/<publisher>/<model-id>` | Vertex AI |
 | `cursor`, Cursor legacy aliases, `cursor:<id>`, `cursor-plan:<id>`, `cursor-ask:<id>` | Cursor Agent |
+| Every `lmstudio/<model key>`, listed from the running LM Studio server | LM Studio |
 | Anthropic-style aliases such as `haiku`, `sonnet`, `opus`, `fable`, and registered `claude-*` aliases | The `aliasProvider`, Codex by default |
 
 `muse-spark-1.3-contributor` and `muse-spark-1.2-contributor` are OpenCode Go models and route to OpenCode Go, not to Muse.

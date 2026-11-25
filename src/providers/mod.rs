@@ -3,6 +3,7 @@ pub mod codex;
 pub mod cursor;
 pub mod grok;
 pub mod kimi;
+pub mod lmstudio;
 pub mod local;
 pub mod muse;
 pub mod opencode;

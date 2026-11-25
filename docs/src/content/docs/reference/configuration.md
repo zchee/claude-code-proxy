@@ -172,6 +172,16 @@ The three URL settings must use `https` (plain `http` only for a loopback host) 
 | `OPENCODE_API_KEY` | `opencode.apiKey` | unset | Fallback API-key variable accepted by the proxy when the CCP-specific variable is unset. |
 | `CCP_OPENCODE_BASE_URL` | `opencode.baseUrl` | `https://opencode.ai/zen/go/v1` | Changes the OpenCode Go API base URL. |
 
+## LM Studio
+
+| Environment | Config key | Default | Purpose |
+| --- | --- | --- | --- |
+| `CCP_LMSTUDIO_ENABLED` | `lmstudio.enabled` | `true` | `0`, `false`, `no`, or `off` turns the provider off. |
+| `CCP_LMSTUDIO_BASE_URL` | `lmstudio.baseUrl` | `http://127.0.0.1:1234` | The LM Studio server: a scheme, a host, and a port, `https` unless the host is a loopback address. |
+| `CCP_LMSTUDIO_API_KEY`, then `LM_API_TOKEN` | `lmstudio.apiKey` | unset | Token for a server with "Require Authentication" on. |
+
+The model list is read from the server on every listing. While a server on a loopback address is stopped, the list comes from `lms ls`, found on `PATH` or in `~/.lmstudio/bin`. `claude-code-proxy models` reads these settings each time it runs; the proxy server reads them at startup. See [LM Studio](/providers/lmstudio/).
+
 ## Vertex AI
 
 | Environment | Config key | Default | Purpose |

@@ -8,7 +8,7 @@ use crate::{
         stream::openai_response as render_openai_response,
     },
     project,
-    provider::RequestContext,
+    provider::{CatalogNote, RequestContext},
     providers::codex::{
         chat_completions::{ChatCompletionsBackend, request::translate_request},
         images::{
@@ -357,6 +357,19 @@ async fn handler_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ModelsQuery>,
 ) -> Json<serde_json::Value> {
+    for (provider, note) in state.registry.refresh_live_catalogs().await {
+        let (message, detail) = match note {
+            CatalogNote::Unavailable(error) => ("model catalog unavailable", error),
+            CatalogNote::Caveat(caveat) => ("model catalog listed with a caveat", caveat),
+        };
+        create_logger("server").warn(
+            message,
+            Some(Map::from_iter([
+                ("provider".to_string(), json!(provider)),
+                ("detail".to_string(), json!(detail)),
+            ])),
+        );
+    }
     let mut data: Vec<Value> = state
         .registry
         .all_supported_models()

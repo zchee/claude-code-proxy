@@ -51,6 +51,7 @@ export default defineConfig({
             { label: 'OpenCode Go', slug: 'providers/opencode-go' },
             { label: 'Vertex AI', slug: 'providers/vertex' },
             { label: 'Cursor Agent', slug: 'providers/cursor-agent' },
+            { label: 'LM Studio', slug: 'providers/lmstudio' },
           ],
         },
         {
