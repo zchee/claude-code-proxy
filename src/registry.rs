@@ -633,7 +633,7 @@ mod tests {
             .iter()
             .filter(|model| !model.starts_with("vertex/endpoint/"))
             .count();
-        assert_eq!(registered, 53, "{advertised:?}");
+        assert_eq!(registered, 57, "{advertised:?}");
         for model in &advertised {
             assert_eq!(
                 registry.provider_for_model(model, None).unwrap().name(),

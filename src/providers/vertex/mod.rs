@@ -1011,7 +1011,7 @@ mod tests {
         assert!(provider.ready.get().is_none());
         assert_eq!(provider.name(), "vertex");
         let models = provider.supported_models();
-        assert_eq!(models.len(), 53, "{models:?}");
+        assert_eq!(models.len(), 57, "{models:?}");
         assert!(
             models
                 .iter()

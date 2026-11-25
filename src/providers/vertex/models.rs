@@ -54,6 +54,14 @@ pub const MODELS: &[ModelSpec] = &[
         supports_minimal: false,
     },
     ModelSpec {
+        id: "gemini-4-hydrogen",
+        supports_minimal: false,
+    },
+    ModelSpec {
+        id: "gemini-4-neon",
+        supports_minimal: false,
+    },
+    ModelSpec {
         id: "gemini-3.8-flash",
         supports_minimal: false,
     },
@@ -845,6 +853,8 @@ mod tests {
     const EXPECTED: &[(&str, bool)] = &[
         ("gemini-4-argon", false),
         ("gemini-4-carbon", false),
+        ("gemini-4-hydrogen", false),
+        ("gemini-4-neon", false),
         ("gemini-3.8-flash", false),
         ("gemini-3.7-flash", false),
         ("gemini-3.5-flash", true),
@@ -944,9 +954,9 @@ mod tests {
     }
 
     #[test]
-    fn advertised_models_are_the_nine_ids_bare_and_prefixed() {
+    fn advertised_models_are_the_registered_ids_bare_and_prefixed() {
         let advertised = advertised_models();
-        assert_eq!(advertised.len(), 53);
+        assert_eq!(advertised.len(), 57);
         for (id, _) in EXPECTED {
             assert!(advertised.contains(&id.to_string()), "{id}");
             assert!(advertised.contains(&format!("vertex/{id}")), "{id}");
@@ -1390,7 +1400,7 @@ mod tests {
         .unwrap();
         let endpoints = crate::config::resolve_vertex_endpoints(config.path());
         let listed = advertised_models_with(&endpoints);
-        assert_eq!(listed.len(), 54, "{listed:?}");
+        assert_eq!(listed.len(), 58, "{listed:?}");
         assert!(listed.contains(&"vertex/endpoint/my-llm".to_string()));
         assert!(!listed.iter().any(|name| name.contains("broken")));
         let mut sorted = listed.clone();
@@ -1712,14 +1722,14 @@ mod tests {
             ]
         );
         assert_eq!(Family::Claude.model_names().len(), 14);
-        assert_eq!(Family::Gemini.model_names().len(), 18);
+        assert_eq!(Family::Gemini.model_names().len(), 22);
         let every: usize = Family::ALL
             .into_iter()
             .map(|family| family.model_names().len())
             .sum();
         assert_eq!(
             every,
-            18 + EXPECTED_PARTNERS.len() + EXPECTED_OPEN_MODELS.len()
+            22 + EXPECTED_PARTNERS.len() + EXPECTED_OPEN_MODELS.len()
         );
         for (raw, family, ..) in EXPECTED_PARTNERS {
             assert!(family.model_names().contains(&raw.to_string()), "{raw}");

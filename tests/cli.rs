@@ -1162,10 +1162,12 @@ fn models_lists_vertex_after_opencode_with_its_served_models()
         .iter()
         .filter(|model| !model.starts_with("vertex/endpoint/"))
         .count();
-    assert_eq!(registered, 53, "{vertex}");
+    assert_eq!(registered, 57, "{vertex}");
     for model in [
         "gemini-4-argon",
         "gemini-4-carbon",
+        "gemini-4-hydrogen",
+        "gemini-4-neon",
         "gemini-3.8-flash",
         "gemini-3.7-flash",
         "gemini-3.5-flash",
@@ -1584,6 +1586,8 @@ fn models_lists_every_vertex_name_of_every_served_family() -> Result<(), Box<dyn
         "gemini-3.8-flash",
         "gemini-4-argon",
         "gemini-4-carbon",
+        "gemini-4-hydrogen",
+        "gemini-4-neon",
     ];
     let partners = [
         "anthropic/claude-fable-5-2",
@@ -1620,7 +1624,7 @@ fn models_lists_every_vertex_name_of_every_served_family() -> Result<(), Box<dyn
     expected.extend(gemini.iter().map(|model| format!("vertex/{model}")));
     expected.extend(partners.iter().map(|model| format!("vertex/{model}")));
     expected.sort_unstable();
-    assert_eq!(expected.len(), 47);
+    assert_eq!(expected.len(), 51);
     assert_eq!(listed, expected, "{vertex}");
     Ok(())
 }
@@ -2127,7 +2131,7 @@ fn models_lists_the_configured_vertex_endpoints_synthetic() -> Result<(), Box<dy
     assert!(names.contains(&"vertex/endpoint/my-llm"), "{line}");
     // An entry whose settings are invalid is not listed.
     assert!(!line.contains("in-global"), "{line}");
-    assert_eq!(names.len(), 54, "{line}");
+    assert_eq!(names.len(), 58, "{line}");
 
     let empty = TempDir::new()?;
     let line = vertex_line(empty.path())?;

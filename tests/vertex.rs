@@ -2924,7 +2924,7 @@ async fn vertex_open_models_synthetic_count_tokens_is_answered_locally() {
 // Every family together.
 
 /// Every name the provider advertises, as Google's model pages spell them.
-const VERTEX_NAMES: [&str; 53] = [
+const VERTEX_NAMES: [&str; 57] = [
     "gemini-3-flash-preview",
     "gemini-3.1-flash-lite",
     "gemini-3.1-pro-preview",
@@ -2934,6 +2934,8 @@ const VERTEX_NAMES: [&str; 53] = [
     "gemini-3.8-flash",
     "gemini-4-argon",
     "gemini-4-carbon",
+    "gemini-4-hydrogen",
+    "gemini-4-neon",
     "vertex/gemini-3-flash-preview",
     "vertex/gemini-3.1-flash-lite",
     "vertex/gemini-3.1-pro-preview",
@@ -2943,6 +2945,8 @@ const VERTEX_NAMES: [&str; 53] = [
     "vertex/gemini-3.8-flash",
     "vertex/gemini-4-argon",
     "vertex/gemini-4-carbon",
+    "vertex/gemini-4-hydrogen",
+    "vertex/gemini-4-neon",
     "vertex/anthropic/claude-fable-5-2",
     "vertex/anthropic/claude-fable-5-1",
     "vertex/anthropic/claude-fable-5",

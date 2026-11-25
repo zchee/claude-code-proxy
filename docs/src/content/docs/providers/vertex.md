@@ -295,7 +295,7 @@ curl -sS http://127.0.0.1:18765/v1/messages -H 'content-type: application/json' 
 
 | Family | Registered names |
 | --- | --- |
-| Gemini | `gemini-4-argon`, `gemini-4-carbon`, `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, each also as `vertex/<model-id>` |
+| Gemini | `gemini-4-argon`, `gemini-4-carbon`, `gemini-4-hydrogen`, `gemini-4-neon`, `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, each also as `vertex/<model-id>` |
 | Anthropic Claude | `vertex/anthropic/claude-fable-5-2`, `vertex/anthropic/claude-fable-5-1`, `vertex/anthropic/claude-fable-5`, `vertex/anthropic/claude-opus-5-5`, `vertex/anthropic/claude-opus-5`, `vertex/anthropic/claude-opus-4-8`, `vertex/anthropic/claude-opus-4-7`, `vertex/anthropic/claude-sonnet-5-5`, `vertex/anthropic/claude-sonnet-5`, `vertex/anthropic/claude-haiku-5-5`, `vertex/anthropic/claude-opus-4-6`, `vertex/anthropic/claude-sonnet-4-6`, `vertex/anthropic/claude-opus-4-5@20251101`, `vertex/anthropic/claude-haiku-4-5@20251001` |
 | xAI Grok | `vertex/xai/grok-4.7`, `vertex/xai/grok-4.6`, `vertex/xai/grok-4.20-reasoning`, `vertex/xai/grok-4.20-non-reasoning`, `vertex/xai/grok-4.3` |
 | OpenAI | `vertex/openai/gpt-6-astra`, `vertex/openai/gpt-6.1-sol`, `vertex/openai/gpt-6.1-terra`, `vertex/openai/gpt-6-luna` |
@@ -335,6 +335,8 @@ Gemini requests are translated to `streamGenerateContent`. The registered Gemini
 | --- | --- |
 | `gemini-4-argon` | `LOW` |
 | `gemini-4-carbon` | `LOW` |
+| `gemini-4-hydrogen` | `LOW` |
+| `gemini-4-neon` | `LOW` |
 | `gemini-3.8-flash` | `LOW` |
 | `gemini-3.7-flash` | `LOW` |
 | `gemini-3.5-flash` | `MINIMAL` |

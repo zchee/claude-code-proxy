@@ -1288,6 +1288,16 @@ mod tests {
             ),
             ("gemini-4-argon", json!({}), json!({"thinkingLevel":"LOW"})),
             (
+                "gemini-4-hydrogen",
+                json!({}),
+                json!({"thinkingLevel":"LOW"}),
+            ),
+            (
+                "vertex/gemini-4-neon",
+                json!({"thinking":{"type":"disabled"}}),
+                json!({"thinkingLevel":"LOW"}),
+            ),
+            (
                 "gemini-3.8-flash",
                 json!({"thinking":{"type":"disabled"}}),
                 json!({"thinkingLevel":"LOW"}),
