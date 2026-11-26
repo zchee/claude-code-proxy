@@ -54,6 +54,8 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
     "gpt-6-sol",
     "gpt-6.1-sol",
     "gpt-6.1-terra",
+    "gpt-6.2-astra",
+    "gpt-6.2-sol",
 ];
 
 pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"];
@@ -468,6 +470,10 @@ mod tests {
             "gpt-6-astra-ultrafast",
             "gpt-6-astra-ultrafast[1m]",
             "gpt-6.1-sol-ultrafast",
+            "gpt-6.2-astra-ultrafast",
+            "gpt-6.2-astra-ultrafast[1m]",
+            "gpt-6.2-sol-ultrafast",
+            "gpt-6.2-sol-ultrafast[1m]",
         ] {
             assert_eq!(
                 registry.provider_for_model(model, None).unwrap().name(),
@@ -615,6 +621,10 @@ mod tests {
             "gpt-6.1-sol-fast",
             "gpt-6.1-terra",
             "gpt-6.1-terra-fast",
+            "gpt-6.2-astra",
+            "gpt-6.2-astra-fast",
+            "gpt-6.2-sol",
+            "gpt-6.2-sol-fast",
         ] {
             assert_eq!(
                 registry.provider_for_model(model, None).unwrap().name(),

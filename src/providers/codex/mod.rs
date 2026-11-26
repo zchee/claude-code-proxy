@@ -2453,6 +2453,8 @@ mod tests {
             ("gpt-6-luna", true),
             ("gpt-6-sol", true),
             ("gpt-6.1-terra", true),
+            ("gpt-6.2-astra", true),
+            ("gpt-6.2-sol", true),
             ("gpt-5.4", false),
         ] {
             let mut model = resolved.to_string();
@@ -2715,6 +2717,15 @@ mod tests {
         assert!(models.contains(&"gpt-6.1-terra".to_string()));
         assert!(models.contains(&"gpt-6.1-terra-fast".to_string()));
         assert!(!models.contains(&"gpt-6.1-terra-ultrafast".to_string()));
+        for model in ["gpt-6.2-astra", "gpt-6.2-sol"] {
+            for name in [
+                model.to_string(),
+                format!("{model}-fast"),
+                format!("{model}-ultrafast"),
+            ] {
+                assert!(models.contains(&name), "{name}");
+            }
+        }
         assert!(models.contains(&"gpt-5.4".to_string()));
         assert!(models.contains(&"gpt-5.4-mini".to_string()));
         assert!(models.contains(&"gpt-6-astra-fast".to_string()));

@@ -72,6 +72,9 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
     }
     assert!(listing.contains("gpt-6.1-terra"));
     assert!(listing.contains("gpt-6-astra-ultrafast"));
+    for id in ["gpt-6.2-astra-ultrafast", "gpt-6.2-sol-ultrafast"] {
+        assert!(listing.contains(id), "{id}");
+    }
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -167,6 +170,19 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
             true,
             Some("ultrafast"),
         ),
+        (
+            "gpt-6.2-astra-ultrafast",
+            "gpt-6.2-astra",
+            true,
+            Some("ultrafast"),
+        ),
+        (
+            "gpt-6.2-sol-ultrafast",
+            "gpt-6.2-sol",
+            true,
+            Some("ultrafast"),
+        ),
+        ("gpt-6.2-sol-fast", "gpt-6.2-sol", true, Some("priority")),
     ] {
         let response = client
             .post(format!("{url}/v1/responses"))

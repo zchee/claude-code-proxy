@@ -1262,6 +1262,18 @@ mod tests {
             (
                 Some("ultrafast"),
                 None,
+                "gpt-6.2-astra",
+                Some(ServiceTier::Ultrafast),
+            ),
+            (
+                Some("ultrafast"),
+                Some(ServiceTier::Priority),
+                "gpt-6.2-sol",
+                Some(ServiceTier::Ultrafast),
+            ),
+            (
+                Some("ultrafast"),
+                None,
                 "gpt-6-astra",
                 Some(ServiceTier::Ultrafast),
             ),

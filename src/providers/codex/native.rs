@@ -729,6 +729,8 @@ mod tests {
         for (model, full_model, lite_only) in [
             ("gpt-6.1-terra-fast", "gpt-6.1-terra", false),
             ("gpt-6-sol", "gpt-6-sol", false),
+            ("gpt-6.2-astra", "gpt-6.2-astra", true),
+            ("gpt-6.2-sol", "gpt-6.2-sol", true),
             ("gpt-5.6-luna", "gpt-5.6-sol", true),
             ("gpt-6-luna", "gpt-6-sol", true),
         ] {
@@ -761,11 +763,13 @@ mod tests {
 
     #[test]
     fn native_request_resolves_ultrafast_tier() {
-        let mut body = request(json!({"model":"gpt-6-astra-ultrafast","input":[]}));
-        let resolved = shape_native_request(&mut body, false).unwrap();
-        assert_eq!(resolved.model, "gpt-6-astra");
-        assert_eq!(body["model"], "gpt-6-astra");
-        assert_eq!(body["service_tier"], "ultrafast");
+        for model in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol"] {
+            let mut body = request(json!({"model":format!("{model}-ultrafast"),"input":[]}));
+            let resolved = shape_native_request(&mut body, false).unwrap();
+            assert_eq!(resolved.model, model);
+            assert_eq!(body["model"], model);
+            assert_eq!(body["service_tier"], "ultrafast");
+        }
 
         let mut explicit = request(json!({
             "model":"gpt-6-astra-ultrafast",

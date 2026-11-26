@@ -468,6 +468,19 @@ mod tests {
                 "gpt-6-astra",
                 Some("ultrafast"),
             ),
+            ("gpt-6.2-astra-fast", "gpt-6.2-astra", Some("priority")),
+            (
+                "gpt-6.2-astra-ultrafast",
+                "gpt-6.2-astra",
+                Some("ultrafast"),
+            ),
+            ("gpt-6.2-sol", "gpt-6.2-sol", None),
+            ("gpt-6.2-sol-ultrafast", "gpt-6.2-sol", Some("ultrafast")),
+            (
+                "gpt-6.2-sol-ultrafast[1m]",
+                "gpt-6.2-sol",
+                Some("ultrafast"),
+            ),
         ] {
             let mut body = base();
             body["model"] = json!(model);

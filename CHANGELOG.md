@@ -5,6 +5,12 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
+- Codex users can select GPT-6.2 Astra and GPT-6.2 Sol with `gpt-6.2-astra` and
+  `gpt-6.2-sol` without a local Codex CLI model cache, with their
+  `gpt-6.2-astra-fast` and `gpt-6.2-sol-fast` priority-tier variants, and
+  request the ultrafast service tier with `gpt-6.2-astra-ultrafast` or
+  `gpt-6.2-sol-ultrafast`. A forced `CCP_CODEX_SERVICE_TIER=ultrafast` now
+  reaches both models as ultrafast instead of priority.
 - Muse Code subscribers can use Meta's `muse-spark-1.3`, `muse-spark-1.2`,
   `muse-wonder-1.0`, `muse-wonder-full-1.0`, and `muse-ember-1.0` after
   `claude-code-proxy muse auth login`, with tools, image input, and reasoning
