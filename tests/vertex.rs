@@ -1130,6 +1130,166 @@ async fn vertex_synthetic_unregistered_ids_are_sent_and_other_publishers_are_ref
     assert_eq!(upstream.requests().len(), 1);
 }
 
+/// Google's Priority PayGo page asks for the tier with the request header
+/// `X-Vertex-AI-LLM-Shared-Request-Type: priority`, sent to the model's own
+/// URL. The header name and value below are written out from that page.
+#[tokio::test]
+async fn vertex_synthetic_fast_names_ask_for_priority_paygo_on_every_route() {
+    const TIER_HEADER: &str = "x-vertex-ai-llm-shared-request-type";
+    const CARBON_PATH: &str = "/v1/projects/ccp-project/locations/global/publishers/google/models/gemini-4-carbon:streamGenerateContent?alt=sse";
+    let answer = || Answer::sse(&[text_frame("ok"), finish_frame("STOP")]);
+    let tier = |request: &Recorded| -> Vec<String> {
+        request
+            .headers
+            .get_all(TIER_HEADER)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect()
+    };
+
+    // (route, request body, whether the answer names the requested model)
+    let fast_requests = [
+        (
+            "/v1/messages",
+            message_request("gemini-4-carbon-fast", false),
+            true,
+        ),
+        (
+            "/v1/messages",
+            message_request("vertex/gemini-4-carbon-fast[1m]", true),
+            false,
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model":"vertex/google/gemini-4-carbon-fast","messages":[{"role":"user","content":"hello"}]}),
+            false,
+        ),
+    ];
+    for (route, request, names_model) in fast_requests {
+        let upstream = FakeVertex::start(vec![answer()]).await;
+        let (status, _, body) = post(
+            app_with_options(registry(provider(&upstream, &[])), None, true),
+            route,
+            &request,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{route} {request}: {body}");
+        let requests = upstream.requests();
+        assert_eq!(requests.len(), 1, "{route} {request}");
+        assert_eq!(requests[0].path_and_query, CARBON_PATH, "{route} {request}");
+        assert_eq!(tier(&requests[0]), ["priority"], "{route} {request}");
+        assert!(
+            !requests[0]
+                .headers
+                .contains_key("x-vertex-ai-llm-request-type"),
+            "{route} {request}"
+        );
+        // The tier is a header only: nothing about it is in the body.
+        assert!(
+            !requests[0]
+                .body
+                .to_string()
+                .to_lowercase()
+                .contains("priority"),
+            "{}",
+            requests[0].body
+        );
+        if names_model {
+            let message: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(message["model"], "gemini-4-carbon-fast", "{body}");
+        }
+    }
+
+    // Without the suffix, and with the suffix on a model that has no `-fast`
+    // name, no tier is asked for.
+    for (model, path) in [
+        ("gemini-4-carbon", CARBON_PATH),
+        (
+            "vertex/gemini-3.5-flash-fast",
+            "/v1/projects/ccp-project/locations/global/publishers/google/models/gemini-3.5-flash-fast:streamGenerateContent?alt=sse",
+        ),
+    ] {
+        let upstream = FakeVertex::start(vec![answer()]).await;
+        let (status, _, body) = post(
+            app_with_monitor(registry(provider(&upstream, &[])), None),
+            "/v1/messages",
+            &message_request(model, false),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{model}: {body}");
+        let requests = upstream.requests();
+        assert_eq!(requests[0].path_and_query, path, "{model}");
+        assert!(tier(&requests[0]).is_empty(), "{model}");
+    }
+}
+
+/// A thought signature is bound to the model, not to the tier: one issued
+/// under a `-fast` name goes back upstream under the plain name, and the
+/// other way round.
+#[tokio::test]
+async fn vertex_synthetic_signature_carries_between_a_model_and_its_fast_name() {
+    for (first_model, second_model) in [
+        ("gemini-4-carbon-fast", "gemini-4-carbon"),
+        ("gemini-4-carbon", "vertex/google/gemini-4-carbon-fast"),
+    ] {
+        let upstream = FakeVertex::start(vec![
+            Answer::sse(&[parallel_calls_frame(), finish_frame("STOP")]),
+            Answer::sse(&[text_frame("Both read."), finish_frame("STOP")]),
+        ])
+        .await;
+        let registry = registry(provider(&upstream, &[]));
+        let (status, _, body) = post(
+            app_with_monitor(registry.clone(), None),
+            "/v1/messages",
+            &json!({
+                "model": first_model,
+                "max_tokens": 256,
+                "tools": [read_file_tool()],
+                "messages": [{"role":"user","content":"Read both files"}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first_model}: {body}");
+        let first: Value = serde_json::from_str(&body).unwrap();
+        let content = first["content"].as_array().unwrap().clone();
+        let tool_ids: Vec<&str> = content
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .map(|block| block["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(tool_ids.len(), 2, "{first_model}: {body}");
+
+        let (status, _, body) = post(
+            app_with_monitor(registry, None),
+            "/v1/messages",
+            &json!({
+                "model": second_model,
+                "max_tokens": 256,
+                "tools": [read_file_tool()],
+                "messages": [
+                    {"role":"user","content":"Read both files"},
+                    {"role":"assistant","content":content},
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":tool_ids[0],"content":"fn a() {}"},
+                        {"type":"tool_result","tool_use_id":tool_ids[1],"content":"fn b() {}"}
+                    ]}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second_model}: {body}");
+
+        let requests = upstream.requests();
+        assert_eq!(requests.len(), 2, "{first_model} then {second_model}");
+        // The real signature, not the value sent when none is usable.
+        assert_eq!(
+            requests[1].body["contents"][1]["parts"][0]["thoughtSignature"], SYNTHETIC_SIGNATURE,
+            "{first_model} then {second_model}: {}",
+            requests[1].body
+        );
+    }
+}
+
 #[tokio::test]
 async fn vertex_models_are_listed_by_the_models_route() {
     let upstream = FakeVertex::start(Vec::new()).await;
@@ -2924,7 +3084,7 @@ async fn vertex_open_models_synthetic_count_tokens_is_answered_locally() {
 // Every family together.
 
 /// Every name the provider advertises, as Google's model pages spell them.
-const VERTEX_NAMES: [&str; 57] = [
+const VERTEX_NAMES: [&str; 65] = [
     "gemini-3-flash-preview",
     "gemini-3.1-flash-lite",
     "gemini-3.1-pro-preview",
@@ -2933,9 +3093,13 @@ const VERTEX_NAMES: [&str; 57] = [
     "gemini-3.7-flash",
     "gemini-3.8-flash",
     "gemini-4-argon",
+    "gemini-4-argon-fast",
     "gemini-4-carbon",
+    "gemini-4-carbon-fast",
     "gemini-4-hydrogen",
+    "gemini-4-hydrogen-fast",
     "gemini-4-neon",
+    "gemini-4-neon-fast",
     "vertex/gemini-3-flash-preview",
     "vertex/gemini-3.1-flash-lite",
     "vertex/gemini-3.1-pro-preview",
@@ -2944,9 +3108,13 @@ const VERTEX_NAMES: [&str; 57] = [
     "vertex/gemini-3.7-flash",
     "vertex/gemini-3.8-flash",
     "vertex/gemini-4-argon",
+    "vertex/gemini-4-argon-fast",
     "vertex/gemini-4-carbon",
+    "vertex/gemini-4-carbon-fast",
     "vertex/gemini-4-hydrogen",
+    "vertex/gemini-4-hydrogen-fast",
     "vertex/gemini-4-neon",
+    "vertex/gemini-4-neon-fast",
     "vertex/anthropic/claude-fable-5-2",
     "vertex/anthropic/claude-fable-5-1",
     "vertex/anthropic/claude-fable-5",

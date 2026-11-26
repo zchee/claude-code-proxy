@@ -643,7 +643,7 @@ mod tests {
             .iter()
             .filter(|model| !model.starts_with("vertex/endpoint/"))
             .count();
-        assert_eq!(registered, 57, "{advertised:?}");
+        assert_eq!(registered, 65, "{advertised:?}");
         for model in &advertised {
             assert_eq!(
                 registry.provider_for_model(model, None).unwrap().name(),
@@ -656,6 +656,10 @@ mod tests {
             "gemini-3.5-flash[1m]",
             "vertex/gemini-4-argon",
             "vertex/google/gemini-3.5-flash",
+            "gemini-4-argon-fast",
+            "gemini-4-neon-fast[1m]",
+            "vertex/gemini-4-carbon-fast",
+            "vertex/google/gemini-4-hydrogen-fast",
             // Not registered: the prefix still routes, and the provider
             // decides whether it can serve the name.
             "vertex/gemini-9-unreleased",
@@ -667,12 +671,14 @@ mod tests {
                 "{model}"
             );
         }
-        // A bare unregistered Gemini ID is not claimed by anyone.
-        assert!(
-            registry
-                .provider_for_model("gemini-9-unreleased", None)
-                .is_none()
-        );
+        // A bare unregistered Gemini ID is not claimed by anyone, and neither
+        // is `-fast` on a model that has no such name.
+        for model in ["gemini-9-unreleased", "gemini-3.5-flash-fast"] {
+            assert!(
+                registry.provider_for_model(model, None).is_none(),
+                "{model}"
+            );
+        }
         // Vertex lists Claude only as `vertex/anthropic/<model-id>`: no bare
         // Claude ID routes to Vertex.
         for model in advertised

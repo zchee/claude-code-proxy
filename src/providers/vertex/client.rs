@@ -644,6 +644,18 @@ impl OpenApiPath {
 /// The `accept` value of a streaming request.
 pub const EVENT_STREAM: &str = "text/event-stream";
 
+/// The request header that picks a pay-as-you-go tier for a Gemini request.
+/// It is sent without `X-Vertex-AI-LLM-Request-Type: shared`, so a project
+/// with Provisioned Throughput spends that first and only the rest is
+/// billed at the tier's rate.
+pub const SHARED_REQUEST_TYPE: http::HeaderName =
+    http::HeaderName::from_static("x-vertex-ai-llm-shared-request-type");
+
+/// The [`SHARED_REQUEST_TYPE`] value that asks for Priority PayGo. Vertex AI
+/// serves the request at the standard tier, and bills it so, when it has no
+/// priority capacity to spare.
+pub const PRIORITY_REQUEST_TYPE: &str = "priority";
+
 /// The parts of a request that differ between model families.
 #[derive(Debug, Clone)]
 pub struct UpstreamCall {
@@ -741,7 +753,9 @@ impl VertexClient {
 
     /// Sends one Gemini `streamGenerateContent?alt=sse` request for `model`
     /// with the resolved settings, in the location
-    /// [`VertexTarget::for_model`] picks for it.
+    /// [`VertexTarget::for_model`] picks for it. A model resolved from its
+    /// `-fast` name is sent with [`SHARED_REQUEST_TYPE`] set to
+    /// [`PRIORITY_REQUEST_TYPE`].
     ///
     /// # Errors
     ///
@@ -755,11 +769,22 @@ impl VertexClient {
         traffic: Option<&TrafficCapture>,
     ) -> Result<VertexResponse, VertexError> {
         let target = VertexTarget::for_model(config, model)?;
-        let url = target.gemini_stream_url(&model.upstream_model)?;
-        self.post_sse(
+        let mut headers = http::HeaderMap::new();
+        if model.priority {
+            headers.insert(
+                SHARED_REQUEST_TYPE,
+                http::HeaderValue::from_static(PRIORITY_REQUEST_TYPE),
+            );
+        }
+        let call = UpstreamCall {
+            url: target.gemini_stream_url(&model.upstream_model)?,
+            accept: EVENT_STREAM,
+            headers,
+        };
+        self.post(
             &target,
             &model.upstream_model,
-            url,
+            call,
             body,
             credentials,
             traffic,
@@ -1976,6 +2001,74 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&seen.body).unwrap(),
             serde_json::json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]})
         );
+    }
+
+    #[tokio::test]
+    async fn fast_name_synthetic_sends_the_priority_header_to_the_models_own_url() {
+        // (requested name, location, the header values the upstream must see)
+        let tests: [(&str, &str, &[&str]); 6] = [
+            ("gemini-4-carbon-fast", "global", &["priority"]),
+            ("vertex/gemini-4-argon-fast", "global", &["priority"]),
+            ("gemini-4-hydrogen-fast", "eu", &["priority"]),
+            // The location is not checked: Google does not say what a
+            // single-region location does with the header.
+            ("gemini-4-neon-fast", "us-central1", &["priority"]),
+            ("gemini-4-carbon", "global", &[]),
+            // No `-fast` name for this model: the ID is sent as written.
+            ("vertex/gemini-3.5-flash-fast", "global", &[]),
+        ];
+        for (requested, location, expected) in tests {
+            let (base, seen) = spawn_upstream(|| {
+                (
+                    [(http::header::CONTENT_TYPE, "text/event-stream")],
+                    SYNTHETIC_SSE,
+                )
+                    .into_response()
+            })
+            .await;
+            let model = crate::providers::vertex::models::resolve(requested).unwrap();
+            let mut config = local_config(&base);
+            config.location_setting = setting(location, VertexSettingSource::Default);
+            local_client()
+                .stream_generate_content(
+                    &config,
+                    &model,
+                    &serde_json::json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}),
+                    &fixed_credentials(),
+                    None,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{requested}: {}", error.message_with_status()));
+            let seen = seen.lock().unwrap().take().unwrap();
+            let sent: Vec<&str> = seen
+                .headers
+                .iter()
+                .filter(|(name, _)| name == "x-vertex-ai-llm-shared-request-type")
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(sent, expected, "{requested}");
+            // Never the header that would bypass Provisioned Throughput.
+            assert!(
+                !seen
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name == "x-vertex-ai-llm-request-type"),
+                "{requested}"
+            );
+            let id = requested.trim_start_matches("vertex/");
+            let upstream_id = if expected.is_empty() {
+                id
+            } else {
+                id.trim_end_matches("-fast")
+            };
+            assert_eq!(
+                seen.path_and_query,
+                format!(
+                    "/v1/projects/synthetic-project/locations/{location}/publishers/google/models/{upstream_id}:streamGenerateContent?alt=sse"
+                ),
+                "{requested}"
+            );
+        }
     }
 
     #[tokio::test]

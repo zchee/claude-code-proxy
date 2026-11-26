@@ -11,6 +11,11 @@ description: Release notes for claude-code-proxy.
   request the ultrafast service tier with `gpt-6.2-astra-ultrafast` or
   `gpt-6.2-sol-ultrafast`. A forced `CCP_CODEX_SERVICE_TIER=ultrafast` now
   reaches both models as ultrafast instead of priority.
+- Vertex AI users can ask for Priority PayGo on the Gemini 4 models with
+  `gemini-4-argon-fast`, `gemini-4-carbon-fast`, `gemini-4-hydrogen-fast`, or
+  `gemini-4-neon-fast`, bare or under `vertex/`. Priority PayGo is billed at
+  a higher rate; Google documents it for the `global`, `us`, and `eu`
+  locations. See the [Vertex AI provider page](https://claude-code-proxy.raine.dev/providers/vertex/#priority-paygo).
 - Muse Code subscribers can use Meta's `muse-spark-1.3`, `muse-spark-1.2`,
   `muse-wonder-1.0`, `muse-wonder-full-1.0`, and `muse-ember-1.0` after
   `claude-code-proxy muse auth login`, with tools, image input, and reasoning

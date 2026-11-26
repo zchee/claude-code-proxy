@@ -20,6 +20,10 @@ pub const DEPLOYED_ENDPOINT_PUBLISHER: &str = "endpoint";
 /// Suffix of the Model Garden managed open models (`…-maas`).
 const OPEN_MODEL_SUFFIX: &str = "-maas";
 
+/// Suffix that asks for Priority PayGo on a Gemini model that has a `-fast`
+/// name (see [`ModelSpec::priority`]).
+const PRIORITY_SUFFIX: &str = "-fast";
+
 /// Name of the deployed endpoints in messages.
 pub const DEPLOYED_ENDPOINT_FAMILY_LABEL: &str = "deployed endpoint (endpoint/<name>)";
 
@@ -41,6 +45,10 @@ pub struct ModelSpec {
     /// Whether the model accepts `thinkingLevel: MINIMAL`. Models that do not
     /// get `LOW` as their smallest thinking level.
     pub supports_minimal: bool,
+    /// Whether the model also has a `<id>-fast` name, which asks Vertex AI
+    /// for Priority PayGo. Set only for models Google lists as supporting
+    /// that tier.
+    pub priority: bool,
 }
 
 /// The Gemini models on Vertex AI's model pages that this proxy registers.
@@ -48,46 +56,57 @@ pub const MODELS: &[ModelSpec] = &[
     ModelSpec {
         id: "gemini-4-argon",
         supports_minimal: false,
+        priority: true,
     },
     ModelSpec {
         id: "gemini-4-carbon",
         supports_minimal: false,
+        priority: true,
     },
     ModelSpec {
         id: "gemini-4-hydrogen",
         supports_minimal: false,
+        priority: true,
     },
     ModelSpec {
         id: "gemini-4-neon",
         supports_minimal: false,
+        priority: true,
     },
     ModelSpec {
         id: "gemini-3.8-flash",
         supports_minimal: false,
+        priority: false,
     },
     ModelSpec {
         id: "gemini-3.7-flash",
         supports_minimal: false,
+        priority: false,
     },
     ModelSpec {
         id: "gemini-3.5-flash",
         supports_minimal: true,
+        priority: false,
     },
     ModelSpec {
         id: "gemini-3.5-flash-lite",
         supports_minimal: true,
+        priority: false,
     },
     ModelSpec {
         id: "gemini-3.1-flash-lite",
         supports_minimal: true,
+        priority: false,
     },
     ModelSpec {
         id: "gemini-3.1-pro-preview",
         supports_minimal: false,
+        priority: false,
     },
     ModelSpec {
         id: "gemini-3-flash-preview",
         supports_minimal: true,
+        priority: false,
     },
 ];
 
@@ -214,7 +233,8 @@ impl Family {
     }
 
     /// The names of the family's registered models as they would be listed:
-    /// each Gemini ID bare and with `vertex/`, and every other model as
+    /// each Gemini ID, and its `-fast` name when the model has one, bare and
+    /// with `vertex/`, and every other model as
     /// `vertex/<publisher>/<model-id>`. Not sorted. Deployed endpoints have
     /// no registered names; [`advertised_models_with`] lists the configured
     /// ones.
@@ -223,7 +243,13 @@ impl Family {
             Family::DeployedEndpoint => Vec::new(),
             Family::Gemini => MODELS
                 .iter()
-                .flat_map(|model| [model.id.to_string(), format!("{MODEL_PREFIX}{}", model.id)])
+                .flat_map(|model| {
+                    let fast = model
+                        .priority
+                        .then(|| format!("{}{PRIORITY_SUFFIX}", model.id));
+                    std::iter::once(model.id.to_string()).chain(fast)
+                })
+                .flat_map(|id| [format!("{MODEL_PREFIX}{id}"), id])
                 .collect(),
             Family::OpenModel => OPEN_MODELS
                 .iter()
@@ -521,6 +547,10 @@ pub struct ResolvedModel {
     /// Whether the ID is in [`MODELS`], [`PARTNER_MODELS`] or
     /// [`OPEN_MODELS`].
     pub registered: bool,
+    /// Whether the request asks for Priority PayGo: the name was the
+    /// `-fast` name of a Gemini model that has one. `model_id` and
+    /// `upstream_model` are then the model's own, without the suffix.
+    pub priority: bool,
 }
 
 impl ResolvedModel {
@@ -711,6 +741,7 @@ pub fn resolve(raw: &str) -> Result<ResolvedModel, ModelError> {
             location: family.default_location(),
             supports_minimal: false,
             registered: false,
+            priority: false,
         });
     }
     if let Some(row) = PARTNER_MODELS
@@ -727,6 +758,7 @@ pub fn resolve(raw: &str) -> Result<ResolvedModel, ModelError> {
             location: row.location,
             supports_minimal: false,
             registered: true,
+            priority: false,
         });
     }
     if let Some(row) = OPEN_MODELS
@@ -743,6 +775,7 @@ pub fn resolve(raw: &str) -> Result<ResolvedModel, ModelError> {
             location: row.location,
             supports_minimal: false,
             registered: true,
+            priority: false,
         });
     }
     if id.contains('/') {
@@ -774,15 +807,24 @@ pub fn resolve(raw: &str) -> Result<ResolvedModel, ModelError> {
         location: family.default_location(),
         supports_minimal: false,
         registered: false,
+        priority: false,
     })
 }
 
 /// A Gemini model, or `None` when the ID could not be placed in the URL.
+///
+/// `<id>-fast` names a registered model that has such a name, with
+/// Priority PayGo asked for. Any other ID ending in `-fast` is sent as
+/// written, because nothing says it is not a model of its own.
 fn gemini(id: &str) -> Option<ResolvedModel> {
     if !is_valid_model_id(id) {
         return None;
     }
-    let spec = MODELS.iter().find(|spec| spec.id == id);
+    let fast = id
+        .strip_suffix(PRIORITY_SUFFIX)
+        .and_then(|base| MODELS.iter().find(|spec| spec.priority && spec.id == base));
+    let spec = fast.or_else(|| MODELS.iter().find(|spec| spec.id == id));
+    let id = spec.map_or(id, |spec| spec.id);
     Some(ResolvedModel {
         family: Family::Gemini,
         wire: WireFormat::GenerateContent,
@@ -793,6 +835,7 @@ fn gemini(id: &str) -> Option<ResolvedModel> {
         location: LocationRule::Inherit,
         supports_minimal: spec.is_some_and(|spec| spec.supports_minimal),
         registered: spec.is_some(),
+        priority: fast.is_some(),
     })
 }
 
@@ -886,10 +929,77 @@ mod tests {
                         location: LocationRule::Inherit,
                         supports_minimal: *supports_minimal,
                         registered: true,
+                        priority: false,
                     },
                     "{raw}"
                 );
             }
+        }
+    }
+
+    /// The registered models that have a `-fast` name. Each is on Google's
+    /// list of models that support Priority PayGo.
+    const EXPECTED_FAST: &[&str] = &[
+        "gemini-4-argon",
+        "gemini-4-carbon",
+        "gemini-4-hydrogen",
+        "gemini-4-neon",
+    ];
+
+    #[test]
+    fn fast_names_resolve_to_the_model_itself_with_priority_asked_for() {
+        let with_fast_name: Vec<&str> = MODELS
+            .iter()
+            .filter(|spec| spec.priority)
+            .map(|spec| spec.id)
+            .collect();
+        assert_eq!(with_fast_name, EXPECTED_FAST);
+        for id in EXPECTED_FAST {
+            let plain = resolve(id).unwrap_or_else(|error| panic!("{id}: {error}"));
+            assert!(!plain.priority, "{id}");
+            for raw in [
+                format!("{id}-fast"),
+                format!("vertex/{id}-fast"),
+                format!("vertex/google/{id}-fast"),
+            ] {
+                let resolved = resolve(&raw).unwrap_or_else(|error| panic!("{raw}: {error}"));
+                // Same model, same override key and same thought-signature
+                // name as without the suffix: only the tier differs.
+                assert_eq!(
+                    resolved,
+                    ResolvedModel {
+                        priority: true,
+                        ..plain.clone()
+                    },
+                    "{raw}"
+                );
+                assert_eq!(resolved.upstream_model, *id, "{raw}");
+                assert_eq!(resolved.override_key(), format!("google/{id}"), "{raw}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_fast_suffix_on_any_other_id_stays_in_the_model_id() {
+        let tests = [
+            // Registered, but without a `-fast` name.
+            ("gemini-3.5-flash-fast", "gemini-3.5-flash-fast"),
+            ("vertex/gemini-3.8-flash-fast", "gemini-3.8-flash-fast"),
+            // Not registered.
+            ("vertex/gemini-9-future-fast", "gemini-9-future-fast"),
+            // The suffix is taken off once.
+            (
+                "vertex/gemini-4-argon-fast-fast",
+                "gemini-4-argon-fast-fast",
+            ),
+            ("vertex/google/gemini-4-neon-faster", "gemini-4-neon-faster"),
+        ];
+        for (raw, id) in tests {
+            let resolved = resolve(raw).unwrap_or_else(|error| panic!("{raw}: {error}"));
+            assert_eq!(resolved.upstream_model, id, "{raw}");
+            assert_eq!(resolved.model_id, id, "{raw}");
+            assert!(!resolved.priority, "{raw}");
+            assert!(!resolved.registered, "{raw}");
         }
     }
 
@@ -956,10 +1066,15 @@ mod tests {
     #[test]
     fn advertised_models_are_the_registered_ids_bare_and_prefixed() {
         let advertised = advertised_models();
-        assert_eq!(advertised.len(), 57);
+        assert_eq!(advertised.len(), 65);
         for (id, _) in EXPECTED {
             assert!(advertised.contains(&id.to_string()), "{id}");
             assert!(advertised.contains(&format!("vertex/{id}")), "{id}");
+            // A `-fast` name is listed for exactly the models that have one.
+            let has_fast_name = EXPECTED_FAST.contains(id);
+            for fast in [format!("{id}-fast"), format!("vertex/{id}-fast")] {
+                assert_eq!(advertised.contains(&fast), has_fast_name, "{fast}");
+            }
         }
         let mut sorted = advertised.clone();
         sorted.sort_unstable();
@@ -1345,6 +1460,7 @@ mod tests {
                     location: LocationRule::Inherit,
                     supports_minimal: false,
                     registered: false,
+                    priority: false,
                 }),
                 "{raw}"
             );
@@ -1400,7 +1516,7 @@ mod tests {
         .unwrap();
         let endpoints = crate::config::resolve_vertex_endpoints(config.path());
         let listed = advertised_models_with(&endpoints);
-        assert_eq!(listed.len(), 58, "{listed:?}");
+        assert_eq!(listed.len(), 66, "{listed:?}");
         assert!(listed.contains(&"vertex/endpoint/my-llm".to_string()));
         assert!(!listed.iter().any(|name| name.contains("broken")));
         let mut sorted = listed.clone();
@@ -1622,6 +1738,11 @@ mod tests {
         let mut expected: Vec<String> = EXPECTED
             .iter()
             .flat_map(|(id, _)| [id.to_string(), format!("vertex/{id}")])
+            .chain(
+                EXPECTED_FAST
+                    .iter()
+                    .flat_map(|id| [format!("{id}-fast"), format!("vertex/{id}-fast")]),
+            )
             .chain(CLAUDE_NAMES.iter().map(|name| name.to_string()))
             .chain(
                 [
@@ -1722,14 +1843,14 @@ mod tests {
             ]
         );
         assert_eq!(Family::Claude.model_names().len(), 14);
-        assert_eq!(Family::Gemini.model_names().len(), 22);
+        assert_eq!(Family::Gemini.model_names().len(), 30);
         let every: usize = Family::ALL
             .into_iter()
             .map(|family| family.model_names().len())
             .sum();
         assert_eq!(
             every,
-            22 + EXPECTED_PARTNERS.len() + EXPECTED_OPEN_MODELS.len()
+            30 + EXPECTED_PARTNERS.len() + EXPECTED_OPEN_MODELS.len()
         );
         for (raw, family, ..) in EXPECTED_PARTNERS {
             assert!(family.model_names().contains(&raw.to_string()), "{raw}");
