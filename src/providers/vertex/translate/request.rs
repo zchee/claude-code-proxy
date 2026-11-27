@@ -330,7 +330,8 @@ pub fn prepare_request(
 }
 
 /// Builds `contents`, merging consecutive messages of one role and dropping
-/// turns without parts.
+/// turns without parts. The one exception to the merge: text and images never
+/// share a user content with function responses (see `flush_user`).
 struct ContentsBuilder<'a> {
     model: &'a str,
     contents: Vec<Content>,
@@ -479,20 +480,42 @@ impl<'a> ContentsBuilder<'a> {
     /// Writes the collected user turn. Function responses come first, in the
     /// order of the calls in the preceding model turn (results whose call is
     /// not there keep their relative order after them); text and images
-    /// follow. Gemini rejects responses interleaved with other parts.
+    /// follow in a user content of their own. Gemini rejects responses
+    /// interleaved with other parts, and Vertex AI answers a content that
+    /// holds function responses followed by text with "Requests ending with
+    /// a model turn are not supported", which Claude Code sends whenever a
+    /// skill or hook adds text beside tool results.
     fn flush_user(&mut self) {
         let mut turn = std::mem::take(&mut self.user);
-        if turn.responses.is_empty() && turn.others.is_empty() {
-            return;
-        }
         turn.responses
             .sort_by_key(|(position, _)| position.unwrap_or(usize::MAX));
-        let parts: Vec<Part> = turn
-            .responses
-            .into_iter()
-            .map(|(_, part)| part)
-            .chain(turn.others)
-            .collect();
+        let responses: Vec<Part> = turn.responses.into_iter().map(|(_, part)| part).collect();
+        self.push_user_parts(responses);
+        // Checked on the content itself, not on this turn: a model message
+        // that produced no parts leaves the previous turn's responses last.
+        let last_holds_responses = matches!(
+            self.contents.last(),
+            Some(Content {
+                role: Some(Role::User),
+                parts,
+            }) if parts.iter().any(|part| part.function_response.is_some())
+        );
+        if last_holds_responses && !turn.others.is_empty() {
+            self.contents.push(Content {
+                role: Some(Role::User),
+                parts: turn.others,
+            });
+        } else {
+            self.push_user_parts(turn.others);
+        }
+    }
+
+    /// Appends parts to the last content when it is a user content, else
+    /// starts a user content.
+    fn push_user_parts(&mut self, parts: Vec<Part>) {
+        if parts.is_empty() {
+            return;
+        }
         match self.contents.last_mut() {
             Some(Content {
                 role: Some(Role::User),
@@ -1035,13 +1058,112 @@ mod tests {
             ]}
         ]}));
         assert_eq!(
-            wire["contents"][2]["parts"],
-            json!([
+            wire["contents"][2],
+            json!({"role":"user","parts":[
                 {"functionResponse":{"name":"Read","response":{"output":"one"}}},
-                {"functionResponse":{"name":"Grep","response":{"output":"two"}}},
+                {"functionResponse":{"name":"Grep","response":{"output":"two"}}}
+            ]})
+        );
+        assert_eq!(
+            wire["contents"][3],
+            json!({"role":"user","parts":[
                 {"text":"note first"},
                 {"inlineData":{"mimeType":"image/png","data":"iVBORw0K"}}
+            ]})
+        );
+        assert_eq!(wire["contents"].as_array().map(Vec::len), Some(4));
+    }
+
+    #[test]
+    fn text_after_tool_results_goes_in_its_own_user_content() {
+        // Claude Code puts a skill's body or a hook's context beside the tool
+        // results of a step, and a later user message can follow them too;
+        // neither may share a content with the function responses.
+        let with_results = wire(json!({"messages":[
+            {"role":"user","content":"q"},
+            {"role":"assistant","content":[tool_use("t1","Skill")]},
+            {"role":"user","content":[
+                tool_result("t1","Launching skill: demo"),
+                {"type":"text","text":"skill body"}
+            ]},
+            {"role":"user","content":[{"type":"text","text":"hook context"}]}
+        ]}));
+        assert_eq!(
+            with_results["contents"],
+            json!([
+                {"role":"user","parts":[{"text":"q"}]},
+                with_results["contents"][1].clone(),
+                {"role":"user","parts":[
+                    {"functionResponse":{"name":"Skill","response":{"output":"Launching skill: demo"}}}
+                ]},
+                {"role":"user","parts":[{"text":"skill body"},{"text":"hook context"}]}
             ])
+        );
+        assert_eq!(with_results["contents"][1]["role"], json!("model"));
+
+        // A model message with no parts (thinking only) between the results
+        // and the next user text adds no model content, so the text must
+        // still not join the function responses.
+        let after_empty_model = wire(json!({"messages":[
+            {"role":"user","content":"q"},
+            {"role":"assistant","content":[tool_use("t1","Skill")]},
+            {"role":"user","content":[tool_result("t1","Launching skill: demo")]},
+            {"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"foreign"}]},
+            {"role":"user","content":"next"}
+        ]}));
+        assert_eq!(
+            after_empty_model["contents"][2],
+            json!({"role":"user","parts":[
+                {"functionResponse":{"name":"Skill","response":{"output":"Launching skill: demo"}}}
+            ]})
+        );
+        assert_eq!(
+            after_empty_model["contents"][3],
+            json!({"role":"user","parts":[{"text":"next"}]})
+        );
+        assert_eq!(
+            after_empty_model["contents"].as_array().map(Vec::len),
+            Some(4)
+        );
+
+        // Without function responses, consecutive user text still merges.
+        let text_only = wire(json!({"messages":[
+            {"role":"user","content":"a"},
+            {"role":"user","content":"b"}
+        ]}));
+        assert_eq!(
+            text_only["contents"],
+            json!([{"role":"user","parts":[{"text":"a"},{"text":"b"}]}])
+        );
+
+        // Every later request replays the split in the middle of the
+        // history, and a turn that holds only results keeps one content.
+        let later_step = wire(json!({"messages":[
+            {"role":"user","content":"q"},
+            {"role":"assistant","content":[tool_use("t1","Skill")]},
+            {"role":"user","content":[
+                tool_result("t1","Launching skill: demo"),
+                {"type":"text","text":"skill body"}
+            ]},
+            {"role":"assistant","content":[tool_use("t2","Bash")]},
+            {"role":"user","content":[tool_result("t2","hi")]}
+        ]}));
+        let roles: Vec<&str> = later_step["contents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|content| content["role"].as_str())
+            .collect();
+        assert_eq!(roles, ["user", "model", "user", "user", "model", "user"]);
+        assert_eq!(
+            later_step["contents"][3],
+            json!({"role":"user","parts":[{"text":"skill body"}]})
+        );
+        assert_eq!(
+            later_step["contents"][5],
+            json!({"role":"user","parts":[
+                {"functionResponse":{"name":"Bash","response":{"output":"hi"}}}
+            ]})
         );
     }
 
