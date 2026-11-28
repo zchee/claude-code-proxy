@@ -947,7 +947,7 @@ fn stream_error(error: &StreamError, sanitize: &Sanitizer) -> ProviderError {
 /// The status and kind the proxy answers with for an Anthropic error type:
 /// 429, 401, 403 and 400 for the rate-limit, authentication, permission and
 /// invalid-request types, a 502 `api_error` for every other type.
-pub(super) fn status_for_error_type(error_type: &str) -> (StatusCode, ProviderErrorKind) {
+pub(crate) fn status_for_error_type(error_type: &str) -> (StatusCode, ProviderErrorKind) {
     match error_type {
         "rate_limit_error" => (StatusCode::TOO_MANY_REQUESTS, ProviderErrorKind::RateLimit),
         "authentication_error" => (StatusCode::UNAUTHORIZED, ProviderErrorKind::Authentication),

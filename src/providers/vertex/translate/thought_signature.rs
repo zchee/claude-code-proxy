@@ -41,17 +41,29 @@ pub fn is_vertex_thought_signature(value: &str) -> bool {
 /// separator), or when `signature` is over [`MAX_SIGNATURE_BYTES`]. An empty
 /// `signature` is allowed and yields the "no signature" envelope.
 pub fn encode_envelope(model: &str, signature: &str) -> Option<String> {
+    encode_envelope_with(ENVELOPE_PREFIX, model, signature)
+}
+
+/// [`encode_envelope`] with another provider's `prefix`, so each provider's
+/// signatures stay apart from the others'.
+pub fn encode_envelope_with(prefix: &str, model: &str, signature: &str) -> Option<String> {
     if model.is_empty() || model.contains(':') || signature.len() > MAX_SIGNATURE_BYTES {
         return None;
     }
-    Some(format!("{ENVELOPE_PREFIX}{model}:{signature}"))
+    Some(format!("{prefix}{model}:{signature}"))
 }
 
 /// Reads an envelope produced by [`encode_envelope`]. Any other value,
 /// including a signature from another provider or from Anthropic, yields
 /// `None`.
 pub fn decode_envelope(value: &str) -> Option<ThoughtSignature<'_>> {
-    let payload = value.strip_prefix(ENVELOPE_PREFIX)?;
+    decode_envelope_with(ENVELOPE_PREFIX, value)
+}
+
+/// [`decode_envelope`] for envelopes made by [`encode_envelope_with`] with
+/// `prefix`.
+pub fn decode_envelope_with<'a>(prefix: &str, value: &'a str) -> Option<ThoughtSignature<'a>> {
+    let payload = value.strip_prefix(prefix)?;
     let (model, signature) = payload.split_once(':')?;
     if model.is_empty() || signature.len() > MAX_SIGNATURE_BYTES {
         return None;
@@ -63,7 +75,12 @@ pub fn decode_envelope(value: &str) -> Option<ThoughtSignature<'_>> {
 /// carries one; `None` for any other value, another model's envelope, or the
 /// "no signature" envelope.
 pub fn signature_for_model<'a>(value: &'a str, model: &str) -> Option<&'a str> {
-    decode_envelope(value)
+    signature_for_model_with(ENVELOPE_PREFIX, value, model)
+}
+
+/// [`signature_for_model`] for envelopes made with `prefix`.
+pub fn signature_for_model_with<'a>(prefix: &str, value: &'a str, model: &str) -> Option<&'a str> {
+    decode_envelope_with(prefix, value)
         .filter(|decoded| decoded.model == model && !decoded.signature.is_empty())
         .map(|decoded| decoded.signature)
 }

@@ -1079,7 +1079,7 @@ impl VertexClient {
 /// Reads at most `limit` bytes. The flag is true when the body reached the
 /// limit or broke off; reaching the limit ends the read without waiting for
 /// more.
-async fn read_bounded(response: reqwest::Response, limit: usize) -> (Vec<u8>, bool) {
+pub(crate) async fn read_bounded(response: reqwest::Response, limit: usize) -> (Vec<u8>, bool) {
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -1140,7 +1140,9 @@ pub fn redact_for_capture(value: &serde_json::Value, token: Option<&str>) -> ser
     redact_every_string(value, &|text: &str| redact_secrets(text, &secrets))
 }
 
-fn safe_response_headers(headers: &reqwest::header::HeaderMap) -> serde_json::Value {
+/// The response headers a capture may record: content type and length,
+/// and `retry-after`.
+pub(crate) fn safe_response_headers(headers: &reqwest::header::HeaderMap) -> serde_json::Value {
     let mut result = serde_json::Map::new();
     for name in CAPTURED_RESPONSE_HEADERS {
         if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {

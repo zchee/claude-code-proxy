@@ -22,6 +22,9 @@ pub const MAX_OUTPUT_TOKENS: u32 = 65_536;
 /// Longest function name `FunctionDeclaration` accepts.
 const MAX_FUNCTION_NAME_CHARS: usize = 128;
 
+/// How this translator names the upstream in its error messages.
+const PROVIDER_LABEL: &str = "Vertex AI Gemini";
+
 /// The `generateContent` / `streamGenerateContent` request body.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -431,7 +434,7 @@ impl<'a> ContentsBuilder<'a> {
                     ..Part::default()
                 }),
                 ContentBlock::Image { source } => self.user.others.push(Part {
-                    inline_data: Some(inline_image(source)?),
+                    inline_data: Some(inline_image(source, PROVIDER_LABEL)?),
                     ..Part::default()
                 }),
                 ContentBlock::ToolResult {
@@ -444,7 +447,7 @@ impl<'a> ContentsBuilder<'a> {
                             "tool_result {tool_use_id} does not match any earlier tool_use"
                         )
                     })?;
-                    let rendered = render_tool_result(content)?;
+                    let rendered = render_tool_result(content, PROVIDER_LABEL)?;
                     let key = if is_error.unwrap_or(false) {
                         "error"
                     } else {
@@ -557,12 +560,22 @@ impl<'a> ContentsBuilder<'a> {
     }
 }
 
-struct RenderedToolResult {
-    text: String,
-    images: Vec<Blob>,
+/// An Anthropic `tool_result` content split into its text and its images.
+pub struct RenderedToolResult {
+    /// Every text block, joined by newlines; blocks of other types are
+    /// replaced by a note that they were omitted.
+    pub text: String,
+    /// Every base64 image, in order.
+    pub images: Vec<Blob>,
 }
 
-fn render_tool_result(content: &Value) -> anyhow::Result<RenderedToolResult> {
+/// Splits a `tool_result` content into text and images. `provider` names
+/// the upstream in the error for a URL image.
+///
+/// # Errors
+///
+/// Fails for an image block without a source, a URL image or an empty one.
+pub fn render_tool_result(content: &Value, provider: &str) -> anyhow::Result<RenderedToolResult> {
     let mut texts = Vec::new();
     let mut images = Vec::new();
     match content {
@@ -582,7 +595,7 @@ fn render_tool_result(content: &Value) -> anyhow::Result<RenderedToolResult> {
                             .next();
                         match block {
                             Some(ContentBlock::Image { source }) => {
-                                images.push(inline_image(&source)?);
+                                images.push(inline_image(&source, provider)?);
                             }
                             _ => anyhow::bail!("tool_result image block has no source"),
                         }
@@ -602,9 +615,15 @@ fn render_tool_result(content: &Value) -> anyhow::Result<RenderedToolResult> {
     })
 }
 
-fn inline_image(source: &ImageSource) -> anyhow::Result<Blob> {
+/// The base64 image of an Anthropic image block. `provider` names the
+/// upstream in the error for a URL image.
+///
+/// # Errors
+///
+/// Fails for a URL image and for an image without data.
+pub fn inline_image(source: &ImageSource, provider: &str) -> anyhow::Result<Blob> {
     if source.source_type == "url" {
-        anyhow::bail!("Vertex AI Gemini does not accept image URLs; send the image as base64 data");
+        anyhow::bail!("{provider} does not accept image URLs; send the image as base64 data");
     }
     if source.data.is_empty() {
         anyhow::bail!("image block has no data");
@@ -616,6 +635,21 @@ fn inline_image(source: &ImageSource) -> anyhow::Result<Blob> {
 }
 
 fn read_tools(req: &MessagesRequest) -> anyhow::Result<Vec<FunctionDeclaration>> {
+    read_function_declarations(req, PROVIDER_LABEL)
+}
+
+/// The request's `tools` as function declarations, with `input_schema`
+/// unchanged. `provider` names the upstream in the errors.
+///
+/// # Errors
+///
+/// Fails for a `tools` value that is not an array of objects, an Anthropic
+/// server tool, a function name Gemini does not accept, or a description
+/// that is not a string.
+pub fn read_function_declarations(
+    req: &MessagesRequest,
+    provider: &str,
+) -> anyhow::Result<Vec<FunctionDeclaration>> {
     let tools = match req.extra.get("tools") {
         None | Some(Value::Null) => return Ok(Vec::new()),
         Some(Value::Array(tools)) => tools,
@@ -630,9 +664,9 @@ fn read_tools(req: &MessagesRequest) -> anyhow::Result<Vec<FunctionDeclaration>>
             match tool.get("type") {
                 None | Some(Value::Null) => {}
                 Some(Value::String(kind)) if kind == "custom" => {}
-                Some(Value::String(kind)) => anyhow::bail!(
-                    "Vertex AI Gemini does not support the Anthropic server tool {kind}"
-                ),
+                Some(Value::String(kind)) => {
+                    anyhow::bail!("{provider} does not support the Anthropic server tool {kind}")
+                }
                 Some(_) => anyhow::bail!("tool type must be a string"),
             }
             let name = tool
@@ -642,7 +676,7 @@ fn read_tools(req: &MessagesRequest) -> anyhow::Result<Vec<FunctionDeclaration>>
                 .ok_or_else(|| anyhow::anyhow!("tool name must be a non-empty string"))?;
             if !is_valid_function_name(name) {
                 anyhow::bail!(
-                    "tool name {name:?} is not accepted by Vertex AI Gemini: a name starts with \
+                    "tool name {name:?} is not accepted by {provider}: a name starts with \
                      a letter or '_', contains only letters, digits, '_', '.', ':' and '-', and \
                      has at most {MAX_FUNCTION_NAME_CHARS} characters"
                 );
@@ -674,7 +708,14 @@ fn is_valid_function_name(name: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || b"_.:-".contains(&byte))
 }
 
-fn read_tool_choice(req: &MessagesRequest) -> anyhow::Result<Option<FunctionCallingConfig>> {
+/// The request's `tool_choice` as a function-calling mode; `{type:"tool"}`
+/// becomes [`FunctionCallingMode::Any`] limited to that function.
+/// `disable_parallel_tool_use` is ignored.
+///
+/// # Errors
+///
+/// Fails for a malformed `tool_choice` or an unknown type.
+pub fn read_tool_choice(req: &MessagesRequest) -> anyhow::Result<Option<FunctionCallingConfig>> {
     let choice = match req.extra.get("tool_choice") {
         None | Some(Value::Null) => return Ok(None),
         Some(Value::Object(choice)) => choice,
