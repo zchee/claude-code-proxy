@@ -2463,35 +2463,45 @@ mod google_ai_plan {
 
     const TOKEN: &str = "ya29.synthetic-plan-server-token-5e6f7a";
 
-    /// One text turn the way the Interactions API streams it.
+    /// One text turn the way Cloud Code PA streams it.
     fn text_turn() -> String {
-        [
-            json!({"event_type":"step.start","index":0,"step":{"type":"model_output"}}),
-            json!({"event_type":"step.delta","index":0,"delta":{"type":"text","text":"ok"}}),
-            json!({"event_type":"step.stop","index":0}),
-            json!({"event_type":"interaction.completed","interaction":{"status":"completed",
-                "usage":{"total_input_tokens":9,"total_output_tokens":1}}}),
-        ]
+        [json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": "ok"}]
+                    },
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 9,
+                    "candidatesTokenCount": 1
+                }
+            }
+        })]
         .iter()
-        .map(|event| {
-            format!(
-                "event: {}\ndata: {event}\n\n",
-                event["event_type"].as_str().unwrap()
-            )
-        })
+        .map(|event| format!("data: {event}\n\n"))
         .collect()
     }
 
-    /// A fake Interactions endpoint that answers every call with `text_turn`
-    /// and counts the calls, and a registry with a provider pointed at it.
+    /// A fake Cloud Code PA endpoint that answers `loadCodeAssist` with a
+    /// project ID and `streamGenerateContent` with `text_turn`, counting the
+    /// generation calls.
     async fn registry() -> (Arc<Registry>, Arc<Mutex<Vec<Value>>>) {
         let bodies: Arc<Mutex<Vec<Value>>> = Arc::default();
         let seen = bodies.clone();
         let upstream = axum::Router::new().route(
             "/{*path}",
-            axum::routing::post(move |body: axum::body::Bytes| {
+            axum::routing::post(move |uri: http::Uri, body: axum::body::Bytes| {
                 let seen = seen.clone();
                 async move {
+                    if uri.path().ends_with(":loadCodeAssist") {
+                        return (
+                            [(http::header::CONTENT_TYPE, "application/json")],
+                            json!({"cloudaicompanionProject": "synthetic-project"}).to_string(),
+                        );
+                    }
                     seen.lock()
                         .unwrap()
                         .push(serde_json::from_slice(&body).unwrap_or(Value::Null));
@@ -2511,7 +2521,7 @@ mod google_ai_plan {
             client_secret: "synthetic-server-secret".to_string(),
         };
         let settings = GoogleAiPlanSettings {
-            base_url: format!("http://{addr}/v1beta"),
+            base_url: format!("http://{addr}"),
             client: client.clone(),
             user_agent: "synthetic-agent/1".to_string(),
         };
@@ -2522,9 +2532,9 @@ mod google_ai_plan {
                 refresh: "synthetic-refresh".to_string(),
                 expires_at_ms: u64::MAX / 2,
                 client_id: client.client_id.clone(),
-                // Read only by a refresh, which a fresh token never needs.
-                dpop_key: "synthetic-unused".to_string(),
+                dpop_key: String::new(),
                 dpop_nonce: None,
+                project_id: None,
             })
             .unwrap();
         let auth =
@@ -2628,8 +2638,10 @@ mod google_ai_plan {
         let sent = bodies.lock().unwrap().clone();
         assert_eq!(sent.len(), 4, "{sent:?}");
         for body in sent {
+            assert_eq!(body["project"], "synthetic-project", "{body}");
             assert_eq!(body["model"], "gemini-4-neon", "{body}");
-            assert_eq!(body["stream"], true, "{body}");
+            assert_eq!(body["userAgent"], "antigravity", "{body}");
+            assert_eq!(body["requestType"], "agent", "{body}");
         }
     }
 }

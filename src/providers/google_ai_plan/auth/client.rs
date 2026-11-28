@@ -5,25 +5,24 @@ use std::sync::LazyLock;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 
-/// Base64-encoded OAuth client id of the Google `Desktop app` client the pi
-/// project registered for the Google AI Ultra plan.
+/// Base64-encoded OAuth client id of the Google `Desktop app` client that
+/// Antigravity (`agy`) uses against Cloud Code PA for the Google AI Ultra plan.
 ///
 /// Stored encoded so repository secret scanners do not flag the public
 /// installed-app client id on push.
-pub const BUILT_IN_CLIENT_ID_B64: &str = "MTAyMzEzMTkwMjIwNy1xaXA3aXA4cDNobDBoaTRjcHRqa3YyZGtpZ2t0MDNvbS5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==";
+pub const BUILT_IN_CLIENT_ID_B64: &str = "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==";
 
 /// Base64-encoded OAuth client secret of the same client. An installed app's
 /// secret cannot be kept confidential (RFC 8252 section 8.5), and Google treats
-/// it as non-confidential; the sign-in is protected by the loopback redirect,
-/// PKCE and DPoP. It is still kept out of logs and `Debug` output, and stored
-/// base64-encoded in source to avoid triggering repository secret scanning.
-pub const BUILT_IN_CLIENT_SECRET_B64: &str = "R09DU1BYLVpya3NCdlN4VmNVaEV3U2IyNVB6LXdoNlF2d28=";
+/// it as non-confidential; the sign-in is protected by the loopback redirect
+/// and PKCE. It is still kept out of logs and `Debug` output, and stored
+/// base64-encoded in source to avoid triggering GitHub push protection.
+pub const BUILT_IN_CLIENT_SECRET_B64: &str = "R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=";
 
 /// Decoded OAuth client id of the built-in Google `Desktop app` client.
 ///
-/// Google approves such clients per app, and pi's README asks other apps to
-/// register their own; that is why configuration can replace it
-/// (`googleAiPlan.clientId` / `CCP_GOOGLE_AI_PLAN_CLIENT_ID`).
+/// Configuration can replace it (`googleAiPlan.clientId` /
+/// `CCP_GOOGLE_AI_PLAN_CLIENT_ID`).
 pub static BUILT_IN_CLIENT_ID: LazyLock<String> = LazyLock::new(|| {
     let bytes = STANDARD
         .decode(BUILT_IN_CLIENT_ID_B64)

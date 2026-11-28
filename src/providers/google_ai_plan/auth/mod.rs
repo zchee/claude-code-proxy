@@ -1,12 +1,14 @@
 //! Google sign-in for the Google AI Ultra plan: Google OAuth for a
 //! `Desktop app` client (the built-in one in [`client`], or one from the
-//! configuration) with a loopback redirect, PKCE and DPoP (RFC 9449).
+//! configuration) with a loopback redirect and PKCE.
 //!
-//! Google binds the refresh token to a P-256 key pair created on this machine
-//! ([`dpop`]); every call to the token endpoint carries a proof signed with
-//! that key. Model calls use the access token as a plain Bearer token, without
-//! DPoP. [`login`] runs the browser sign-in, [`manager`] hands out access
-//! tokens and refreshes them, and [`token_store`] keeps the credential.
+//! Model calls send the access token as a Bearer token, and token refreshes
+//! send the refresh token in the OAuth form, both without DPoP. [`login`]
+//! runs the browser sign-in, [`manager`] hands out access tokens and
+//! refreshes them, and [`token_store`] keeps the credential. A credential
+//! from an older DPoP-bound sign-in is recognized by its non-empty stored
+//! DPoP key and the user is asked to sign in again; no request path uses
+//! the [`dpop`] module.
 
 pub mod client;
 pub mod dpop;
@@ -24,13 +26,15 @@ pub const AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 /// Google's OAuth token endpoint, for the code exchange and refreshes.
 pub const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
-/// The scope that grants the Google AI Ultra plan's per-user quota. A sign-in
-/// that does not grant it cannot call the plan's models.
-pub const QUOTA_SCOPE: &str = "https://www.googleapis.com/auth/generative-language.peruserquota";
+/// The scope that grants Cloud Code PA access for the Google AI Ultra plan.
+/// A sign-in that does not grant it cannot call the plan's models.
+pub const QUOTA_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
-/// Every scope the sign-in asks for.
-pub const SCOPES: &str =
-    "openid email profile https://www.googleapis.com/auth/generative-language.peruserquota";
+/// The AI Code scope requested by Antigravity (`agy`) for Cloud Code PA.
+pub const AICODE_SCOPE: &str = "https://www.googleapis.com/auth/aicode";
+
+/// Every scope the sign-in asks for, matching Antigravity (`agy`).
+pub const SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs https://www.googleapis.com/auth/aicode";
 
 /// The command that signs in, named in every message that asks the user to
 /// sign in (again).
@@ -57,15 +61,11 @@ pub(crate) struct TokenResponse {
     pub error_description: Option<String>,
 }
 
-/// One token endpoint response: its status, body, the `DPoP-Nonce` header and
-/// Google's clock from the `Date` header.
+/// One token endpoint response: its status and parsed body.
 #[derive(Debug, Clone)]
 pub(crate) struct TokenReply {
     pub status: u16,
     pub body: TokenResponse,
-    pub nonce: Option<String>,
-    /// Google's clock in Unix seconds; used when the local clock is off.
-    pub server_time: Option<i64>,
 }
 
 impl TokenReply {
@@ -80,7 +80,7 @@ impl TokenReply {
     /// Google puts the tokens, so a cut-short or otherwise malformed one may
     /// still hold them, and so may JSON that is not an object (a string, or
     /// an array around the token object) whatever the status.
-    pub(crate) fn from_parts(status: u16, headers: &http::HeaderMap, text: &str) -> Self {
+    pub(crate) fn from_parts(status: u16, text: &str) -> Self {
         let body = match serde_json::from_str::<serde_json::Value>(text) {
             Ok(serde_json::Value::Object(fields)) => {
                 let string = |name: &str| {
@@ -115,18 +115,7 @@ impl TokenReply {
                 ..TokenResponse::default()
             },
         };
-        let header = |name: &str| {
-            headers
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-        };
-        Self {
-            status,
-            body,
-            nonce: header("dpop-nonce").filter(|nonce| !nonce.is_empty()),
-            server_time: header("date").as_deref().and_then(parse_http_date),
-        }
+        Self { status, body }
     }
 
     /// `<prefix>: <status> <error> <error_description>`, leaving out the
@@ -160,14 +149,6 @@ pub(crate) fn token_form<'a>(
 /// minutes before it, as Google's docs ask.
 pub(crate) fn access_expiry_ms(body: &TokenResponse) -> u64 {
     now_ms().saturating_add(body.expires_in.unwrap_or(3599).saturating_mul(1000))
-}
-
-/// An HTTP date (`Wed, 25 Nov 2026 12:00:00 GMT`) in Unix seconds.
-fn parse_http_date(value: &str) -> Option<i64> {
-    jiff::fmt::rfc2822::DateTimeParser::new()
-        .parse_timestamp(value.trim())
-        .ok()
-        .map(|timestamp| timestamp.as_second())
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -210,11 +191,6 @@ pub(super) mod test_support {
 
     use crate::config::GoogleAiPlanClient;
 
-    /// The date the reference tests use for Google's clock.
-    pub const SERVER_DATE: &str = "Wed, 25 Nov 2026 12:00:00 GMT";
-    /// [`SERVER_DATE`] in Unix seconds.
-    pub const SERVER_TIME: i64 = 1_795_608_000;
-
     pub fn synthetic_client() -> GoogleAiPlanClient {
         GoogleAiPlanClient {
             client_id: "synthetic-client".to_string(),
@@ -246,11 +222,6 @@ pub(super) mod test_support {
                 body: serde_json::json!({ "error": error }).to_string(),
             }
         }
-
-        pub fn with_headers(mut self, headers: &[(&'static str, &'static str)]) -> Self {
-            self.headers = headers.to_vec();
-            self
-        }
     }
 
     /// One request the fake endpoint received.
@@ -261,26 +232,6 @@ pub(super) mod test_support {
         pub accept: Option<String>,
         pub content_type: Option<String>,
         pub form: HashMap<String, String>,
-    }
-
-    impl SeenTokenRequest {
-        pub fn proof_header(&self) -> serde_json::Value {
-            proof_part(
-                self.dpop
-                    .as_deref()
-                    .expect("the request carries a DPoP proof"),
-                0,
-            )
-        }
-
-        pub fn proof_claims(&self) -> serde_json::Value {
-            proof_part(
-                self.dpop
-                    .as_deref()
-                    .expect("the request carries a DPoP proof"),
-                1,
-            )
-        }
     }
 
     /// Decodes the header (`0`) or the claims (`1`) of a compact JWT.
@@ -366,44 +317,26 @@ pub(super) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{SERVER_DATE, SERVER_TIME};
     use super::*;
 
-    fn headers(pairs: &[(&'static str, &'static str)]) -> http::HeaderMap {
-        let mut map = http::HeaderMap::new();
-        for (name, value) in pairs {
-            map.insert(*name, http::HeaderValue::from_static(value));
-        }
-        map
-    }
-
     #[test]
-    fn http_dates_parse_to_unix_seconds() {
-        assert_eq!(parse_http_date(SERVER_DATE), Some(SERVER_TIME));
-        assert_eq!(parse_http_date("not a date"), None);
-    }
-
-    #[test]
-    fn token_reply_reads_the_body_nonce_and_server_clock() {
+    fn token_reply_reads_the_error_body() {
         let reply = TokenReply::from_parts(
             400,
-            &headers(&[("dpop-nonce", "n1"), ("date", SERVER_DATE)]),
-            r#"{"error":"use_dpop_nonce","error_description":"Use a nonce"}"#,
+            r#"{"error":"invalid_grant","error_description":"Token expired"}"#,
         );
         assert_eq!(reply.status, 400);
-        assert_eq!(reply.body.error.as_deref(), Some("use_dpop_nonce"));
-        assert_eq!(reply.nonce.as_deref(), Some("n1"));
-        assert_eq!(reply.server_time, Some(SERVER_TIME));
+        assert_eq!(reply.body.error.as_deref(), Some("invalid_grant"));
         assert_eq!(
             reply.describe("Google token refresh failed"),
-            "Google token refresh failed: 400 use_dpop_nonce Use a nonce"
+            "Google token refresh failed: 400 invalid_grant Token expired"
         );
     }
 
     #[test]
     fn error_page_that_is_not_json_becomes_an_http_error_with_a_short_text() {
         let page = format!("<html>Bad gateway {}</html>", "x".repeat(4096));
-        let reply = TokenReply::from_parts(502, &http::HeaderMap::new(), &page);
+        let reply = TokenReply::from_parts(502, &page);
         assert_eq!(reply.body.error.as_deref(), Some("HTTP 502"));
         let description = reply.body.error_description.clone().unwrap();
         assert_eq!(
@@ -418,8 +351,6 @@ mod tests {
             "{described}"
         );
         assert!(!described.contains(NOT_AN_OBJECT), "{described}");
-        assert_eq!(reply.nonce, None);
-        assert_eq!(reply.server_time, None);
     }
 
     #[test]
@@ -459,7 +390,7 @@ mod tests {
             ),
         ];
         for (name, status, body, token) in cases {
-            let reply = TokenReply::from_parts(status, &http::HeaderMap::new(), &body);
+            let reply = TokenReply::from_parts(status, &body);
             let described = reply.describe("Google sign-in failed");
             println!("{name}: {described}");
             assert_eq!(
@@ -480,7 +411,6 @@ mod tests {
         // to the raw text: that text holds the tokens.
         let reply = TokenReply::from_parts(
             200,
-            &http::HeaderMap::new(),
             r#"{"access_token":"synthetic-access","expires_in":"soon","scope":7}"#,
         );
         assert_eq!(reply.body.access_token.as_deref(), Some("synthetic-access"));
@@ -505,5 +435,6 @@ mod tests {
     #[test]
     fn scopes_include_the_quota_scope() {
         assert!(SCOPES.split(' ').any(|scope| scope == QUOTA_SCOPE));
+        assert!(SCOPES.split(' ').any(|scope| scope == AICODE_SCOPE));
     }
 }

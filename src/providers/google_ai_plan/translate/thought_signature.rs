@@ -1,14 +1,16 @@
-//! Carries Interactions thought signatures through Anthropic thinking
-//! blocks.
+//! Carries Gemini `thoughtSignature`s through Anthropic thinking blocks.
 //!
-//! Gemini rejects a replayed `function_call` step that has no signed
-//! `thought` step before it. The proxy keeps no state, so the signature of a
-//! `thought` step travels to the client inside the `signature` of the
-//! thinking block, as `ccp:google-ai-plan:v1:<model>:<signature>`, and comes
-//! back with the history. The prefix differs from the Vertex AI one, so a
+//! Gemini rejects a replayed `functionCall` part that does not carry the
+//! `thoughtSignature` the model returned with it. The proxy keeps no state,
+//! so the signature travels to the client inside the `signature` of an
+//! Anthropic thinking block, as `ccp:google-ai-plan:v1:<model>:<signature>`,
+//! and comes back with the history. On replay the thinking block is not sent
+//! as a thought part: its signature is set on the next `functionCall` part of
+//! the same model turn. The prefix differs from the Vertex AI one, so a
 //! signature is never replayed to the other provider, and the model ID keeps
 //! it from reaching another model. An envelope with an empty signature marks
-//! a thinking block that had none.
+//! a thinking block with no signature to replay: Google sent none, or the one
+//! it sent was over the 1 MiB signature limit.
 
 use crate::providers::vertex::translate::thought_signature::{
     decode_envelope_with, encode_envelope_with, signature_for_model_with,

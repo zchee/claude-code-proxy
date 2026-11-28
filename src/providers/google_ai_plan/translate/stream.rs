@@ -1,31 +1,16 @@
-//! Interactions API SSE step events → Anthropic Messages.
+//! Cloud Code PA `v1internal:streamGenerateContent?alt=sse` chunks → Anthropic Messages.
 //!
 //! One [`LiveStreamTranslator`] drives both the streaming response and the
 //! non-streaming one ([`accumulate_response`]), so the two decide content
 //! and stop reason the same way.
 //!
-//! The upstream sends `step.start`, `step.delta` and `step.stop` events keyed
-//! by a step `index`, closed by `interaction.completed`. Steps may
-//! interleave, but Anthropic content blocks cannot overlap, so blocks follow
-//! the order in which steps started: only the oldest open step streams, and
-//! the content of later steps is held until every step before it has
-//! stopped. A step is never split across two blocks. A function call is
-//! emitted whole when its step stops, once its arguments are known to be one
-//! JSON object.
-//!
-//! | `interaction.completed` status | stop reason |
-//! |---|---|
-//! | `completed` | `end_turn` |
-//! | `requires_action` | `tool_use` |
-//! | `incomplete` | `max_tokens` |
-//! | anything else | error |
-//!
-//! A stream that closes before `interaction.completed` is an error, never a
-//! short answer, and so is an `error` event. The response is complete at
-//! `interaction.completed`; anything after it is not read.
+//! Each SSE `data:` frame from Cloud Code PA is a JSON object wrapping a
+//! `GenerateContentResponse` under `"response"` (plus optional `"traceId"`),
+//! or a flat `GenerateContentResponse` / error object.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashSet;
 
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::thought_signature::encode_envelope;
@@ -35,7 +20,8 @@ pub use crate::providers::vertex::translate::stream::{
     BLOCK_CHARGE, MAX_CONTENT_BYTES, MAX_SSE_FRAME_BYTES, TranslatorConfig,
 };
 
-/// Longest upstream token (a status or an error code) kept in error text.
+/// Longest upstream token (a status, finishReason, blockReason or error code)
+/// kept in error text.
 const MAX_TOKEN_CHARS: usize = 64;
 
 /// Placeholder for an upstream token that is not a plain identifier.
@@ -44,27 +30,66 @@ const UNRECOGNIZED_TOKEN: &str = "unrecognized";
 /// Longest upstream call ID passed through as the `tool_use` ID.
 const MAX_CALL_ID_BYTES: usize = 256;
 
+/// Documented top-level fields of a `GenerateContentResponse` or Cloud Code PA
+/// wrapper chunk.
+const RESPONSE_FIELDS: [&str; 7] = [
+    "candidates",
+    "usageMetadata",
+    "promptFeedback",
+    "modelVersion",
+    "createTime",
+    "responseId",
+    "traceId",
+];
+
+/// Documented fields of a response `Part`.
+const PART_FIELDS: [&str; 9] = [
+    "text",
+    "thought",
+    "thoughtSignature",
+    "functionCall",
+    "inlineData",
+    "fileData",
+    "functionResponse",
+    "executableCode",
+    "codeExecutionResult",
+];
+
 /// Why a stream could not be translated into a successful response.
 ///
 /// `Display` contains only proxy-authored words and identifier tokens.
-/// Upstream prose is kept in `upstream_message` and is added, sanitised,
-/// only by [`StreamError::message_with`].
+/// Upstream prose is kept in `upstream_message` / `finish_message` and is
+/// added, sanitised, only by [`StreamError::message_with`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StreamError {
-    /// The stream carried an `error` event.
+    /// The stream carried an `error` object.
     #[error("Google AI Ultra plan stream reported an error{}", code_suffix(.code))]
     Upstream {
-        /// The error `code` token, such as `invalid_request`.
+        /// The error `code` or `status` token, such as `invalid_request` or
+        /// `INVALID_ARGUMENT`.
         code: Option<String>,
         /// The upstream `error.message`. Unsanitised.
         upstream_message: Option<String>,
     },
-    /// `interaction.completed` carried a status that is not a successful
-    /// end of the turn.
-    #[error("Google AI Ultra plan interaction ended with status {0}")]
-    Status(String),
-    /// The upstream closed before `interaction.completed`.
-    #[error("Google AI Ultra plan stream ended before interaction.completed")]
+    /// `promptFeedback.blockReason` was set.
+    #[error("Google AI Ultra plan blocked the prompt: blockReason {block_reason}")]
+    PromptBlocked {
+        /// The block reason token.
+        block_reason: String,
+        /// The upstream `promptFeedback.blockReasonMessage`. Unsanitised.
+        upstream_message: Option<String>,
+    },
+    /// `candidates[0].finishReason` carried a value other than `STOP` or
+    /// `MAX_TOKENS`.
+    #[error("Google AI Ultra plan stopped the response: finishReason {finish_reason}")]
+    Stopped {
+        /// The finish reason token.
+        finish_reason: String,
+        /// The upstream `candidates[0].finishMessage`. Unsanitised.
+        finish_message: Option<String>,
+    },
+    /// The upstream closed before any `finishReason`.
+    #[error("Google AI Ultra plan stream ended without a finishReason")]
     Incomplete,
     /// Reading the upstream body failed.
     #[error("Google AI Ultra plan stream was interrupted")]
@@ -89,7 +114,11 @@ impl StreamError {
         let prose = match self {
             Self::Upstream {
                 upstream_message, ..
+            }
+            | Self::PromptBlocked {
+                upstream_message, ..
             } => upstream_message.as_deref(),
+            Self::Stopped { finish_message, .. } => finish_message.as_deref(),
             _ => None,
         };
         match prose.map(sanitize).filter(|text| !text.trim().is_empty()) {
@@ -104,12 +133,23 @@ impl StreamError {
             Self::Upstream {
                 code: Some(code), ..
             } => match code.as_str() {
-                "too_many_requests" | "resource_exhausted" | "429" => "rate_limit_error",
-                "invalid_request" | "invalid_argument" | "400" => "invalid_request_error",
-                "unauthenticated" | "401" => "authentication_error",
-                "permission_denied" | "403" => "permission_error",
+                "too_many_requests" | "resource_exhausted" | "RESOURCE_EXHAUSTED" | "429" => {
+                    "rate_limit_error"
+                }
+                "invalid_request"
+                | "invalid_argument"
+                | "INVALID_ARGUMENT"
+                | "failed_precondition"
+                | "FAILED_PRECONDITION"
+                | "not_found"
+                | "NOT_FOUND"
+                | "400"
+                | "404" => "invalid_request_error",
+                "unauthenticated" | "UNAUTHENTICATED" | "401" => "authentication_error",
+                "permission_denied" | "PERMISSION_DENIED" | "403" => "permission_error",
                 _ => "api_error",
             },
+            Self::PromptBlocked { .. } => "invalid_request_error",
             _ => "api_error",
         }
     }
@@ -118,7 +158,8 @@ impl StreamError {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Upstream { .. } => "upstream_error",
-            Self::Status(_) => "interaction_status",
+            Self::PromptBlocked { .. } => "prompt_blocked",
+            Self::Stopped { .. } => "finish_reason",
             Self::Incomplete => "incomplete_stream",
             Self::Transport => "upstream_stream",
             Self::Malformed(_) => "invalid_event",
@@ -139,83 +180,124 @@ pub fn error_event(error_type: &str, message: &str) -> Vec<u8> {
     encode_sse_event(Some("error"), &data.to_string())
 }
 
-/// `interaction.usage`, as far as the translation uses it.
-#[derive(Debug, Clone, Copy, Default)]
-struct Usage {
-    input: u64,
-    cached: u64,
-    output: u64,
-    thought: u64,
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Chunk {
+    #[serde(default)]
+    candidates: Option<Vec<Candidate>>,
+    #[serde(default)]
+    usage_metadata: Option<UsageMetadata>,
+    #[serde(default)]
+    prompt_feedback: Option<PromptFeedback>,
 }
 
-impl Usage {
-    fn from_value(value: &Value) -> Self {
-        let field = |name: &str| value.get(name).and_then(Value::as_u64).unwrap_or(0);
-        Self {
-            input: field("total_input_tokens"),
-            cached: field("total_cached_tokens"),
-            output: field("total_output_tokens"),
-            thought: field("total_thought_tokens"),
-        }
-    }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Candidate {
+    #[serde(default)]
+    content: Option<CandidateContent>,
+    #[serde(default)]
+    finish_reason: Option<String>,
+    #[serde(default)]
+    finish_message: Option<String>,
+    #[serde(default)]
+    index: Option<u64>,
+}
 
-    /// `(input, cache_read, output)`: cached tokens are part of the input
-    /// total, and thought tokens are output.
-    fn anthropic(self) -> (u64, u64, u64) {
-        (
-            self.input.saturating_sub(self.cached),
-            self.cached,
-            self.output.saturating_add(self.thought),
-        )
+#[derive(Debug, Deserialize)]
+struct CandidateContent {
+    #[serde(default)]
+    parts: Option<Vec<ResponsePart>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResponsePart {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    thought: Option<bool>,
+    #[serde(default)]
+    thought_signature: Option<String>,
+    #[serde(default)]
+    function_call: Option<ResponseFunctionCall>,
+    #[serde(default)]
+    inline_data: Option<Value>,
+    #[serde(default)]
+    file_data: Option<Value>,
+    #[serde(default)]
+    function_response: Option<Value>,
+    #[serde(default)]
+    executable_code: Option<Value>,
+    #[serde(default)]
+    code_execution_result: Option<Value>,
+}
+
+impl ResponsePart {
+    fn has_untranslated_data(&self) -> bool {
+        self.inline_data.is_some()
+            || self.file_data.is_some()
+            || self.function_response.is_some()
+            || self.executable_code.is_some()
+            || self.code_execution_result.is_some()
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResponseFunctionCall {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    args: Option<Value>,
+    #[serde(default)]
+    partial_args: Option<Value>,
+    #[serde(default)]
+    will_continue: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageMetadata {
+    #[serde(default)]
+    prompt_token_count: Option<u64>,
+    #[serde(default)]
+    candidates_token_count: Option<u64>,
+    #[serde(default)]
+    thoughts_token_count: Option<u64>,
+    #[serde(default)]
+    cached_content_token_count: Option<u64>,
+}
+
+impl UsageMetadata {
+    /// `(input, cache_read, output)`: cached tokens are part of
+    /// `promptTokenCount`, and thought tokens are output.
+    fn anthropic(self) -> (u64, u64, u64) {
+        let cached = self.cached_content_token_count.unwrap_or(0);
+        let input = self.prompt_token_count.unwrap_or(0).saturating_sub(cached);
+        let output = self
+            .candidates_token_count
+            .unwrap_or(0)
+            .saturating_add(self.thoughts_token_count.unwrap_or(0));
+        (input, cached, output)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptFeedback {
+    #[serde(default)]
+    block_reason: Option<String>,
+    #[serde(default)]
+    block_reason_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Status {
-    Completed,
-    RequiresAction,
-    Incomplete,
-}
-
-impl Status {
-    fn stop_reason(self) -> &'static str {
-        match self {
-            Self::Completed => "end_turn",
-            Self::RequiresAction => "tool_use",
-            Self::Incomplete => "max_tokens",
-        }
-    }
-}
-
-/// What a tracked step is.
-#[derive(Debug)]
-enum StepKind {
-    Thought {
-        /// Summary text not emitted yet.
-        pending: String,
-        signature: String,
-    },
-    Text {
-        /// Text not emitted yet.
-        pending: String,
-    },
-    Call {
-        id: String,
-        name: String,
-        /// The `arguments` of `step.start`, used when no delta arrives.
-        start_arguments: Value,
-        /// The concatenated `arguments_delta` strings.
-        arguments: String,
-        streamed_arguments: bool,
-    },
-}
-
-#[derive(Debug)]
-struct TrackedStep {
-    kind: StepKind,
-    stopped: bool,
-    /// The Anthropic block index, once the block has started.
-    block: Option<usize>,
+enum Finish {
+    Stop,
+    MaxTokens,
 }
 
 /// A finished content block, kept for the non-streaming response.
@@ -235,6 +317,12 @@ enum Block {
     },
 }
 
+#[derive(Debug)]
+enum Open {
+    Thinking { index: usize, signature: String },
+    Text(usize),
+}
+
 struct TranslationState {
     config: TranslatorConfig,
     keep_content: bool,
@@ -243,21 +331,11 @@ struct TranslationState {
     finished: bool,
     blocks: Vec<Block>,
     block_count: usize,
+    open: Option<Open>,
     tool_count: usize,
-    /// Every `tool_use` ID emitted so far, so no two blocks share one. Each
-    /// entry is at most [`MAX_CALL_ID_BYTES`] or a proxy-made ID, and there
-    /// is one per block, each of which already paid [`BLOCK_CHARGE`], so the
-    /// set stays within a fixed multiple of the content budget.
     tool_ids: HashSet<String>,
-    /// Steps in start order; the front one is the only one that streams.
-    queue: VecDeque<TrackedStep>,
-    /// Sequence number of the front of `queue`.
-    head_seq: u64,
-    /// Sequence number of every step that has started and not stopped, by
-    /// its wire index.
-    open: HashMap<u64, u64>,
-    status: Option<Status>,
-    usage: Option<Usage>,
+    finish: Option<Finish>,
+    usage: Option<UsageMetadata>,
 }
 
 impl TranslationState {
@@ -270,12 +348,10 @@ impl TranslationState {
             finished: false,
             blocks: Vec::new(),
             block_count: 0,
+            open: None,
             tool_count: 0,
             tool_ids: HashSet::new(),
-            queue: VecDeque::new(),
-            head_seq: 0,
-            open: HashMap::new(),
-            status: None,
+            finish: None,
             usage: None,
         }
     }
@@ -290,351 +366,272 @@ impl TranslationState {
         Ok(())
     }
 
-    fn apply_event(&mut self, event: &Map<String, Value>) -> Result<Vec<u8>, StreamError> {
-        let mut out = Vec::new();
-        let event_type = event.get("event_type").and_then(Value::as_str);
-        match event_type {
-            Some("step.start") => {
-                let index = wire_index(event)?;
-                self.start(index, event.get("step").unwrap_or(&Value::Null))?;
-            }
-            Some("step.delta") => {
-                let index = wire_index(event)?;
-                self.delta(index, event.get("delta").unwrap_or(&Value::Null))?;
-            }
-            Some("step.stop") => {
-                let index = wire_index(event)?;
-                if let Some(seq) = self.open.remove(&index)
-                    && let Some(step) = self.step_mut(seq)
-                {
-                    step.stopped = true;
-                }
-            }
-            Some("interaction.completed") => {
-                let interaction = event.get("interaction").unwrap_or(&Value::Null);
-                if let Some(usage) = interaction.get("usage").filter(|usage| usage.is_object()) {
-                    self.usage = Some(Usage::from_value(usage));
-                }
-                let status = interaction.get("status").and_then(Value::as_str).ok_or(
-                    StreamError::Malformed("interaction.completed has no status"),
-                )?;
-                self.status = Some(match status {
-                    "completed" => Status::Completed,
-                    "requires_action" => Status::RequiresAction,
-                    "incomplete" => Status::Incomplete,
-                    other => return Err(StreamError::Status(upstream_token(other))),
-                });
-            }
-            Some("error") => return Err(upstream_error(event.get("error"))),
-            None if event.contains_key("error") => {
-                return Err(upstream_error(event.get("error")));
-            }
-            // Other event types carry nothing the translation uses.
-            _ => return Ok(out),
+    fn apply_chunk(&mut self, chunk: Chunk) -> Result<Vec<u8>, StreamError> {
+        if let Some(feedback) = chunk.prompt_feedback
+            && let Some(block_reason) = feedback.block_reason
+        {
+            return Err(StreamError::PromptBlocked {
+                block_reason: upstream_token(&block_reason),
+                upstream_message: feedback.block_reason_message,
+            });
         }
-        self.drain(&mut out)?;
-        if self.status.is_some() {
-            self.finalize(&mut out)?;
+        if let Some(usage) = chunk.usage_metadata {
+            let prev = self.usage.unwrap_or_default();
+            self.usage = Some(UsageMetadata {
+                prompt_token_count: usage.prompt_token_count.or(prev.prompt_token_count),
+                candidates_token_count: usage
+                    .candidates_token_count
+                    .or(prev.candidates_token_count),
+                thoughts_token_count: usage.thoughts_token_count.or(prev.thoughts_token_count),
+                cached_content_token_count: usage
+                    .cached_content_token_count
+                    .or(prev.cached_content_token_count),
+            });
+        }
+        let mut candidates = chunk.candidates.unwrap_or_default();
+        if candidates.len() > 1 {
+            return Err(StreamError::Malformed(
+                "the response has more than one candidate",
+            ));
+        }
+        let Some(candidate) = candidates.pop() else {
+            return Ok(Vec::new());
+        };
+        if candidate.index.is_some_and(|index| index != 0) {
+            return Err(StreamError::Malformed(
+                "the response has a candidate other than the first",
+            ));
+        }
+        let parts = candidate
+            .content
+            .and_then(|content| content.parts)
+            .unwrap_or_default();
+        // Once the finish reason has arrived, only trailing usage-only chunks
+        // are expected; further content is a malformed stream.
+        if self.finish.is_some() && !parts.is_empty() {
+            return Err(StreamError::Malformed(
+                "the response streams content after the finish reason",
+            ));
+        }
+        let mut out = Vec::new();
+        for part in parts {
+            self.apply_part(part, &mut out)?;
+        }
+        if let Some(reason) = candidate.finish_reason {
+            let finish = match reason.as_str() {
+                "STOP" => Finish::Stop,
+                "MAX_TOKENS" => Finish::MaxTokens,
+                _ => {
+                    return Err(StreamError::Stopped {
+                        finish_reason: upstream_token(&reason),
+                        finish_message: candidate.finish_message,
+                    });
+                }
+            };
+            // Hold the terminal events: the final chunk may be followed by a
+            // usage-only chunk, so they are emitted when the stream closes, a
+            // `[DONE]` marker arrives, or the post-terminal read window ends.
+            self.finish = Some(finish);
         }
         Ok(out)
     }
 
-    fn step_mut(&mut self, seq: u64) -> Option<&mut TrackedStep> {
-        let position = usize::try_from(seq.checked_sub(self.head_seq)?).ok()?;
-        self.queue.get_mut(position)
-    }
-
-    fn start(&mut self, index: u64, step: &Value) -> Result<(), StreamError> {
-        // Checked before the type, so a step the translator ignores cannot
-        // start over an open one and have its deltas and stop applied there.
-        if self.open.contains_key(&index) {
+    fn apply_part(&mut self, part: ResponsePart, out: &mut Vec<u8>) -> Result<(), StreamError> {
+        if part.has_untranslated_data() {
             return Err(StreamError::Malformed(
-                "a step started at an index that is still open",
+                "the response has a part type the proxy does not translate",
             ));
         }
-        let kind = match step.get("type").and_then(Value::as_str) {
-            Some("thought") => {
-                let signature = str_field(step, "signature").to_string();
-                self.count_content(signature.len())?;
-                StepKind::Thought {
-                    pending: String::new(),
-                    signature,
-                }
+        if let Some(call) = part.function_call {
+            if call.will_continue == Some(true) || call.partial_args.is_some() {
+                return Err(StreamError::Malformed(
+                    "the response streams function-call arguments, which the proxy did not request",
+                ));
             }
-            Some("model_output") => StepKind::Text {
-                pending: String::new(),
-            },
-            Some("function_call") => {
-                let name = str_field(step, "name");
-                if name.is_empty() {
-                    return Err(StreamError::Malformed("a function_call step has no name"));
-                }
-                let id = str_field(step, "id");
-                let arguments = step.get("arguments");
-                // The call is held until its step and every step before it
-                // stop, so what it holds is charged now; otherwise many
-                // calls queued behind an open step could pass the budget.
-                // A missing `arguments` is held as `{}`.
-                let arguments_len = arguments.map_or(2, compact_len);
-                self.count_content(
-                    id.len()
-                        .saturating_add(name.len())
-                        .saturating_add(arguments_len),
-                )?;
-                let start_arguments = arguments.cloned().unwrap_or_else(|| json!({}));
-                StepKind::Call {
-                    id: id.to_string(),
-                    name: name.to_string(),
-                    start_arguments,
-                    arguments: String::new(),
-                    streamed_arguments: false,
-                }
+            let name = call
+                .name
+                .filter(|name| !name.is_empty())
+                .ok_or(StreamError::Malformed("a functionCall has no name"))?;
+            let input = call.args.unwrap_or_else(|| json!({}));
+            if !input.is_object() {
+                return Err(StreamError::Malformed("functionCall args is not an object"));
             }
-            // Server-side tool steps (code execution, URL context, search)
-            // are not requested and not shown.
-            _ => return Ok(()),
-        };
-        self.count_content(BLOCK_CHARGE)?;
-        let seq = self.head_seq + self.queue.len() as u64;
-        self.open.insert(index, seq);
-        self.queue.push_back(TrackedStep {
-            kind,
-            stopped: false,
-            block: None,
-        });
-        Ok(())
-    }
+            let raw_id = call.id.unwrap_or_default();
+            let signature = part.thought_signature.filter(|value| !value.is_empty());
+            return self.function_call(raw_id, name, input, signature, out);
+        }
 
-    fn delta(&mut self, index: u64, delta: &Value) -> Result<(), StreamError> {
-        let Some(&seq) = self.open.get(&index) else {
+        let text = part.text.unwrap_or_default();
+        let signature = part.thought_signature.filter(|value| !value.is_empty());
+        if part.thought == Some(true) {
+            if !text.is_empty() && self.config.emit_thinking {
+                self.thinking_delta(&text, out)?;
+            }
+            if let Some(sig) = signature {
+                self.thinking_signature(&sig, out)?;
+            }
             return Ok(());
-        };
-        let emit_thinking = self.config.emit_thinking;
-        let delta_type = delta.get("type").and_then(Value::as_str);
-        let appended = {
-            let Some(step) = self.step_mut(seq) else {
-                return Ok(());
-            };
-            match (&mut step.kind, delta_type) {
-                (StepKind::Text { pending }, Some("text")) => {
-                    let text = delta
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    pending.push_str(text);
-                    text.len()
-                }
-                (StepKind::Thought { pending, .. }, Some("thought_summary")) => {
-                    let content = delta.get("content");
-                    let text = content
-                        .filter(|content| {
-                            content.get("type").and_then(Value::as_str) == Some("text")
-                        })
-                        .and_then(|content| content.get("text"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if emit_thinking {
-                        pending.push_str(text);
-                        text.len()
-                    } else {
-                        0
-                    }
-                }
-                (StepKind::Thought { signature, .. }, Some("thought_signature")) => {
-                    let part = delta
-                        .get("signature")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    signature.push_str(part);
-                    part.len()
-                }
-                (
-                    StepKind::Call {
-                        arguments,
-                        streamed_arguments,
-                        ..
+        }
+
+        if let Some(sig) = signature
+            && (matches!(self.open, Some(Open::Thinking { .. })) || text.is_empty())
+        {
+            self.thinking_signature(&sig, out)?;
+        }
+        if !text.is_empty() {
+            self.text_delta(&text, out)?;
+        }
+        Ok(())
+    }
+
+    /// The open thinking block, or a new one. A signature ends its block:
+    /// thought text or a signature arriving after it starts a new block, so
+    /// two independently signed parts never share one block or have their
+    /// signatures joined.
+    fn ensure_thinking_open(&mut self, out: &mut Vec<u8>) -> Result<usize, StreamError> {
+        match &self.open {
+            Some(Open::Thinking { index, signature }) if signature.is_empty() => Ok(*index),
+            _ => {
+                self.close_open(out)?;
+                let index = self.start_block(
+                    out,
+                    Block::Thinking {
+                        text: String::new(),
+                        signature: String::new(),
                     },
-                    Some("arguments_delta"),
-                ) => {
-                    let part = delta
-                        .get("arguments")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    arguments.push_str(part);
-                    *streamed_arguments |= !part.is_empty();
-                    part.len()
-                }
-                _ => 0,
+                    json!({"type":"thinking","thinking":"","signature":""}),
+                )?;
+                self.open = Some(Open::Thinking {
+                    index,
+                    signature: String::new(),
+                });
+                Ok(index)
+            }
+        }
+    }
+
+    fn thinking_delta(&mut self, text: &str, out: &mut Vec<u8>) -> Result<(), StreamError> {
+        self.count_content(text.len())?;
+        let index = self.ensure_thinking_open(out)?;
+        if self.keep_content
+            && let Some(Block::Thinking { text: stored, .. }) = self.blocks.get_mut(index)
+        {
+            stored.push_str(text);
+        }
+        emit(
+            out,
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":text}}),
+        );
+        Ok(())
+    }
+
+    fn thinking_signature(&mut self, sig: &str, out: &mut Vec<u8>) -> Result<(), StreamError> {
+        self.count_content(sig.len())?;
+        let _ = self.ensure_thinking_open(out)?;
+        if let Some(Open::Thinking { signature, .. }) = &mut self.open {
+            signature.push_str(sig);
+        }
+        Ok(())
+    }
+
+    fn text_delta(&mut self, text: &str, out: &mut Vec<u8>) -> Result<(), StreamError> {
+        self.count_content(text.len())?;
+        let index = match self.open {
+            Some(Open::Text(index)) => index,
+            _ => {
+                self.close_open(out)?;
+                let index = self.start_block(
+                    out,
+                    Block::Text {
+                        text: String::new(),
+                    },
+                    json!({"type":"text","text":""}),
+                )?;
+                self.open = Some(Open::Text(index));
+                index
             }
         };
-        self.count_content(appended)
-    }
-
-    /// Emits what the front steps allow: the new content of the front step,
-    /// then, while the front step has stopped, its end and the same for the
-    /// step after it.
-    fn drain(&mut self, out: &mut Vec<u8>) -> Result<(), StreamError> {
-        while let Some(mut step) = self.queue.pop_front() {
-            self.emit_pending(&mut step, out);
-            if !step.stopped {
-                self.queue.push_front(step);
-                return Ok(());
-            }
-            self.head_seq += 1;
-            self.end_step(step, out)?;
+        if self.keep_content
+            && let Some(Block::Text { text: stored }) = self.blocks.get_mut(index)
+        {
+            stored.push_str(text);
         }
+        emit(
+            out,
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}),
+        );
         Ok(())
     }
 
-    fn emit_pending(&mut self, step: &mut TrackedStep, out: &mut Vec<u8>) {
-        match &mut step.kind {
-            StepKind::Thought { pending, .. } if !pending.is_empty() => {
-                let text = std::mem::take(pending);
-                let index = *step.block.get_or_insert_with(|| {
-                    self.start_block(
+    fn function_call(
+        &mut self,
+        raw_id: String,
+        name: String,
+        input: Value,
+        signature: Option<String>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), StreamError> {
+        if let Some(sig) = signature {
+            self.count_content(sig.len())?;
+            match &mut self.open {
+                Some(Open::Thinking {
+                    signature: existing,
+                    ..
+                }) if existing.is_empty() => {
+                    *existing = sig;
+                    self.close_open(out)?;
+                }
+                _ => {
+                    self.close_open(out)?;
+                    let index = self.start_block(
                         out,
                         Block::Thinking {
                             text: String::new(),
                             signature: String::new(),
                         },
                         json!({"type":"thinking","thinking":"","signature":""}),
-                    )
-                });
-                if self.keep_content
-                    && let Some(Block::Thinking { text: stored, .. }) = self.blocks.get_mut(index)
-                {
-                    stored.push_str(&text);
+                    )?;
+                    self.open = Some(Open::Thinking {
+                        index,
+                        signature: sig,
+                    });
+                    self.close_open(out)?;
                 }
-                emit(
-                    out,
-                    "content_block_delta",
-                    json!({"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":text}}),
-                );
             }
-            StepKind::Text { pending } if !pending.is_empty() => {
-                let text = std::mem::take(pending);
-                let index = *step.block.get_or_insert_with(|| {
-                    self.start_block(
-                        out,
-                        Block::Text {
-                            text: String::new(),
-                        },
-                        json!({"type":"text","text":""}),
-                    )
-                });
-                if self.keep_content
-                    && let Some(Block::Text { text: stored }) = self.blocks.get_mut(index)
-                {
-                    stored.push_str(&text);
-                }
-                emit(
-                    out,
-                    "content_block_delta",
-                    json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}),
-                );
-            }
-            _ => {}
+        } else {
+            self.close_open(out)?;
         }
-    }
 
-    fn end_step(&mut self, step: TrackedStep, out: &mut Vec<u8>) -> Result<(), StreamError> {
-        match step.kind {
-            StepKind::Thought { signature, .. } => {
-                // The block carries the signature back with the history; a
-                // thought without one and without forwarded text leaves no
-                // block. An oversized signature is dropped, so the next
-                // request falls back to the skip sentinel.
-                let index = match step.block {
-                    Some(index) => index,
-                    None if !signature.is_empty() => self.start_block(
-                        out,
-                        Block::Thinking {
-                            text: String::new(),
-                            signature: String::new(),
-                        },
-                        json!({"type":"thinking","thinking":"","signature":""}),
-                    ),
-                    None => return Ok(()),
-                };
-                let envelope = encode_envelope(&self.config.signature_model, &signature)
-                    .or_else(|| encode_envelope(&self.config.signature_model, ""))
-                    .unwrap_or_default();
-                emit(
-                    out,
-                    "content_block_delta",
-                    json!({"type":"content_block_delta","index":index,"delta":{"type":"signature_delta","signature":envelope}}),
-                );
-                emit(
-                    out,
-                    "content_block_stop",
-                    json!({"type":"content_block_stop","index":index}),
-                );
-                if self.keep_content
-                    && let Some(Block::Thinking { signature, .. }) = self.blocks.get_mut(index)
-                {
-                    *signature = envelope;
-                }
-            }
-            StepKind::Text { .. } => {
-                if let Some(index) = step.block {
-                    emit(
-                        out,
-                        "content_block_stop",
-                        json!({"type":"content_block_stop","index":index}),
-                    );
-                }
-            }
-            StepKind::Call {
-                id,
-                name,
-                start_arguments,
-                arguments,
-                streamed_arguments,
-            } => {
-                let input = if streamed_arguments {
-                    serde_json::from_str::<Value>(&arguments).map_err(|_| {
-                        StreamError::Malformed("function_call arguments are not valid JSON")
-                    })?
-                } else {
-                    start_arguments
-                };
-                if !input.is_object() {
-                    return Err(StreamError::Malformed(
-                        "function_call arguments are not a JSON object",
-                    ));
-                }
-                // The upstream ID and name were charged when the step
-                // started; a replacement ID is proxy-made and short, and the
-                // block already paid `BLOCK_CHARGE`.
-                let id = if is_valid_call_id(&id) && !self.tool_ids.contains(&id) {
-                    id
-                } else {
-                    self.unused_call_id()
-                };
-                let compact = input.to_string();
-                self.tool_ids.insert(id.clone());
-                self.tool_count += 1;
-                let content_block = json!({"type":"tool_use","id":id,"name":name,"input":{}});
-                let index = self.start_block(out, Block::Tool { id, name, input }, content_block);
-                emit(
-                    out,
-                    "content_block_delta",
-                    json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":compact}}),
-                );
-                emit(
-                    out,
-                    "content_block_stop",
-                    json!({"type":"content_block_stop","index":index}),
-                );
-            }
-        }
+        let compact = input.to_string();
+        let id = if is_valid_call_id(&raw_id) && !self.tool_ids.contains(&raw_id) {
+            raw_id
+        } else {
+            self.unused_call_id()
+        };
+        self.count_content(
+            id.len()
+                .saturating_add(name.len())
+                .saturating_add(compact.len()),
+        )?;
+        self.tool_ids.insert(id.clone());
+        self.tool_count += 1;
+        let content_block = json!({"type":"tool_use","id":id,"name":name,"input":{}});
+        let index = self.start_block(out, Block::Tool { id, name, input }, content_block)?;
+        emit(
+            out,
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":compact}}),
+        );
+        emit(
+            out,
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":index}),
+        );
         Ok(())
     }
 
-    /// A `toolu_<message id>_<n>` ID no block of this response has, with the
-    /// lowest `n` from the number of calls emitted so far. The set has one
-    /// entry per emitted call, so a free ID is found within that many tries
-    /// plus one.
     fn unused_call_id(&self) -> String {
         let mut suffix = self.tool_count;
         loop {
@@ -646,9 +643,13 @@ impl TranslationState {
         }
     }
 
-    /// Starts the next block; `block` is kept only by the non-streaming
-    /// translator.
-    fn start_block(&mut self, out: &mut Vec<u8>, block: Block, content_block: Value) -> usize {
+    fn start_block(
+        &mut self,
+        out: &mut Vec<u8>,
+        block: Block,
+        content_block: Value,
+    ) -> Result<usize, StreamError> {
+        self.count_content(BLOCK_CHARGE)?;
         self.ensure_message_start(out);
         let index = self.block_count;
         self.block_count += 1;
@@ -660,7 +661,45 @@ impl TranslationState {
             "content_block_start",
             json!({"type":"content_block_start","index":index,"content_block":content_block}),
         );
-        index
+        Ok(index)
+    }
+
+    fn close_open(&mut self, out: &mut Vec<u8>) -> Result<(), StreamError> {
+        match self.open.take() {
+            Some(Open::Thinking { index, signature }) => {
+                let envelope = encode_envelope(&self.config.signature_model, &signature)
+                    .or_else(|| encode_envelope(&self.config.signature_model, ""))
+                    .unwrap_or_default();
+                // The signature bytes were charged while the block was open.
+                self.count_content(envelope.len().saturating_sub(signature.len()))?;
+                emit(
+                    out,
+                    "content_block_delta",
+                    json!({"type":"content_block_delta","index":index,"delta":{"type":"signature_delta","signature":envelope}}),
+                );
+                emit(
+                    out,
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":index}),
+                );
+                if self.keep_content
+                    && let Some(Block::Thinking {
+                        signature: stored, ..
+                    }) = self.blocks.get_mut(index)
+                {
+                    *stored = envelope;
+                }
+            }
+            Some(Open::Text(index)) => {
+                emit(
+                    out,
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":index}),
+                );
+            }
+            None => {}
+        }
+        Ok(())
     }
 
     fn ensure_message_start(&mut self, out: &mut Vec<u8>) {
@@ -675,27 +714,20 @@ impl TranslationState {
         );
     }
 
-    /// Ends every step still open and completes the message.
+    fn stop_reason(&self) -> Result<&'static str, StreamError> {
+        match self.finish {
+            None => Err(StreamError::Incomplete),
+            Some(Finish::MaxTokens) => Ok("max_tokens"),
+            Some(Finish::Stop) if self.tool_count > 0 => Ok("tool_use"),
+            Some(Finish::Stop) => Ok("end_turn"),
+        }
+    }
+
     fn finalize(&mut self, out: &mut Vec<u8>) -> Result<(), StreamError> {
-        let Some(status) = self.status else {
-            return Err(StreamError::Incomplete);
-        };
-        // An output limit can cut a function call short; a call that never
-        // stopped is dropped rather than sent with arguments the model did
-        // not finish.
-        if status == Status::Incomplete {
-            self.queue
-                .retain(|step| step.stopped || !matches!(step.kind, StepKind::Call { .. }));
-        }
-        for step in &mut self.queue {
-            step.stopped = true;
-        }
-        self.open.clear();
-        self.drain(out)?;
+        let stop_reason = self.stop_reason()?;
+        self.close_open(out)?;
         self.ensure_message_start(out);
-        // Input usage is published only when the upstream reported it, so the
-        // client keeps the seeded estimate otherwise.
-        let usage = match self.usage.map(Usage::anthropic) {
+        let usage = match self.usage.map(UsageMetadata::anthropic) {
             Some((input, cache_read, output)) => json!({
                 "input_tokens":input,
                 "output_tokens":output,
@@ -707,7 +739,7 @@ impl TranslationState {
         emit(
             out,
             "message_delta",
-            json!({"type":"message_delta","delta":{"stop_reason":status.stop_reason(),"stop_sequence":null},"usage":usage}),
+            json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":usage}),
         );
         emit(out, "message_stop", json!({"type":"message_stop"}));
         self.finished = true;
@@ -720,9 +752,10 @@ impl TranslationState {
                 "the streaming translator keeps no content to build a message from",
             ));
         }
-        let Some(status) = self.status.filter(|_| self.finished) else {
+        if !self.finished {
             return Err(StreamError::Incomplete);
-        };
+        }
+        let stop_reason = self.stop_reason()?;
         let content: Vec<Value> = self
             .blocks
             .iter()
@@ -736,17 +769,18 @@ impl TranslationState {
                 }
             })
             .collect();
-        let (input, cache_read, output) =
-            self.usage
-                .map(Usage::anthropic)
-                .unwrap_or((self.config.estimated_input_tokens, 0, 0));
+        let (input, cache_read, output) = self.usage.map(UsageMetadata::anthropic).unwrap_or((
+            self.config.estimated_input_tokens,
+            0,
+            0,
+        ));
         Ok(json!({
             "id":self.config.message_id,
             "type":"message",
             "role":"assistant",
             "model":self.config.model,
             "content":content,
-            "stop_reason":status.stop_reason(),
+            "stop_reason":stop_reason,
             "stop_sequence":null,
             "usage":{
                 "input_tokens":input,
@@ -758,37 +792,6 @@ impl TranslationState {
     }
 }
 
-fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
-    value.get(key).and_then(Value::as_str).unwrap_or_default()
-}
-
-fn wire_index(event: &Map<String, Value>) -> Result<u64, StreamError> {
-    event
-        .get("index")
-        .and_then(Value::as_u64)
-        .ok_or(StreamError::Malformed("a step event has no index"))
-}
-
-/// The length of `value` serialised as compact JSON, without building the
-/// string.
-fn compact_len(value: &Value) -> usize {
-    struct Counter(usize);
-    impl std::io::Write for Counter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(buf.len());
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter(0);
-    // A `Value` always serialises and this writer never fails, so there is
-    // no error to report.
-    let _ = serde_json::to_writer(&mut counter, value);
-    counter.0
-}
-
 fn is_valid_call_id(id: &str) -> bool {
     (1..=MAX_CALL_ID_BYTES).contains(&id.len())
         && id
@@ -796,8 +799,8 @@ fn is_valid_call_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
-/// Keeps an upstream token (a status or an error code) only when it looks
-/// like one.
+/// Keeps an upstream token (a status, finishReason, blockReason or error code)
+/// only when it looks like one.
 fn upstream_token(value: &str) -> String {
     let well_formed = (1..=MAX_TOKEN_CHARS).contains(&value.len())
         && value
@@ -811,13 +814,18 @@ fn upstream_token(value: &str) -> String {
 }
 
 fn upstream_error(error: Option<&Value>) -> StreamError {
-    let code = error
-        .and_then(|error| error.get("code"))
-        .and_then(|code| match code {
-            Value::String(code) => Some(upstream_token(code)),
-            Value::Number(code) => Some(upstream_token(&code.to_string())),
-            _ => None,
-        });
+    let code = error.and_then(|error| {
+        if let Some(code) = error.get("code").and_then(Value::as_str) {
+            return Some(upstream_token(code));
+        }
+        if let Some(status) = error.get("status").and_then(Value::as_str) {
+            return Some(upstream_token(status));
+        }
+        if let Some(code) = error.get("code").and_then(Value::as_u64) {
+            return Some(upstream_token(&code.to_string()));
+        }
+        None
+    });
     let upstream_message = match error {
         Some(Value::String(message)) => Some(message.clone()),
         Some(error) => error
@@ -832,19 +840,80 @@ fn upstream_error(error: Option<&Value>) -> StreamError {
     }
 }
 
+fn parse_chunk(data: &str) -> Result<Chunk, StreamError> {
+    let value: Value = serde_json::from_str(data)
+        .map_err(|_| StreamError::Malformed("an event is not valid JSON"))?;
+    let mut object = match value {
+        Value::Object(object) => object,
+        Value::Array(items) => {
+            return Err(match items.as_slice() {
+                [item] if item.get("error").is_some() => upstream_error(item.get("error")),
+                _ => StreamError::Malformed("an event is not a JSON object"),
+            });
+        }
+        _ => return Err(StreamError::Malformed("an event is not a JSON object")),
+    };
+    if let Some(error) = object.get("error") {
+        return Err(upstream_error(Some(error)));
+    }
+    let response = match object.remove("response") {
+        Some(Value::Object(inner)) => inner,
+        Some(_) => {
+            return Err(StreamError::Malformed(
+                "response field in SSE event is not a JSON object",
+            ));
+        }
+        None => object,
+    };
+    if let Some(error) = response.get("error") {
+        return Err(upstream_error(Some(error)));
+    }
+    check_known_shape(&response)?;
+    serde_json::from_value(Value::Object(response)).map_err(|_| {
+        StreamError::Malformed("an event does not have the GenerateContentResponse shape")
+    })
+}
+
+fn check_known_shape(object: &Map<String, Value>) -> Result<(), StreamError> {
+    let has_any = |map: &Map<String, Value>, fields: &[&str]| {
+        fields.iter().any(|field| map.contains_key(*field))
+    };
+    if !has_any(object, &RESPONSE_FIELDS) {
+        return Err(StreamError::Malformed(
+            "an event has none of the GenerateContentResponse fields",
+        ));
+    }
+    check_parts_shape(object)
+}
+
+fn check_parts_shape(object: &Map<String, Value>) -> Result<(), StreamError> {
+    let has_any = |map: &Map<String, Value>, fields: &[&str]| {
+        fields.iter().any(|field| map.contains_key(*field))
+    };
+    let parts = object
+        .get("candidates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|candidate| candidate.pointer("/content/parts")?.as_array())
+        .flatten();
+    for part in parts {
+        if let Some(part) = part.as_object()
+            && !has_any(part, &PART_FIELDS)
+        {
+            return Err(StreamError::Malformed(
+                "a part has none of the documented Part fields",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn emit(out: &mut Vec<u8>, event: &str, value: Value) {
     out.extend(encode_sse_event(Some(event), &value.to_string()));
 }
 
-/// Incremental translator from Interactions SSE bytes to Anthropic SSE
-/// bytes.
-///
-/// Feed every upstream chunk to [`Self::push`] and send what it returns.
-/// Once [`Self::is_finished`] is true the response is complete and the
-/// upstream need not be read further. When the upstream closes first, call
-/// [`Self::finish`], which fails with [`StreamError::Incomplete`]. On any
-/// error, send [`StreamError::sse_event`] as the last event (or answer the
-/// non-streaming request with the error) and drop the translator.
+/// Incremental translator from Cloud Code PA SSE bytes to Anthropic SSE bytes.
 pub struct LiveStreamTranslator {
     decoder: SseDecoder,
     state: TranslationState,
@@ -873,13 +942,6 @@ impl LiveStreamTranslator {
     /// Feeds upstream bytes, split at any boundary, and returns the
     /// Anthropic SSE bytes they produce. Input after the response completed
     /// is ignored.
-    ///
-    /// # Errors
-    ///
-    /// [`StreamError::Upstream`] for an `error` event,
-    /// [`StreamError::Status`] for an unsuccessful final status, and
-    /// [`StreamError::Malformed`] for a stream that breaks the documented
-    /// shape or the content limit.
     pub fn push(&mut self, input: &[u8]) -> Result<Vec<u8>, StreamError> {
         if self.state.finished {
             return Ok(Vec::new());
@@ -890,16 +952,19 @@ impl LiveStreamTranslator {
         let mut out = Vec::new();
         for event in events {
             let data = event.data.trim();
-            // Google sends `[DONE]` after `interaction.completed`.
-            if data.is_empty() || data == "[DONE]" {
+            if data.is_empty() {
                 continue;
             }
-            let value: Value = serde_json::from_str(data)
-                .map_err(|_| StreamError::Malformed("an event is not valid JSON"))?;
-            let Value::Object(object) = value else {
-                return Err(StreamError::Malformed("an event is not a JSON object"));
-            };
-            out.extend(self.state.apply_event(&object)?);
+            if data == "[DONE]" {
+                // The upstream has ended the stream. Emit the held terminal
+                // events if a finish reason arrived, and read nothing further.
+                if self.state.finish.is_some() && !self.state.finished {
+                    self.state.finalize(&mut out)?;
+                }
+                break;
+            }
+            let chunk = parse_chunk(data)?;
+            out.extend(self.state.apply_chunk(chunk)?);
             if self.state.finished {
                 break;
             }
@@ -907,21 +972,44 @@ impl LiveStreamTranslator {
         Ok(out)
     }
 
-    /// Completes the response after the upstream closed.
+    /// Completes the response after the upstream closed, emitting the held
+    /// terminal events.
     ///
     /// # Errors
     ///
-    /// [`StreamError::Incomplete`] when `interaction.completed` never
-    /// arrived, whatever was buffered.
+    /// [`StreamError::Incomplete`] when no `finishReason` arrived.
     pub fn finish(&mut self) -> Result<Vec<u8>, StreamError> {
         if self.state.finished {
-            Ok(Vec::new())
-        } else {
-            Err(StreamError::Incomplete)
+            return Ok(Vec::new());
         }
+        if self.state.finish.is_none() {
+            return Err(StreamError::Incomplete);
+        }
+        let mut out = Vec::new();
+        self.state.finalize(&mut out)?;
+        Ok(out)
     }
 
-    /// Whether `interaction.completed` arrived and the message is complete.
+    /// Completes the response when the upstream stayed open for the
+    /// post-terminal read window after the `finishReason`, emitting the held
+    /// terminal events with whatever usage arrived in that window.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError::Incomplete`] when called before a `finishReason`.
+    pub fn finish_after_read_limit(&mut self) -> Result<Vec<u8>, StreamError> {
+        let mut out = Vec::new();
+        self.state.finalize(&mut out)?;
+        Ok(out)
+    }
+
+    /// Whether a `finishReason` has arrived but the terminal events are still
+    /// held, so the caller reads for at most the post-terminal window.
+    pub fn has_finish(&self) -> bool {
+        self.state.finish.is_some() && !self.state.finished
+    }
+
+    /// Whether the response has been completed.
     pub fn is_finished(&self) -> bool {
         self.state.finished
     }
@@ -937,12 +1025,6 @@ impl LiveStreamTranslator {
     }
 
     /// The non-streaming Anthropic message, once the response is completed.
-    ///
-    /// # Errors
-    ///
-    /// [`StreamError::Incomplete`] before completion, and
-    /// [`StreamError::Malformed`] for a translator made with
-    /// [`Self::streaming`].
     pub fn response(&self) -> Result<Value, StreamError> {
         self.state.response()
     }
@@ -950,10 +1032,6 @@ impl LiveStreamTranslator {
 
 /// Translates a whole buffered upstream body into a non-streaming Anthropic
 /// message.
-///
-/// # Errors
-///
-/// The same conditions that fail the streaming response.
 pub fn accumulate_response(input: &[u8], config: TranslatorConfig) -> Result<Value, StreamError> {
     let mut translator = LiveStreamTranslator::new(config);
     translator.push(input)?;
@@ -981,69 +1059,72 @@ mod tests {
         }
     }
 
-    /// One SSE frame in the shape Google sends (`event:` line plus `data:`
-    /// JSON).
     fn frame(data: Value) -> String {
-        let name = data["event_type"].as_str().unwrap_or("message").to_string();
-        format!("event: {name}\ndata: {data}\n\n")
+        format!("data: {data}\n\n")
     }
 
     fn frames(events: &[Value]) -> String {
         events.iter().cloned().map(frame).collect()
     }
 
-    fn start(index: u64, step: Value) -> Value {
-        json!({"event_type":"step.start","index":index,"step":step})
+    fn ccpa_parts(parts: Value) -> Value {
+        json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "role": "model",
+                        "parts": parts
+                    }
+                }]
+            },
+            "traceId": "trace-1"
+        })
     }
 
-    fn delta(index: u64, delta: Value) -> Value {
-        json!({"event_type":"step.delta","index":index,"delta":delta})
+    fn ccpa_finish(parts: Value, reason: &str, usage: Option<Value>) -> Value {
+        let mut resp = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": parts
+                },
+                "finishReason": reason
+            }]
+        });
+        if let Some(usage) = usage {
+            resp["usageMetadata"] = usage;
+        }
+        json!({
+            "response": resp,
+            "traceId": "trace-1"
+        })
     }
 
-    fn stop(index: u64) -> Value {
-        json!({"event_type":"step.stop","index":index})
-    }
-
-    fn text(index: u64, text: &str) -> Value {
-        delta(index, json!({"type":"text","text":text}))
-    }
-
-    fn summary(index: u64, text: &str) -> Value {
-        delta(
-            index,
-            json!({"type":"thought_summary","content":{"type":"text","text":text}}),
-        )
-    }
-
-    fn completed(status: &str) -> Value {
-        json!({"event_type":"interaction.completed","interaction":{"status":status}})
-    }
-
-    /// The recorded gemini-4-hydrogen tool turn of the reference test.
     fn recorded_tool_turn() -> String {
         frames(&[
-            start(0, json!({"type":"thought"})),
-            summary(0, "Need the file."),
-            delta(0, json!({"type":"thought_signature","signature":"c2ln"})),
-            stop(0),
-            start(1, json!({"type":"model_output"})),
-            text(1, "Reading it."),
-            stop(1),
-            start(
-                2,
-                json!({"type":"function_call","id":"call_1","name":"read_file","arguments":{}}),
+            ccpa_parts(json!([{"thought": true, "text": "Need the file."}])),
+            ccpa_parts(json!([
+                {"thought": true, "thoughtSignature": "c2ln"},
+                {"text": "Reading it."}
+            ])),
+            ccpa_finish(
+                json!([{
+                    "functionCall": {
+                        "id": "call_1",
+                        "name": "read_file",
+                        "args": {"path": "a.py"}
+                    }
+                }]),
+                "STOP",
+                Some(json!({
+                    "promptTokenCount": 114,
+                    "cachedContentTokenCount": 10,
+                    "candidatesTokenCount": 26,
+                    "thoughtsTokenCount": 44,
+                    "totalTokenCount": 184
+                })),
             ),
-            delta(
-                2,
-                json!({"type":"arguments_delta","arguments":"{\"path\":"}),
-            ),
-            delta(2, json!({"type":"arguments_delta","arguments":"\"a.py\"}"})),
-            stop(2),
-            json!({"event_type":"interaction.completed","interaction":{
-                "status":"requires_action",
-                "usage":{"total_tokens":184,"total_input_tokens":114,"total_cached_tokens":10,"total_output_tokens":26,"total_thought_tokens":44}
-            }}),
-        ]) + "event: done\ndata: [DONE]\n\n"
+        ]) + "data: [DONE]\n\n"
     }
 
     fn live_chunks(
@@ -1071,8 +1152,6 @@ mod tests {
         live_chunks(&[input.as_bytes()], emit_thinking)
     }
 
-    /// Rebuilds the content, stop reason and usage a client would assemble
-    /// from the live events, checking that blocks never overlap.
     fn rebuild(events: &[(String, Value)]) -> (Vec<Value>, Value, Value) {
         let mut content: Vec<Value> = Vec::new();
         let mut partial: Vec<String> = Vec::new();
@@ -1139,8 +1218,6 @@ mod tests {
         (content, stop_reason, usage)
     }
 
-    /// Asserts that the live and accumulated translations agree and returns
-    /// the accumulated message.
     fn both_succeed(input: &str, emit_thinking: bool) -> Value {
         let events = live(input, emit_thinking).unwrap_or_else(|error| panic!("live: {error}"));
         let message = accumulate_response(input.as_bytes(), config(emit_thinking))
@@ -1151,8 +1228,6 @@ mod tests {
         if usage.get("input_tokens").is_some() {
             assert_eq!(usage, message["usage"], "usage differs");
         } else {
-            // Without upstream usage the stream keeps the seeded estimate
-            // and the message reports it.
             assert_eq!(
                 usage,
                 json!({"output_tokens":0}),
@@ -1189,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn thought_text_and_function_call_steps_become_one_message() {
+    fn thought_text_and_function_call_parts_become_one_message() {
         let message = both_succeed(&recorded_tool_turn(), true);
         assert_eq!(
             message["content"],
@@ -1225,13 +1300,8 @@ mod tests {
             Some("c2ln")
         );
         let unsigned = frames(&[
-            start(0, json!({"type":"thought"})),
-            summary(0, "hidden"),
-            stop(0),
-            start(1, json!({"type":"model_output"})),
-            text(1, "answer"),
-            stop(1),
-            completed("completed"),
+            ccpa_parts(json!([{"thought": true, "text": "hidden"}])),
+            ccpa_finish(json!([{"text": "answer"}]), "STOP", None),
         ]);
         let message = both_succeed(&unsigned, false);
         assert_eq!(message["content"], json!([{"type":"text","text":"answer"}]));
@@ -1244,74 +1314,216 @@ mod tests {
     }
 
     #[test]
-    fn a_signature_on_step_start_is_carried() {
-        let input = frames(&[
-            start(0, json!({"type":"thought","signature":"c3RhcnQ="})),
-            stop(0),
-            completed("completed"),
-        ]);
-        let message = both_succeed(&input, true);
+    fn a_signature_on_a_function_call_part_is_carried() {
+        let input = frames(&[ccpa_finish(
+            json!([{
+                "functionCall": {"name": "read_file", "args": {"path": "a.py"}},
+                "thoughtSignature": "c3RhcnQ="
+            }]),
+            "STOP",
+            None,
+        )]);
+        let message = both_succeed(&input, false);
         assert_eq!(
             message["content"],
-            json!([{"type":"thinking","thinking":"","signature":envelope("c3RhcnQ=")}])
+            json!([
+                {"type":"thinking","thinking":"","signature":envelope("c3RhcnQ=")},
+                {"type":"tool_use","id":"toolu_msg_1_0","name":"read_file","input":{"path":"a.py"}}
+            ])
         );
     }
 
     #[test]
-    fn statuses_map_to_stop_reasons_or_errors() {
+    fn independently_signed_thought_parts_stay_separate_blocks() {
+        const SIG_A: &str = "Zmlyc3Q=";
+        const SIG_B: &str = "c2Vjb25kIQ==";
+        let first = json!({"thought": true, "text": "First thought.", "thoughtSignature": SIG_A});
+        let second = json!({"thought": true, "text": "Second thought.", "thoughtSignature": SIG_B});
+        let finish = ccpa_finish(json!([{"text": "answer"}]), "STOP", None);
         let tests = [
-            ("completed", Some("end_turn")),
-            ("requires_action", Some("tool_use")),
-            ("incomplete", Some("max_tokens")),
-            ("failed", None),
-            ("cancelled", None),
+            (
+                "both parts in one chunk",
+                frames(&[ccpa_parts(json!([first, second])), finish.clone()]),
+            ),
+            (
+                "each part in its own chunk",
+                frames(&[
+                    ccpa_parts(json!([first])),
+                    ccpa_parts(json!([second])),
+                    finish.clone(),
+                ]),
+            ),
+            (
+                "each signature on a part after its text",
+                frames(&[
+                    ccpa_parts(json!([
+                        {"thought": true, "text": "First thought."},
+                        {"thought": true, "thoughtSignature": SIG_A}
+                    ])),
+                    ccpa_parts(json!([
+                        {"thought": true, "text": "Second thought."},
+                        {"thought": true, "thoughtSignature": SIG_B}
+                    ])),
+                    finish.clone(),
+                ]),
+            ),
         ];
-        for (status, expected) in tests {
-            let input = frames(&[
-                start(0, json!({"type":"model_output"})),
-                text(0, "hi"),
-                stop(0),
-                completed(status),
-            ]);
-            match expected {
-                Some(reason) => {
-                    let message = both_succeed(&input, true);
-                    assert_eq!(message["stop_reason"], json!(reason), "{status}");
-                    assert_eq!(
-                        message["usage"]["input_tokens"],
-                        json!(42),
-                        "{status}: estimate kept without usage"
-                    );
-                }
-                None => assert_eq!(
-                    both_fail(&input),
-                    StreamError::Status(status.to_string()),
-                    "{status}"
-                ),
+        for (name, input) in &tests {
+            let message = both_succeed(input, true);
+            println!("{name}: {}", message["content"]);
+            assert_eq!(
+                message["content"],
+                json!([
+                    {"type":"thinking","thinking":"First thought.","signature":envelope(SIG_A)},
+                    {"type":"thinking","thinking":"Second thought.","signature":envelope(SIG_B)},
+                    {"type":"text","text":"answer"}
+                ]),
+                "{name}"
+            );
+            for (index, signature) in [(0, SIG_A), (1, SIG_B)] {
+                assert_eq!(
+                    signature_for_model(
+                        message["content"][index]["signature"]
+                            .as_str()
+                            .unwrap_or_default(),
+                        MODEL
+                    ),
+                    Some(signature),
+                    "{name}: block {index}"
+                );
             }
+
+            let hidden = both_succeed(input, false);
+            assert_eq!(
+                hidden["content"],
+                json!([
+                    {"type":"thinking","thinking":"","signature":envelope(SIG_A)},
+                    {"type":"thinking","thinking":"","signature":envelope(SIG_B)},
+                    {"type":"text","text":"answer"}
+                ]),
+                "{name}: thinking not requested"
+            );
         }
-        let weird = frames(&[completed("Not A Token!")]);
+
+        // A signature on a non-thought part after a signed thought gets its
+        // own block as well.
+        let input = frames(&[
+            ccpa_parts(json!([first, {"text": "", "thoughtSignature": SIG_B}])),
+            finish,
+        ]);
         assert_eq!(
-            both_fail(&weird),
-            StreamError::Status("unrecognized".to_string())
+            both_succeed(&input, true)["content"],
+            json!([
+                {"type":"thinking","thinking":"First thought.","signature":envelope(SIG_A)},
+                {"type":"thinking","thinking":"","signature":envelope(SIG_B)},
+                {"type":"text","text":"answer"}
+            ])
         );
     }
 
     #[test]
-    fn a_stream_that_closes_before_completion_fails() {
-        let partial = frames(&[start(0, json!({"type":"model_output"})), text(0, "Partial")]);
+    fn finish_reasons_map_to_stop_reasons_or_errors() {
+        let text_end = frames(&[ccpa_finish(json!([{"text": "hi"}]), "STOP", None)]);
+        assert_eq!(
+            both_succeed(&text_end, true)["stop_reason"],
+            json!("end_turn")
+        );
+
+        let tool_end = frames(&[ccpa_finish(
+            json!([{"functionCall": {"id": "c1", "name": "Read", "args": {}}}]),
+            "STOP",
+            None,
+        )]);
+        assert_eq!(
+            both_succeed(&tool_end, true)["stop_reason"],
+            json!("tool_use")
+        );
+
+        let max_tokens = frames(&[ccpa_finish(json!([{"text": "hi"}]), "MAX_TOKENS", None)]);
+        assert_eq!(
+            both_succeed(&max_tokens, true)["stop_reason"],
+            json!("max_tokens")
+        );
+
+        let safety = frames(&[ccpa_finish(json!([{"text": "hi"}]), "SAFETY", None)]);
+        assert_eq!(
+            both_fail(&safety),
+            StreamError::Stopped {
+                finish_reason: "SAFETY".to_string(),
+                finish_message: None,
+            }
+        );
+
+        let blocked = frames(&[json!({
+            "response": {
+                "promptFeedback": {
+                    "blockReason": "SAFETY",
+                    "blockReasonMessage": "Blocked."
+                }
+            }
+        })]);
+        assert_eq!(
+            both_fail(&blocked),
+            StreamError::PromptBlocked {
+                block_reason: "SAFETY".to_string(),
+                upstream_message: Some("Blocked.".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_usage_only_chunk_after_the_finish_reason_is_counted() {
+        // The usage arrives in a separate chunk after the finish reason, not
+        // in the final content chunk; both modes must still report it.
+        let input = frames(&[
+            ccpa_finish(json!([{"text": "hi"}]), "STOP", None),
+            json!({
+                "response": {
+                    "usageMetadata": {
+                        "promptTokenCount": 10,
+                        "candidatesTokenCount": 5,
+                        "totalTokenCount": 15
+                    }
+                },
+                "traceId": "trace-1"
+            }),
+        ]);
+        let message = both_succeed(&input, true);
+        assert_eq!(message["stop_reason"], json!("end_turn"));
+        assert_eq!(
+            message["usage"],
+            json!({
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0
+            }),
+            "the trailing usage chunk is counted, not output_tokens 0"
+        );
+    }
+
+    #[test]
+    fn content_after_the_finish_reason_is_malformed() {
+        let input = frames(&[
+            ccpa_finish(json!([{"text": "hi"}]), "STOP", None),
+            ccpa_parts(json!([{"text": "late"}])),
+        ]);
+        assert_eq!(
+            both_fail(&input),
+            StreamError::Malformed("the response streams content after the finish reason")
+        );
+    }
+
+    #[test]
+    fn a_stream_that_closes_before_finish_reason_fails() {
+        let partial = frames(&[ccpa_parts(json!([{"text": "Partial"}]))]);
         let error = both_fail(&partial);
         assert_eq!(error, StreamError::Incomplete);
         assert_eq!(
             error.to_string(),
-            "Google AI Ultra plan stream ended before interaction.completed"
+            "Google AI Ultra plan stream ended without a finishReason"
         );
-        let cut_frame = format!("{partial}event: step.delta\ndata: {{\"event_type\"");
-        assert_eq!(
-            both_fail(&cut_frame),
-            StreamError::Incomplete,
-            "a buffered partial frame changes nothing"
-        );
+        assert_eq!(error.kind(), "incomplete_stream");
         assert_eq!(both_fail(""), StreamError::Incomplete);
     }
 
@@ -1335,194 +1547,18 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_steps_never_overlap_and_keep_start_order() {
-        let input = frames(&[
-            start(0, json!({"type":"thought"})),
-            summary(0, "think "),
-            start(1, json!({"type":"model_output"})),
-            text(1, "early text "),
-            start(
-                2,
-                json!({"type":"function_call","id":"c1","name":"Read","arguments":{}}),
-            ),
-            delta(2, json!({"type":"arguments_delta","arguments":"{\"a\":1}"})),
-            summary(0, "more"),
-            stop(2),
-            text(1, "late text"),
-            delta(0, json!({"type":"thought_signature","signature":"czA="})),
-            stop(0),
-            stop(1),
-            completed("requires_action"),
-        ]);
-        let message = both_succeed(&input, true);
-        assert_eq!(
-            message["content"],
-            json!([
-                {"type":"thinking","thinking":"think more","signature":envelope("czA=")},
-                {"type":"text","text":"early text late text"},
-                {"type":"tool_use","id":"c1","name":"Read","input":{"a":1}}
-            ])
-        );
-        let events = live(&input, true).expect("live");
-        let first_text = events
-            .iter()
-            .position(|(_, data)| data["delta"]["type"] == "text_delta")
-            .expect("text delta");
-        let thinking_stop = events
-            .iter()
-            .position(|(name, data)| name == "content_block_stop" && data["index"] == 0)
-            .expect("thinking stop");
-        assert!(
-            thinking_stop < first_text,
-            "held text follows the thinking block"
-        );
-    }
-
-    #[test]
-    fn steps_still_open_at_completion_are_closed_and_indexes_may_be_reused() {
-        let input = frames(&[
-            start(0, json!({"type":"model_output"})),
-            text(0, "one"),
-            stop(0),
-            start(0, json!({"type":"model_output"})),
-            text(0, "two"),
-            start(
-                1,
-                json!({"type":"function_call","id":"c","name":"Read","arguments":{"path":"x"}}),
-            ),
-            completed("requires_action"),
-        ]);
-        let message = both_succeed(&input, true);
-        assert_eq!(
-            message["content"],
-            json!([
-                {"type":"text","text":"one"},
-                {"type":"text","text":"two"},
-                {"type":"tool_use","id":"c","name":"Read","input":{"path":"x"}}
-            ]),
-            "a call without deltas uses the arguments of step.start"
-        );
-    }
-
-    #[test]
-    fn a_call_cut_short_by_the_output_limit_is_dropped_and_the_turn_ends_at_max_tokens() {
-        let input = frames(&[
-            start(0, json!({"type":"model_output"})),
-            text(0, "Writing the file"),
-            start(
-                1,
-                json!({"type":"function_call","id":"c","name":"Write","arguments":{}}),
-            ),
-            delta(
-                1,
-                json!({"type":"arguments_delta","arguments":"{\"content\":\"half"}),
-            ),
-            start(
-                2,
-                json!({"type":"function_call","id":"d","name":"Read","arguments":{}}),
-            ),
-            completed("incomplete"),
-        ]);
-        let message = both_succeed(&input, true);
-        assert_eq!(message["stop_reason"], json!("max_tokens"));
-        assert_eq!(
-            message["content"],
-            json!([{"type":"text","text":"Writing the file"}]),
-            "no tool_use is sent for a call that never stopped"
-        );
-        let stopped = frames(&[
-            start(
-                0,
-                json!({"type":"function_call","id":"c","name":"Read","arguments":{}}),
-            ),
-            delta(0, json!({"type":"arguments_delta","arguments":"{\"a\":1}"})),
-            stop(0),
-            completed("incomplete"),
-        ]);
-        let message = both_succeed(&stopped, true);
-        assert_eq!(
-            message["content"],
-            json!([{"type":"tool_use","id":"c","name":"Read","input":{"a":1}}]),
-            "a call that stopped before the limit is kept"
-        );
-    }
-
-    #[test]
-    fn unknown_events_and_server_side_steps_are_ignored() {
-        let input = frames(&[
-            json!({"event_type":"interaction.start","interaction":{"id":"i1"}}),
-            start(0, json!({"type":"code_execution_call","code":"print(1)"})),
-            delta(0, json!({"type":"text","text":"ignored"})),
-            stop(0),
-            start(1, json!({"type":"model_output"})),
-            delta(1, json!({"type":"something_new"})),
-            text(1, "kept"),
-            stop(1),
-            json!({"event_type":"interaction.status_update"}),
-            completed("completed"),
-        ]);
-        let message = both_succeed(&input, true);
-        assert_eq!(message["content"], json!([{"type":"text","text":"kept"}]));
-    }
-
-    #[test]
-    fn an_ignored_step_at_a_free_index_leaves_the_output_unchanged() {
-        let without = frames(&[
-            start(0, json!({"type":"model_output"})),
-            text(0, "one "),
-            text(0, "two"),
-            stop(0),
-            completed("completed"),
-        ]);
-        let with = frames(&[
-            start(0, json!({"type":"model_output"})),
-            text(0, "one "),
-            start(5, json!({"type":"code_execution_call","code":"print(1)"})),
-            delta(5, json!({"type":"text","text":"ignored"})),
-            text(0, "two"),
-            stop(5),
-            stop(0),
-            completed("completed"),
-        ]);
-        let message = both_succeed(&with, true);
-        assert_eq!(
-            message["content"],
-            json!([{"type":"text","text":"one two"}])
-        );
-        assert_eq!(message, both_succeed(&without, true));
-        assert_eq!(
-            live(&with, true).expect("live with the ignored step"),
-            live(&without, true).expect("live without it"),
-            "the ignored step adds no event"
-        );
-    }
-
-    #[test]
     fn events_after_completion_are_not_read() {
-        let input = frames(&[completed("completed")])
-            + "event: done\ndata: [DONE]\n\n"
-            + &frames(&[start(0, json!({"type":"model_output"})), text(0, "late")]);
+        let input = frames(&[ccpa_finish(json!([]), "STOP", None)])
+            + "data: [DONE]\n\n"
+            + &frames(&[ccpa_parts(json!([{"text": "late"}]))]);
         let message = both_succeed(&input, true);
         assert_eq!(message["content"], json!([]));
-        let mut translator = LiveStreamTranslator::streaming(config(true));
-        translator
-            .push(frames(&[completed("completed")]).as_bytes())
-            .expect("completes");
-        assert!(translator.is_finished());
-        assert_eq!(
-            translator
-                .push(b"garbage that is not SSE JSON\n\n")
-                .expect("ignored"),
-            Vec::<u8>::new()
-        );
-        assert_eq!(translator.finish().expect("finished"), Vec::<u8>::new());
     }
 
     #[test]
     fn an_error_event_mid_stream_fails_with_the_mapped_type() {
-        let error_frame = "event: error\ndata: {\"error\":{\"message\":\"Function call is missing a thought_signature.\",\"code\":\"invalid_request\"},\"event_type\":\"error\"}\n\n";
-        let input =
-            frames(&[start(0, json!({"type":"model_output"})), text(0, "partial")]) + error_frame;
+        let error_frame = "data: {\"error\":{\"message\":\"Function call is missing a thought_signature.\",\"code\":\"invalid_request\"}}\n\n";
+        let input = frames(&[ccpa_parts(json!([{"text": "partial"}]))]) + error_frame;
         let error = both_fail(&input);
         assert_eq!(
             error,
@@ -1532,6 +1568,7 @@ mod tests {
             }
         );
         assert_eq!(error.error_type(), "invalid_request_error");
+        assert_eq!(error.kind(), "upstream_error");
         let event = parse_sse_events(
             &error.sse_event(&|text: &str| text.replace("thought_signature", "[x]")),
         );
@@ -1539,30 +1576,24 @@ mod tests {
         assert_eq!(event[0].event.as_deref(), Some("error"));
         assert_eq!(
             serde_json::from_str::<Value>(&event[0].data).expect("JSON"),
-            json!({"type":"error","error":{"type":"invalid_request_error","message":"Google AI Ultra plan stream reported an error (invalid_request): Function call is missing a [x]."}}),
-            "the upstream message goes through the sanitiser"
+            json!({"type":"error","error":{"type":"invalid_request_error","message":"Google AI Ultra plan stream reported an error (invalid_request): Function call is missing a [x]."}})
         );
         let tests = [
             (
-                json!({"event_type":"error","error":{"code":"too_many_requests","message":"slow down"}}),
+                json!({"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"slow down"}}),
                 "rate_limit_error",
             ),
             (
-                json!({"event_type":"error","error":{"code":"unauthenticated"}}),
+                json!([{"error":{"code":401,"status":"UNAUTHENTICATED"}}]),
                 "authentication_error",
             ),
             (
-                json!({"event_type":"error","error":{"code":"permission_denied"}}),
+                json!({"error":{"code":403,"status":"PERMISSION_DENIED"}}),
                 "permission_error",
             ),
             (
-                json!({"event_type":"error","error":{"code":"internal"}}),
+                json!({"error":{"code":500,"status":"INTERNAL"}}),
                 "api_error",
-            ),
-            (json!({"event_type":"error"}), "api_error"),
-            (
-                json!({"error":{"code":429,"message":"no event_type"}}),
-                "rate_limit_error",
             ),
         ];
         for (event, expected) in tests {
@@ -1583,67 +1614,54 @@ mod tests {
                 "an event is not a JSON object",
             ),
             (
-                frames(&[json!({"event_type":"step.start","step":{"type":"model_output"}})]),
-                "a step event has no index",
+                frames(&[json!({"unexpected": 1})]),
+                "an event has none of the GenerateContentResponse fields",
             ),
             (
-                frames(&[start(
-                    0,
-                    json!({"type":"function_call","id":"c","arguments":{}}),
+                frames(&[json!({"response": {"unexpected": 1}})]),
+                "an event has none of the GenerateContentResponse fields",
+            ),
+            (
+                frames(&[ccpa_parts(json!([{"functionCall": {"args": {}}}]))]),
+                "a functionCall has no name",
+            ),
+            (
+                frames(&[ccpa_parts(
+                    json!([{"functionCall": {"name": "Read", "args": [1]}}]),
                 )]),
-                "a function_call step has no name",
-            ),
-            (
-                frames(&[
-                    start(0, json!({"type":"model_output"})),
-                    start(0, json!({"type":"model_output"})),
-                ]),
-                "a step started at an index that is still open",
-            ),
-            (
-                frames(&[
-                    start(0, json!({"type":"model_output"})),
-                    start(0, json!({"type":"code_execution_call","code":"print(1)"})),
-                ]),
-                "a step started at an index that is still open",
-            ),
-            (
-                frames(&[
-                    start(0, json!({"type":"function_call","id":"c","name":"Read"})),
-                    start(0, json!({"type":"url_context_call"})),
-                    stop(0),
-                    completed("requires_action"),
-                ]),
-                "a step started at an index that is still open",
-            ),
-            (
-                frames(&[
-                    start(0, json!({"type":"function_call","id":"c","name":"Read"})),
-                    delta(0, json!({"type":"arguments_delta","arguments":"{\"a\":"})),
-                    stop(0),
-                    completed("requires_action"),
-                ]),
-                "function_call arguments are not valid JSON",
-            ),
-            (
-                frames(&[
-                    start(
-                        0,
-                        json!({"type":"function_call","id":"c","name":"Read","arguments":[1]}),
-                    ),
-                    stop(0),
-                    completed("requires_action"),
-                ]),
-                "function_call arguments are not a JSON object",
-            ),
-            (
-                frames(&[json!({"event_type":"interaction.completed","interaction":{}})]),
-                "interaction.completed has no status",
+                "functionCall args is not an object",
             ),
         ];
         for (input, expected) in tests {
             let error = both_fail(&input);
             assert_eq!(error, StreamError::Malformed(expected), "{input}");
+        }
+    }
+
+    #[test]
+    fn generated_ids_and_signature_envelopes_count_toward_the_content_limit() {
+        for keep_content in [false, true] {
+            let mut out = Vec::new();
+            let mut state = TranslationState::new(config(true), keep_content);
+            state.content_bytes = MAX_CONTENT_BYTES - BLOCK_CHARGE - "Read{}".len();
+            assert!(matches!(
+                state.function_call(String::new(), "Read".into(), json!({}), None, &mut out),
+                Err(StreamError::Malformed(
+                    "the response content exceeds the 16 MiB limit"
+                ))
+            ));
+
+            let mut state = TranslationState::new(config(true), keep_content);
+            state.content_bytes = MAX_CONTENT_BYTES - BLOCK_CHARGE - 4;
+            state
+                .thinking_signature("YWJj", &mut out)
+                .expect("raw signature fits");
+            assert!(matches!(
+                state.close_open(&mut out),
+                Err(StreamError::Malformed(
+                    "the response content exceeds the 16 MiB limit"
+                ))
+            ));
         }
     }
 
@@ -1656,14 +1674,11 @@ mod tests {
             ("ünïcode", "toolu_msg_1_0"),
         ];
         for (upstream, expected) in tests {
-            let input = frames(&[
-                start(
-                    0,
-                    json!({"type":"function_call","id":upstream,"name":"Read","arguments":{}}),
-                ),
-                stop(0),
-                completed("requires_action"),
-            ]);
+            let input = frames(&[ccpa_finish(
+                json!([{"functionCall": {"id": upstream, "name": "Read", "args": {}}}]),
+                "STOP",
+                None,
+            )]);
             let message = both_succeed(&input, true);
             assert_eq!(message["content"][0]["id"], json!(expected), "{upstream:?}");
         }
@@ -1672,16 +1687,14 @@ mod tests {
     #[test]
     fn tool_use_ids_are_unique_within_a_response() {
         let calls = |ids: &[&str]| {
-            let mut events: Vec<Value> = Vec::new();
-            for (index, id) in (0u64..).zip(ids) {
-                events.push(start(
-                    index,
-                    json!({"type":"function_call","id":id,"name":"Read","arguments":{"n":index}}),
-                ));
-                events.push(stop(index));
-            }
-            events.push(completed("requires_action"));
-            frames(&events)
+            let parts: Vec<Value> = ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| {
+                    json!({"functionCall": {"id": id, "name": "Read", "args": {"n": index}}})
+                })
+                .collect();
+            frames(&[ccpa_finish(Value::Array(parts), "STOP", None)])
         };
         let tests = [
             (
@@ -1710,74 +1723,16 @@ mod tests {
                 .map(|block| block["id"].as_str().expect("tool_use id"))
                 .collect();
             assert_eq!(ids, expected, "{case}");
-            let inputs: Vec<Value> = message["content"]
-                .as_array()
-                .expect("content is an array")
-                .iter()
-                .map(|block| block["input"].clone())
-                .collect();
-            let calls: Vec<Value> = (0..upstream.len()).map(|n| json!({"n":n})).collect();
-            assert_eq!(inputs, calls, "{case}: each block keeps its own call");
         }
-    }
-
-    #[test]
-    fn function_calls_are_charged_when_they_start() {
-        let limit = StreamError::Malformed("the response content exceeds the 16 MiB limit");
-        let chunk = "x".repeat(1024 * 1024);
-        let call = |index: u64| {
-            start(
-                index,
-                json!({"type":"function_call","id":format!("c{index}"),"name":"Write","arguments":{"content":chunk}}),
-            )
-        };
-        let mut queued = vec![start(0, json!({"type":"model_output"})), text(0, "open")];
-        for index in 1..=17 {
-            queued.push(call(index));
-            queued.push(stop(index));
-        }
-        assert_eq!(
-            both_fail(&frames(&queued)),
-            limit,
-            "calls held behind an open text step fail before the stream ends"
-        );
-        let mut emitted = Vec::new();
-        for index in 0..17 {
-            emitted.push(call(index));
-            emitted.push(stop(index));
-        }
-        emitted.push(completed("requires_action"));
-        assert_eq!(
-            both_fail(&frames(&emitted)),
-            limit,
-            "calls emitted as they stop count against the same limit"
-        );
-        let large = frames(&[
-            start(
-                0,
-                json!({"type":"function_call","id":"c","name":"Write","arguments":{"content":"y".repeat(15 * 1024 * 1024)}}),
-            ),
-            stop(0),
-            completed("requires_action"),
-        ]);
-        let message = both_succeed(&large, true);
-        assert_eq!(message["content"][0]["id"], json!("c"));
-        assert_eq!(
-            message["content"][0]["input"]["content"]
-                .as_str()
-                .map(str::len),
-            Some(15 * 1024 * 1024),
-            "a call within the limit is charged once"
-        );
     }
 
     #[test]
     fn content_past_the_limit_fails_in_both_modes() {
         let chunk = "x".repeat(1024 * 1024);
-        let mut events = vec![start(0, json!({"type":"model_output"}))];
-        events.extend((0..17).map(|_| text(0, &chunk)));
-        events.push(stop(0));
-        events.push(completed("completed"));
+        let mut events: Vec<Value> = (0..17)
+            .map(|_| ccpa_parts(json!([{"text": chunk}])))
+            .collect();
+        events.push(ccpa_finish(json!([]), "STOP", None));
         let error = both_fail(&frames(&events));
         assert_eq!(
             error,
@@ -1787,15 +1742,11 @@ mod tests {
 
     #[test]
     fn oversized_signature_falls_back_to_the_empty_envelope() {
-        let input = frames(&[
-            start(0, json!({"type":"thought"})),
-            delta(
-                0,
-                json!({"type":"thought_signature","signature":"A".repeat(1024 * 1024 + 1)}),
-            ),
-            stop(0),
-            completed("completed"),
-        ]);
+        let input = frames(&[ccpa_finish(
+            json!([{"thought": true, "thoughtSignature": "A".repeat(1024 * 1024 + 1)}]),
+            "STOP",
+            None,
+        )]);
         let message = both_succeed(&input, false);
         assert_eq!(message["content"][0]["signature"], json!(envelope("")));
         assert!(

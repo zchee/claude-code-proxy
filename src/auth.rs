@@ -77,8 +77,10 @@ impl Keychain for SystemKeychain {
     }
 }
 
+/// Runs `/usr/bin/security` with a 10-second cap, so a locked Keychain never
+/// blocks the caller for longer than that.
 #[cfg(target_os = "macos")]
-fn run_security(args: &[&str]) -> Result<std::process::Output> {
+pub(crate) fn run_security(args: &[&str]) -> Result<std::process::Output> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 

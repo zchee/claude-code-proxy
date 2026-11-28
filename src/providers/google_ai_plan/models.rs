@@ -20,7 +20,13 @@ pub const MAX_OUTPUT_TOKENS: u32 = 65_536;
 /// and recorded in every thought-signature envelope, so it is bounded.
 const MAX_MODEL_ID_BYTES: usize = 256;
 
-/// `generation_config.thinking_level`, lowest first.
+/// A thinking level, lowest first, sent as
+/// `generationConfig.thinkingConfig.thinkingLevel`.
+///
+/// Claude Code's effort names `low`, `medium`, `high`, `xhigh` and `max` are
+/// accepted; `xhigh` and `max` both ask for [`ThinkingLevel::Xhigh`]. The
+/// level is clamped to the model's range and then sent in uppercase, with
+/// `Xhigh` sent as `HIGH`, the highest value the wire takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
@@ -32,7 +38,8 @@ pub enum ThinkingLevel {
     Medium,
     /// High.
     High,
-    /// Extra high.
+    /// Extra high: what effort `xhigh` and `max` ask for. It is sent as
+    /// `HIGH`.
     Xhigh,
 }
 
@@ -80,7 +87,7 @@ const MINIMAL_TO_HIGH: ThinkingRange = ThinkingRange {
 /// A model the plan includes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelSpec {
-    /// The model ID the Interactions API expects.
+    /// The model ID sent as `model` in the Cloud Code PA request.
     pub id: &'static str,
     /// The display name.
     pub display_name: &'static str,

@@ -1,49 +1,47 @@
-//! Anthropic Messages request → Interactions API request.
+//! Anthropic Messages request → Cloud Code PA `v1internal` `GenerateContentRequest`.
 //!
-//! Every request is stateless (`store: false`) and carries the whole
-//! conversation as typed steps: `user_input`, `thought`, `model_output`,
-//! `function_call` and `function_result`.
+//! Every request wraps `google.cloud.aiplatform.master.GenerateContentRequest`
+//! inside the Cloud Code PA `v1internal.GenerateContentRequest` envelope,
+//! matching `agy`'s `ccpa.Codec.EncodeRequest` and `ccpa.ComputeRequestID`.
 
 use std::collections::HashMap;
 
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::thought_signature::{SKIP_THOUGHT_SIGNATURE_VALIDATOR, decode_envelope};
+use super::thought_signature::{SKIP_THOUGHT_SIGNATURE_VALIDATOR, signature_for_model};
 use crate::anthropic::schema::MessagesRequest;
 use crate::providers::google_ai_plan::models::{MAX_OUTPUT_TOKENS, ResolvedModel, ThinkingLevel};
 use crate::providers::translate_shared::{
     ContentBlock, flatten_system_text, normalize_content, read_effort,
 };
-use crate::providers::vertex::translate::request::{
-    FunctionCallingMode, inline_image, read_function_declarations, read_tool_choice,
-    render_tool_result,
+pub use crate::providers::vertex::translate::request::{
+    Blob, Content, FunctionCall, FunctionCallingConfig, FunctionCallingMode, FunctionDeclaration,
+    FunctionResponse, FunctionResponsePart, Part, Role, Tool, ToolConfig, inline_image,
+    read_function_declarations, read_tool_choice, render_tool_result,
 };
 
 /// How this provider is named in request errors.
 const PROVIDER_LABEL: &str = "Google AI Ultra plan";
 
-/// The `interactions:createPerUserQuota` request body.
+/// The Cloud Code PA `v1internal:streamGenerateContent` request envelope.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InteractionRequest {
+    /// The Cloud AI Companion project ID (`cloudaicompanionProject`).
+    pub project: String,
+    /// Per-request ID (`agent/<uuid_v4>`).
+    pub request_id: String,
     /// The upstream model ID.
     pub model: String,
-    /// Always `false`: the conversation is sent whole every time.
-    pub store: bool,
-    /// Always `true`: the response is an SSE stream of step events.
-    pub stream: bool,
-    /// The conversation as steps.
-    pub input: Vec<Step>,
-    /// System prompt, from the request's `system` and `system` / `developer`
-    /// messages.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system_instruction: Option<String>,
-    /// Function tools.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<Tool>>,
-    /// Thinking, output length and tool-choice settings.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub generation_config: Option<GenerationConfig>,
+    /// Per-prompt UUIDv4.
+    pub user_prompt_id: String,
+    /// Always `"antigravity"`.
+    pub user_agent: &'static str,
+    /// Always `"agent"`.
+    pub request_type: &'static str,
+    /// The inner `google.cloud.aiplatform.master.GenerateContentRequest`.
+    pub request: InnerGenerateContentRequest,
     /// Whether the client enabled thinking, which is whether the response
     /// translation forwards thought summaries as thinking text. The body
     /// always asks for summaries, so this is not derived from it. Never sent.
@@ -51,122 +49,80 @@ pub struct InteractionRequest {
     pub emit_thinking: bool,
 }
 
-/// One step of the conversation.
+impl InteractionRequest {
+    /// Sets the Cloud AI Companion project ID on the request envelope.
+    pub fn with_project(mut self, project: impl Into<String>) -> Self {
+        self.project = project.into();
+        self
+    }
+}
+
+/// The inner `google.cloud.aiplatform.master.GenerateContentRequest` inside
+/// [`InteractionRequest`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Step {
-    /// What the user sent: text and images.
-    UserInput {
-        /// The parts, never empty.
-        content: Vec<Content>,
-    },
-    /// A thought the model had, replayed with its signature.
-    Thought {
-        /// The opaque signature, or the skip sentinel.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        signature: Option<String>,
-        /// The thought summary the client kept.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        summary: Option<Vec<Content>>,
-    },
-    /// Text the model wrote.
-    ModelOutput {
-        /// The parts, never empty.
-        content: Vec<Content>,
-    },
-    /// A function call the model made.
-    FunctionCall {
-        /// The call ID, which the result's `call_id` names.
-        id: String,
-        /// The function name.
-        name: String,
-        /// The arguments object.
-        arguments: Value,
-    },
-    /// The result of a function call.
-    FunctionResult {
-        /// The ID of the call this answers.
-        call_id: String,
-        /// The function name.
-        name: String,
-        /// The result text, or a content list when it has images.
-        result: FunctionResultValue,
-        /// Whether the call failed.
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
-        is_error: bool,
-    },
-}
-
-/// A text or image part.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Content {
-    /// Plain text.
-    Text {
-        /// The text.
-        text: String,
-    },
-    /// A base64 image.
-    Image {
-        /// The media type, for example `image/png`.
-        mime_type: String,
-        /// The base64 payload.
-        data: String,
-    },
-}
-
-/// `function_result.result`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(untagged)]
-pub enum FunctionResultValue {
-    /// A result without images.
-    Text(String),
-    /// A result with images: its text first, when there is any.
-    Content(Vec<Content>),
-}
-
-/// A function the model may call.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Tool {
-    /// Always `function`.
-    #[serde(rename = "type")]
-    pub kind: &'static str,
-    /// The function name.
-    pub name: String,
-    /// What the function does.
+#[serde(rename_all = "camelCase")]
+pub struct InnerGenerateContentRequest {
+    /// The conversation, alternating `user` and `model` turns.
+    pub contents: Vec<Content>,
+    /// System prompt, from the request's `system` and `system` / `developer`
+    /// messages. In `agy`, `systemInstruction` has `"role": "user"`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// The Anthropic `input_schema`, sent unchanged as JSON Schema.
+    pub system_instruction: Option<Content>,
+    /// Function declarations, all in one `Tool`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parameters: Option<Value>,
+    pub tools: Option<Vec<Tool>>,
+    /// Function-calling mode, from `tool_choice`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_config: Option<ToolConfig>,
+    /// Thinking and output length settings.
+    pub generation_config: GenerationConfig,
 }
 
-/// `generation_config`. No sampling settings: the plan's request shape has
-/// none, so the client's `temperature`, `top_p` and `top_k` are dropped.
+/// `request.generationConfig`. No sampling settings (`temperature`, `top_p`,
+/// `top_k`) are forwarded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GenerationConfig {
-    /// The thinking level, always one the model accepts.
-    pub thinking_level: ThinkingLevel,
-    /// Always `auto`, so the stream carries thought summaries.
-    pub thinking_summaries: &'static str,
     /// Output token limit, from `max_tokens`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
-    /// How the model may call tools; sent only with tools.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<ToolChoice>,
+    /// Thinking level and summaries.
+    pub thinking_config: ThinkingConfig,
 }
 
-/// `generation_config.tool_choice`.
+/// `request.generationConfig.thinkingConfig`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThinkingConfig {
+    /// Always `true` so the stream carries thought summaries.
+    pub include_thoughts: bool,
+    /// The thinking level in uppercase (`MINIMAL`, `LOW`, `MEDIUM`, `HIGH`).
+    pub thinking_level: WireThinkingLevel,
+}
+
+/// `google.cloud.aiplatform.master.GenerationConfig.ThinkingConfig.ThinkingLevel`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ToolChoice {
-    /// The model decides.
-    Auto,
-    /// The model must call a tool.
-    Any,
-    /// The model must not call a tool.
-    None,
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WireThinkingLevel {
+    /// Minimal.
+    Minimal,
+    /// Low.
+    Low,
+    /// Medium.
+    Medium,
+    /// High.
+    High,
+}
+
+impl From<ThinkingLevel> for WireThinkingLevel {
+    fn from(level: ThinkingLevel) -> Self {
+        match level {
+            ThinkingLevel::Minimal => Self::Minimal,
+            ThinkingLevel::Low => Self::Low,
+            ThinkingLevel::Medium => Self::Medium,
+            ThinkingLevel::High | ThinkingLevel::Xhigh => Self::High,
+        }
+    }
 }
 
 /// Translates an Anthropic Messages request for `model`.
@@ -174,11 +130,12 @@ pub enum ToolChoice {
 /// # Errors
 ///
 /// Fails, with a message meant for a 400 `invalid_request_error`, for what
-/// the Interactions API has no counterpart for or cannot receive: URL images,
-/// Anthropic server tools, `stop_sequences`, a function name Gemini does not
-/// accept, a `tool_choice` naming a tool the request does not declare, a
-/// `tool_result` that matches no earlier `tool_use`, an unknown message role,
-/// a conversation without steps, a `max_tokens` of 0, or malformed fields.
+/// the Cloud Code PA endpoint has no counterpart for or cannot receive: URL
+/// images, Anthropic server tools, `stop_sequences`, a function name Gemini
+/// does not accept, a `tool_choice` naming a tool the request does not
+/// declare, a `tool_result` that matches no earlier `tool_use`, an unknown
+/// message role, a conversation without contents, a `max_tokens` of 0, or
+/// malformed fields.
 pub fn prepare_request(
     body: &MessagesRequest,
     model: &ResolvedModel,
@@ -187,7 +144,7 @@ pub fn prepare_request(
     if let Some(text) = request_system_text(body.extra.get("system")) {
         system.push(text);
     }
-    let mut builder = StepsBuilder::new(&model.upstream_model);
+    let mut builder = ContentsBuilder::new(&model.upstream_model);
     for message in &body.messages {
         let blocks = normalize_content(&message.content, json!({}));
         match message.role.as_str() {
@@ -211,96 +168,104 @@ pub fn prepare_request(
             other => anyhow::bail!("unexpected message role: {other}"),
         }
     }
-    let input = builder.finish();
-    if input.is_empty() {
+    let contents = builder.finish();
+    if contents.is_empty() {
         anyhow::bail!("messages must contain at least one non-empty user or assistant turn");
     }
     reject_stop_sequences(body)?;
-    // An explicit 0 has no counterpart: leaving the limit out would run the
-    // request with the provider's default instead.
     if body.max_tokens == Some(0) {
         anyhow::bail!("max_tokens must be at least 1");
     }
 
-    let mut tools: Vec<Tool> = read_function_declarations(body, PROVIDER_LABEL)?
-        .into_iter()
-        .map(|declaration| Tool {
-            kind: "function",
-            name: declaration.name,
-            description: declaration.description,
-            parameters: declaration.parameters_json_schema,
-        })
-        .collect();
+    let declarations = read_function_declarations(body, PROVIDER_LABEL)?;
     let choice = read_tool_choice(body)?;
-    let tool_choice = match choice {
-        None => None,
-        Some(config) => {
-            if tools.is_empty() && config.mode != FunctionCallingMode::None {
-                anyhow::bail!("tool_choice requires at least one tool");
-            }
-            // The Interactions tool choice names no function, so a choice
-            // of one tool sends `any` with only that tool declared.
-            if let Some(name) = config
-                .allowed_function_names
-                .as_ref()
-                .and_then(|names| names.first())
-            {
-                tools.retain(|tool| &tool.name == name);
-                if tools.is_empty() {
-                    anyhow::bail!(
-                        "tool_choice names the tool {name}, which tools does not declare"
-                    );
-                }
-            }
-            Some(match config.mode {
-                FunctionCallingMode::Auto => ToolChoice::Auto,
-                FunctionCallingMode::Any => ToolChoice::Any,
-                FunctionCallingMode::None => ToolChoice::None,
-            })
+    if let Some(config) = choice.as_ref() {
+        if declarations.is_empty() && config.mode != FunctionCallingMode::None {
+            anyhow::bail!("tool_choice requires at least one tool");
         }
-    };
+        if let Some(name) = config
+            .allowed_function_names
+            .as_ref()
+            .and_then(|names| names.first())
+            && !declarations.iter().any(|decl| &decl.name == name)
+        {
+            anyhow::bail!("tool_choice names the tool {name}, which tools does not declare");
+        }
+    }
+    let has_tools = !declarations.is_empty();
     let (thinking_level, emit_thinking) = read_thinking(body, model)?;
 
     Ok(InteractionRequest {
+        project: String::new(),
+        request_id: format!("agent/{}", uuid::Uuid::new_v4()),
         model: model.upstream_model.clone(),
-        store: false,
-        stream: true,
-        input,
-        system_instruction: (!system.is_empty()).then(|| system.join("\n\n")),
-        generation_config: Some(GenerationConfig {
-            thinking_level,
-            thinking_summaries: "auto",
-            max_output_tokens: body.max_tokens.map(|value| value.min(MAX_OUTPUT_TOKENS)),
-            tool_choice: tool_choice.filter(|_| !tools.is_empty()),
-        }),
-        tools: (!tools.is_empty()).then_some(tools),
+        user_prompt_id: uuid::Uuid::new_v4().to_string(),
+        user_agent: "antigravity",
+        request_type: "agent",
+        request: InnerGenerateContentRequest {
+            contents,
+            system_instruction: (!system.is_empty()).then(|| Content {
+                role: Some(Role::User),
+                parts: vec![Part {
+                    text: Some(system.join("\n\n")),
+                    ..Part::default()
+                }],
+            }),
+            tools: has_tools.then(|| {
+                vec![Tool {
+                    function_declarations: declarations,
+                }]
+            }),
+            tool_config: choice
+                .filter(|_| has_tools)
+                .map(|function_calling_config| ToolConfig {
+                    function_calling_config,
+                }),
+            generation_config: GenerationConfig {
+                max_output_tokens: body.max_tokens.map(|value| value.min(MAX_OUTPUT_TOKENS)),
+                thinking_config: ThinkingConfig {
+                    include_thoughts: true,
+                    thinking_level: WireThinkingLevel::from(thinking_level),
+                },
+            },
+        },
         emit_thinking,
     })
 }
 
-/// Builds `input`, keeping consecutive messages of one role together.
-struct StepsBuilder<'a> {
+/// Builds `contents`, merging consecutive messages of one role and dropping
+/// turns without parts. Text and images never share a user content with
+/// function responses (see `flush_user`).
+struct ContentsBuilder<'a> {
     model: &'a str,
-    steps: Vec<Step>,
-    /// Function results of the user turn being collected, in order.
-    results: Vec<Step>,
-    /// Text and images of the user turn being collected, in order.
-    user_content: Vec<Content>,
+    contents: Vec<Content>,
+    user: UserTurn,
     /// Function name of every `tool_use` seen so far, by ID.
     tool_names: HashMap<String, String>,
-    /// Whether the current model turn already has a signed thought step.
-    signed: bool,
+    /// `tool_use` IDs of the latest model turn, in order.
+    model_calls: Vec<String>,
+    /// A signature from this model, waiting for the next function call.
+    held_signature: Option<String>,
 }
 
-impl<'a> StepsBuilder<'a> {
+#[derive(Default)]
+struct UserTurn {
+    /// Function responses with the position of their call in the latest
+    /// model turn (`None` when it is not there).
+    responses: Vec<(Option<usize>, Part)>,
+    /// Text and images, in order.
+    others: Vec<Part>,
+}
+
+impl<'a> ContentsBuilder<'a> {
     fn new(model: &'a str) -> Self {
         Self {
             model,
-            steps: Vec::new(),
-            results: Vec::new(),
-            user_content: Vec::new(),
+            contents: Vec::new(),
+            user: UserTurn::default(),
             tool_names: HashMap::new(),
-            signed: false,
+            model_calls: Vec::new(),
+            held_signature: None,
         }
     }
 
@@ -308,39 +273,20 @@ impl<'a> StepsBuilder<'a> {
         self.flush_user();
         for block in blocks {
             match block {
-                ContentBlock::Thinking {
-                    thinking,
-                    signature,
-                } => {
-                    // Only this model's own envelopes are replayed; thinking
-                    // from another model or provider is dropped whole.
-                    let Some(decoded) = signature
-                        .as_deref()
-                        .and_then(decode_envelope)
-                        .filter(|decoded| decoded.model == self.model)
-                    else {
-                        continue;
-                    };
-                    let summary = (!thinking.trim().is_empty()).then(|| {
-                        vec![Content::Text {
-                            text: thinking.clone(),
-                        }]
-                    });
-                    let signature =
-                        (!decoded.signature.is_empty()).then(|| decoded.signature.to_string());
-                    if signature.is_none() && summary.is_none() {
-                        continue;
-                    }
-                    self.signed |= signature.is_some();
-                    self.steps.push(Step::Thought { signature, summary });
-                }
                 ContentBlock::Text { text } if !text.is_empty() => {
-                    let part = Content::Text { text: text.clone() };
-                    match self.steps.last_mut() {
-                        Some(Step::ModelOutput { content }) => content.push(part),
-                        _ => self.steps.push(Step::ModelOutput {
-                            content: vec![part],
-                        }),
+                    self.push_model_part(Part {
+                        text: Some(text.clone()),
+                        ..Part::default()
+                    });
+                }
+                ContentBlock::Thinking { signature, .. } => {
+                    // Only this model's own `ccp:google-ai-plan:v1:` envelopes
+                    // with a non-empty signature are kept for the next call.
+                    if let Some(signature) = signature
+                        .as_deref()
+                        .and_then(|value| signature_for_model(value, self.model))
+                    {
+                        self.held_signature = Some(signature.to_string());
                     }
                 }
                 ContentBlock::ToolUse { id, name, input } => {
@@ -350,22 +296,20 @@ impl<'a> StepsBuilder<'a> {
                     if !input.is_object() {
                         anyhow::bail!("assistant tool_use {id} input must be an object");
                     }
-                    // Gemini rejects a function call of a model turn without
-                    // a signed thought step before it, for example after the
-                    // client switched models mid tool loop; Google's sentinel
-                    // skips the check.
-                    if !self.signed {
-                        self.steps.push(Step::Thought {
-                            signature: Some(SKIP_THOUGHT_SIGNATURE_VALIDATOR.to_string()),
-                            summary: None,
-                        });
-                        self.signed = true;
-                    }
+                    self.ensure_model_content();
+                    let first_call = self.model_calls.is_empty();
+                    let thought_signature = self.held_signature.take().or_else(|| {
+                        first_call.then(|| SKIP_THOUGHT_SIGNATURE_VALIDATOR.to_string())
+                    });
                     self.tool_names.insert(id.clone(), name.clone());
-                    self.steps.push(Step::FunctionCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                        arguments: input.clone(),
+                    self.model_calls.push(id.clone());
+                    self.push_model_part(Part {
+                        function_call: Some(FunctionCall {
+                            name: name.clone(),
+                            args: input.clone(),
+                        }),
+                        thought_signature,
+                        ..Part::default()
                     });
                 }
                 ContentBlock::Text { .. }
@@ -377,18 +321,17 @@ impl<'a> StepsBuilder<'a> {
     }
 
     fn push_user(&mut self, blocks: &[ContentBlock]) -> anyhow::Result<()> {
+        self.held_signature = None;
         for block in blocks {
             match block {
-                ContentBlock::Text { text } if !text.is_empty() => {
-                    self.user_content.push(Content::Text { text: text.clone() });
-                }
-                ContentBlock::Image { source } => {
-                    let image = inline_image(source, PROVIDER_LABEL)?;
-                    self.user_content.push(Content::Image {
-                        mime_type: image.mime_type,
-                        data: image.data,
-                    });
-                }
+                ContentBlock::Text { text } if !text.is_empty() => self.user.others.push(Part {
+                    text: Some(text.clone()),
+                    ..Part::default()
+                }),
+                ContentBlock::Image { source } => self.user.others.push(Part {
+                    inline_data: Some(inline_image(source, PROVIDER_LABEL)?),
+                    ..Part::default()
+                }),
                 ContentBlock::ToolResult {
                     tool_use_id,
                     content,
@@ -400,27 +343,29 @@ impl<'a> StepsBuilder<'a> {
                         )
                     })?;
                     let rendered = render_tool_result(content, PROVIDER_LABEL)?;
-                    let result = if rendered.images.is_empty() {
-                        FunctionResultValue::Text(rendered.text)
+                    let key = if is_error.unwrap_or(false) {
+                        "error"
                     } else {
-                        let text = (!rendered.text.is_empty()).then_some(Content::Text {
-                            text: rendered.text,
-                        });
-                        FunctionResultValue::Content(
-                            text.into_iter()
-                                .chain(rendered.images.into_iter().map(|image| Content::Image {
-                                    mime_type: image.mime_type,
-                                    data: image.data,
-                                }))
-                                .collect(),
-                        )
+                        "output"
                     };
-                    self.results.push(Step::FunctionResult {
-                        call_id: tool_use_id.clone(),
-                        name: name.clone(),
-                        result,
-                        is_error: is_error.unwrap_or(false),
-                    });
+                    let position = self.model_calls.iter().position(|id| id == tool_use_id);
+                    self.user.responses.push((
+                        position,
+                        Part {
+                            function_response: Some(FunctionResponse {
+                                name: name.clone(),
+                                response: json!({ key: rendered.text }),
+                                parts: (!rendered.images.is_empty()).then(|| {
+                                    rendered
+                                        .images
+                                        .into_iter()
+                                        .map(|inline_data| FunctionResponsePart { inline_data })
+                                        .collect()
+                                }),
+                            }),
+                            ..Part::default()
+                        },
+                    ));
                 }
                 ContentBlock::Text { .. }
                 | ContentBlock::Thinking { .. }
@@ -430,26 +375,71 @@ impl<'a> StepsBuilder<'a> {
         Ok(())
     }
 
-    /// Writes the collected user turn: function results first, so they
-    /// follow the calls they answer, then one `user_input` step with the
-    /// turn's text and images. A user turn that produced steps ends the
-    /// model turn before it.
     fn flush_user(&mut self) {
-        let results = std::mem::take(&mut self.results);
-        let content = std::mem::take(&mut self.user_content);
-        if results.is_empty() && content.is_empty() {
-            return;
-        }
-        self.signed = false;
-        self.steps.extend(results);
-        if !content.is_empty() {
-            self.steps.push(Step::UserInput { content });
+        let mut turn = std::mem::take(&mut self.user);
+        turn.responses
+            .sort_by_key(|(position, _)| position.unwrap_or(usize::MAX));
+        let responses: Vec<Part> = turn.responses.into_iter().map(|(_, part)| part).collect();
+        self.push_user_parts(responses);
+        let last_holds_responses = matches!(
+            self.contents.last(),
+            Some(Content {
+                role: Some(Role::User),
+                parts,
+            }) if parts.iter().any(|part| part.function_response.is_some())
+        );
+        if last_holds_responses && !turn.others.is_empty() {
+            self.contents.push(Content {
+                role: Some(Role::User),
+                parts: turn.others,
+            });
+        } else {
+            self.push_user_parts(turn.others);
         }
     }
 
-    fn finish(mut self) -> Vec<Step> {
+    fn push_user_parts(&mut self, parts: Vec<Part>) {
+        if parts.is_empty() {
+            return;
+        }
+        match self.contents.last_mut() {
+            Some(Content {
+                role: Some(Role::User),
+                parts: existing,
+            }) => existing.extend(parts),
+            _ => self.contents.push(Content {
+                role: Some(Role::User),
+                parts,
+            }),
+        }
+    }
+
+    fn ensure_model_content(&mut self) {
+        if !matches!(
+            self.contents.last(),
+            Some(Content {
+                role: Some(Role::Model),
+                ..
+            })
+        ) {
+            self.contents.push(Content {
+                role: Some(Role::Model),
+                parts: Vec::new(),
+            });
+            self.model_calls.clear();
+        }
+    }
+
+    fn push_model_part(&mut self, part: Part) {
+        self.ensure_model_content();
+        if let Some(content) = self.contents.last_mut() {
+            content.parts.push(part);
+        }
+    }
+
+    fn finish(mut self) -> Vec<Content> {
         self.flush_user();
-        self.steps
+        self.contents
     }
 }
 
@@ -486,18 +476,7 @@ fn reject_stop_sequences(body: &MessagesRequest) -> anyhow::Result<()> {
 }
 
 /// Maps Claude Code's effort and thinking settings to a thinking level,
-/// then moves it to the nearest level the model accepts:
-///
-/// | effort | thinking | requested level |
-/// |---|---|---|
-/// | low / medium / high / xhigh | any | the same level |
-/// | max | any | xhigh |
-/// | none | on | high |
-/// | none | off or absent | minimal |
-///
-/// Thinking is on for any `thinking.type` other than `disabled`;
-/// `budget_tokens` is not used. No plan model can turn thinking off, so a
-/// level is always sent. The second value is whether thinking is on.
+/// then moves it to the nearest level the model accepts.
 fn read_thinking(
     body: &MessagesRequest,
     model: &ResolvedModel,
@@ -514,11 +493,7 @@ fn read_thinking(
         Some("medium") => ThinkingLevel::Medium,
         Some("high") => ThinkingLevel::High,
         Some(_) => ThinkingLevel::Xhigh,
-        // A level is always named: the request shape pairs it with
-        // `thinking_summaries`, and summaries without a level is a request
-        // nobody has seen accepted. `high` is a level all four models take.
         None if thinking_on => ThinkingLevel::High,
-        // Thinking cannot be turned off; the clamp picks the lowest level.
         None => ThinkingLevel::Minimal,
     };
     Ok((model.thinking.clamp(requested), thinking_on))
@@ -542,6 +517,7 @@ mod tests {
         let model = resolve(&format!("google-ai-plan/{model}")).expect("model resolves");
         prepare_request(&request(value), &model)
             .unwrap_or_else(|error| panic!("request should translate: {error}"))
+            .with_project("test-project")
     }
 
     fn wire_for(model: &str, value: Value) -> Value {
@@ -559,16 +535,16 @@ mod tests {
             .to_string()
     }
 
-    fn steps(wire: &Value) -> &[Value] {
-        wire["input"].as_array().expect("input is an array")
+    fn contents(wire: &Value) -> &[Value] {
+        wire["request"]["contents"]
+            .as_array()
+            .expect("contents is an array")
     }
 
     fn envelope(model: &str, signature: &str) -> String {
         encode_envelope(model, signature).expect("envelope encodes")
     }
 
-    /// The conversation of the reference replay test: a user turn, a model
-    /// turn with a thinking block and a call, and the call's result.
     fn replay(thinking: Value) -> Value {
         json!({"messages":[
             {"role":"user","content":"Read a.py"},
@@ -583,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn stateless_request_with_a_clamped_level_and_no_sampling_settings() {
+    fn cloud_code_envelope_with_clamped_level_and_no_sampling_settings() {
         let wire = wire(json!({
             "system":"Be brief.",
             "temperature":0.5,
@@ -593,18 +569,34 @@ mod tests {
             "tools":[{"name":"read_file","description":"Read a file","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}],
             "messages":[{"role":"user","content":"Hi"}]
         }));
+        assert_eq!(wire["project"], json!("test-project"));
+        assert_eq!(wire["model"], json!("gemini-4-hydrogen"));
+        assert_eq!(wire["userAgent"], json!("antigravity"));
+        assert_eq!(wire["requestType"], json!("agent"));
+        assert!(
+            wire["requestId"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("agent/")),
+            "{wire}"
+        );
+        assert!(
+            wire["userPromptId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "{wire}"
+        );
         assert_eq!(
-            wire,
+            wire["request"],
             json!({
-                "model":"gemini-4-hydrogen",
-                "store":false,
-                "stream":true,
-                "input":[{"type":"user_input","content":[{"type":"text","text":"Hi"}]}],
-                "system_instruction":"Be brief.",
-                "tools":[{"type":"function","name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}],
-                "generation_config":{"thinking_level":"low","thinking_summaries":"auto","max_output_tokens":1024}
+                "contents":[{"role":"user","parts":[{"text":"Hi"}]}],
+                "systemInstruction":{"role":"user","parts":[{"text":"Be brief."}]},
+                "tools":[{"functionDeclarations":[{"name":"read_file","description":"Read a file","parametersJsonSchema":{"type":"object","properties":{"path":{"type":"string"}}}}]}],
+                "generationConfig":{
+                    "maxOutputTokens":1024,
+                    "thinkingConfig":{"includeThoughts":true,"thinkingLevel":"LOW"}
+                }
             }),
-            "a request without thinking asks for the lowest level Hydrogen accepts, not minimal"
+            "a request without thinking asks for the lowest level Hydrogen accepts, mapped to uppercase"
         );
         let rendered = wire.to_string();
         for absent in ["temperature", "top_p", "top_k", "emit_thinking"] {
@@ -616,17 +608,16 @@ mod tests {
     }
 
     #[test]
-    fn replays_the_models_own_signed_thought_before_its_function_call() {
+    fn replays_the_models_own_signed_thought_on_its_function_call() {
         let wire = wire(replay(
             json!({"type":"thinking","thinking":"Read the file first.","signature":envelope(MODEL, SIG)}),
         ));
         assert_eq!(
-            wire["input"],
+            wire["request"]["contents"],
             json!([
-                {"type":"user_input","content":[{"type":"text","text":"Read a.py"}]},
-                {"type":"thought","signature":SIG,"summary":[{"type":"text","text":"Read the file first."}]},
-                {"type":"function_call","id":"call_1","name":"read_file","arguments":{"path":"a.py"}},
-                {"type":"function_result","call_id":"call_1","name":"read_file","result":"x = 1"}
+                {"role":"user","parts":[{"text":"Read a.py"}]},
+                {"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"path":"a.py"}},"thoughtSignature":SIG}]},
+                {"role":"user","parts":[{"functionResponse":{"name":"read_file","response":{"output":"x = 1"}}}]}
             ])
         );
     }
@@ -647,15 +638,19 @@ mod tests {
                 json!({"type":"thinking","thinking":"x","signature":vertex::encode_envelope(MODEL, SIG).expect("encodes")}),
             ),
             ("no signature", json!({"type":"thinking","thinking":""})),
+            (
+                "an unsigned envelope",
+                json!({"type":"thinking","thinking":"Plan.","signature":envelope(MODEL, "")}),
+            ),
         ];
         for (case, thinking) in foreign {
             let wire = wire(replay(thinking));
             assert_eq!(
-                steps(&wire)[1..3],
-                [
-                    json!({"type":"thought","signature":"skip_thought_signature_validator"}),
-                    json!({"type":"function_call","id":"call_1","name":"read_file","arguments":{"path":"a.py"}}),
-                ],
+                contents(&wire)[1],
+                json!({
+                    "role":"model",
+                    "parts":[{"functionCall":{"name":"read_file","args":{"path":"a.py"}},"thoughtSignature":"skip_thought_signature_validator"}]
+                }),
                 "{case}"
             );
             assert!(
@@ -666,22 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_envelope_keeps_its_summary_and_still_gets_the_sentinel() {
-        let wire = wire(replay(
-            json!({"type":"thinking","thinking":"Plan.","signature":envelope(MODEL, "")}),
-        ));
-        assert_eq!(
-            steps(&wire)[1..4],
-            [
-                json!({"type":"thought","summary":[{"type":"text","text":"Plan."}]}),
-                json!({"type":"thought","signature":"skip_thought_signature_validator"}),
-                json!({"type":"function_call","id":"call_1","name":"read_file","arguments":{"path":"a.py"}}),
-            ]
-        );
-    }
-
-    #[test]
-    fn one_signed_thought_covers_every_call_of_the_model_turn_and_resets_after_results() {
+    fn one_signed_thought_covers_parallel_calls_of_the_model_turn_and_resets_after_results() {
         let wire = wire(json!({"messages":[
             {"role":"user","content":"q"},
             {"role":"assistant","content":[
@@ -698,35 +678,28 @@ mod tests {
                 {"type":"tool_use","id":"c","name":"Read","input":{}}
             ]}
         ]}));
-        let kinds: Vec<String> = wire["input"]
-            .as_array()
-            .expect("input is an array")
-            .iter()
-            .map(|step| match step["signature"].as_str() {
-                Some(signature) => format!("thought:{signature}"),
-                None => step["type"].as_str().unwrap_or_default().to_string(),
-            })
-            .collect();
         assert_eq!(
-            kinds,
-            [
-                "user_input",
-                &format!("thought:{SIG}"),
-                "function_call",
-                "function_call",
-                "function_result",
-                "function_result",
-                "model_output",
-                "thought:skip_thought_signature_validator",
-                "function_call",
-            ]
+            wire["request"]["contents"],
+            json!([
+                {"role":"user","parts":[{"text":"q"}]},
+                {"role":"model","parts":[
+                    {"functionCall":{"name":"Read","args":{}},"thoughtSignature":SIG},
+                    {"functionCall":{"name":"Grep","args":{}}}
+                ]},
+                {"role":"user","parts":[
+                    {"functionResponse":{"name":"Read","response":{"output":"1"}}},
+                    {"functionResponse":{"name":"Grep","response":{"error":"2"}}}
+                ]},
+                {"role":"model","parts":[
+                    {"text":"again"},
+                    {"functionCall":{"name":"Read","args":{}},"thoughtSignature":"skip_thought_signature_validator"}
+                ]}
+            ])
         );
-        assert_eq!(wire["input"][5]["is_error"], json!(true));
-        assert_eq!(wire["input"][4].get("is_error"), None, "false is not sent");
     }
 
     #[test]
-    fn tool_results_come_before_text_and_carry_images_as_content() {
+    fn tool_results_come_before_text_and_carry_images_as_parts() {
         let image = json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}});
         let wire = wire(json!({"messages":[
             {"role":"user","content":"look"},
@@ -738,34 +711,25 @@ mod tests {
             ]}
         ]}));
         assert_eq!(
-            steps(&wire)[3..],
+            contents(&wire)[2..],
             [
-                json!({"type":"function_result","call_id":"t1","name":"Screenshot","result":[
-                    {"type":"text","text":"captured"},
-                    {"type":"image","mime_type":"image/png","data":"iVBORw0KGgo="}
-                ]}),
-                json!({"type":"user_input","content":[
-                    {"type":"text","text":"also this"},
-                    {"type":"image","mime_type":"image/png","data":"iVBORw0KGgo="}
+                json!({"role":"user","parts":[{
+                    "functionResponse":{
+                        "name":"Screenshot",
+                        "response":{"output":"captured"},
+                        "parts":[{"inlineData":{"mimeType":"image/png","data":"iVBORw0KGgo="}}]
+                    }
+                }]}),
+                json!({"role":"user","parts":[
+                    {"text":"also this"},
+                    {"inlineData":{"mimeType":"image/png","data":"iVBORw0KGgo="}}
                 ]}),
             ]
-        );
-        let image_only = wire_for(
-            MODEL,
-            json!({"messages":[
-                {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Shot","input":{}}]},
-                {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[image]}]}
-            ]}),
-        );
-        assert_eq!(
-            image_only["input"][2]["result"],
-            json!([{"type":"image","mime_type":"image/png","data":"iVBORw0KGgo="}]),
-            "an image-only result has no empty text part"
         );
     }
 
     #[test]
-    fn consecutive_model_text_merges_into_one_model_output() {
+    fn consecutive_messages_of_one_role_merge_into_one_content() {
         let wire = wire(json!({"messages":[
             {"role":"user","content":"a"},
             {"role":"user","content":"b"},
@@ -773,16 +737,16 @@ mod tests {
             {"role":"assistant","content":[{"type":"text","text":""},{"type":"text","text":"d"}]}
         ]}));
         assert_eq!(
-            wire["input"],
+            wire["request"]["contents"],
             json!([
-                {"type":"user_input","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]},
-                {"type":"model_output","content":[{"type":"text","text":"c"},{"type":"text","text":"d"}]}
+                {"role":"user","parts":[{"text":"a"},{"text":"b"}]},
+                {"role":"model","parts":[{"text":"c"},{"text":"d"}]}
             ])
         );
     }
 
     #[test]
-    fn system_prompt_and_system_messages_join_into_the_system_instruction() {
+    fn system_prompt_and_system_messages_join_into_user_role_system_instruction() {
         let wire = wire(json!({
             "system":[
                 {"type":"text","text":"x-anthropic-billing-header: dropped"},
@@ -795,8 +759,8 @@ mod tests {
             ]
         }));
         assert_eq!(
-            wire["system_instruction"],
-            json!("first\n\nsecond\n\nthird")
+            wire["request"]["systemInstruction"],
+            json!({"role":"user","parts":[{"text":"first\n\nsecond\n\nthird"}]})
         );
     }
 
@@ -829,7 +793,11 @@ mod tests {
             }
             messages.push(json!({"role":"user","content":"hi"}));
             let wire = wire(body);
-            assert_eq!(wire.get("system_instruction"), None, "{case}: {wire}");
+            assert_eq!(
+                wire["request"].get("systemInstruction"),
+                None,
+                "{case}: {wire}"
+            );
         }
     }
 
@@ -856,8 +824,8 @@ mod tests {
                 ]
             }));
             assert_eq!(
-                wire["system_instruction"],
-                json!(format!("{expected}\n\nrules")),
+                wire["request"]["systemInstruction"],
+                json!({"role":"user","parts":[{"text":format!("{expected}\n\nrules")}]}),
                 "{system}"
             );
         }
@@ -870,96 +838,77 @@ mod tests {
             {"name":"Grep","input_schema":{"type":"object"}}
         ]);
         let tests = [
-            (
-                "auto",
-                json!({"type":"auto"}),
-                Some("auto"),
-                vec!["Read", "Grep"],
-            ),
+            ("auto", json!({"type":"auto"}), Some(json!({"mode":"AUTO"}))),
             (
                 "any",
                 json!({"type":"any","disable_parallel_tool_use":true}),
-                Some("any"),
-                vec!["Read", "Grep"],
+                Some(json!({"mode":"ANY"})),
             ),
-            (
-                "none",
-                json!({"type":"none"}),
-                Some("none"),
-                vec!["Read", "Grep"],
-            ),
+            ("none", json!({"type":"none"}), Some(json!({"mode":"NONE"}))),
             (
                 "one tool",
                 json!({"type":"tool","name":"Grep"}),
-                Some("any"),
-                vec!["Grep"],
+                Some(json!({"mode":"ANY","allowedFunctionNames":["Grep"]})),
             ),
-            ("absent", Value::Null, None, vec!["Read", "Grep"]),
+            ("absent", Value::Null, None),
         ];
-        for (case, choice, expected, names) in tests {
+        for (case, choice, expected) in tests {
             let wire = wire(json!({
                 "tools":tools,
                 "tool_choice":choice,
                 "messages":[{"role":"user","content":"hi"}]
             }));
             assert_eq!(
-                wire["generation_config"]
-                    .get("tool_choice")
-                    .and_then(Value::as_str),
-                expected,
+                wire["request"]
+                    .get("toolConfig")
+                    .and_then(|tc| tc.get("functionCallingConfig")),
+                expected.as_ref(),
                 "{case}"
             );
-            let sent: Vec<&str> = wire["tools"]
-                .as_array()
-                .expect("tools are sent")
-                .iter()
-                .map(|tool| tool["name"].as_str().unwrap_or_default())
-                .collect();
-            assert_eq!(sent, names, "{case}");
         }
         let without_tools = wire(json!({
             "tool_choice":{"type":"none"},
             "messages":[{"role":"user","content":"hi"}]
         }));
-        assert_eq!(without_tools.get("tools"), None);
-        assert_eq!(without_tools["generation_config"].get("tool_choice"), None);
+        assert_eq!(without_tools["request"].get("tools"), None);
+        assert_eq!(without_tools["request"].get("toolConfig"), None);
     }
 
     #[test]
-    fn each_models_level_is_clamped_to_what_it_accepts() {
+    fn each_models_level_is_clamped_and_mapped_to_uppercase_thinking_level() {
         let tests = [
-            // (model, effort, thinking type, level, emit_thinking)
-            ("gemini-4-hydrogen", None, None, "low", false),
-            ("gemini-4-hydrogen", None, Some("enabled"), "high", true),
+            // (model, effort, thinking type, wire thinkingLevel, emit_thinking)
+            ("gemini-4-hydrogen", None, None, "LOW", false),
+            ("gemini-4-hydrogen", None, Some("enabled"), "HIGH", true),
             (
                 "gemini-4-hydrogen",
                 Some("xhigh"),
                 Some("adaptive"),
-                "xhigh",
+                "HIGH",
                 true,
             ),
-            ("gemini-4-hydrogen", Some("max"), None, "xhigh", false),
-            ("gemini-4-neon", Some("low"), Some("disabled"), "low", false),
-            ("gemini-4-neon", Some("max"), Some("enabled"), "xhigh", true),
-            ("gemini-4-carbon", Some("xhigh"), None, "high", false),
-            ("gemini-4-carbon", Some("max"), None, "high", false),
-            ("gemini-4-carbon", None, None, "low", false),
-            ("gemini-4-carbon", None, Some("enabled"), "high", true),
-            ("gemini-4-neon", None, Some("adaptive"), "high", true),
-            ("gemini-4-neon", None, None, "low", false),
-            ("gemini-3.5-flash-lite", None, Some("enabled"), "high", true),
-            ("gemini-4-carbon", Some("medium"), None, "medium", false),
-            ("gemini-3.5-flash-lite", None, None, "minimal", false),
-            ("gemini-3.5-flash-lite", Some("low"), None, "low", false),
+            ("gemini-4-hydrogen", Some("max"), None, "HIGH", false),
+            ("gemini-4-neon", Some("low"), Some("disabled"), "LOW", false),
+            ("gemini-4-neon", Some("max"), Some("enabled"), "HIGH", true),
+            ("gemini-4-carbon", Some("xhigh"), None, "HIGH", false),
+            ("gemini-4-carbon", Some("max"), None, "HIGH", false),
+            ("gemini-4-carbon", None, None, "LOW", false),
+            ("gemini-4-carbon", None, Some("enabled"), "HIGH", true),
+            ("gemini-4-neon", None, Some("adaptive"), "HIGH", true),
+            ("gemini-4-neon", None, None, "LOW", false),
+            ("gemini-3.5-flash-lite", None, Some("enabled"), "HIGH", true),
+            ("gemini-4-carbon", Some("medium"), None, "MEDIUM", false),
+            ("gemini-3.5-flash-lite", None, None, "MINIMAL", false),
+            ("gemini-3.5-flash-lite", Some("low"), None, "LOW", false),
             (
                 "gemini-3.5-flash-lite",
                 Some("xhigh"),
                 Some("enabled"),
-                "high",
+                "HIGH",
                 true,
             ),
-            ("gemini-4-argon", Some("xhigh"), None, "high", false),
-            ("gemini-4-argon", None, None, "low", false),
+            ("gemini-4-argon", Some("xhigh"), None, "HIGH", false),
+            ("gemini-4-argon", None, None, "LOW", false),
         ];
         for (model, effort, thinking, level, emit_thinking) in tests {
             let mut body = json!({"messages":[{"role":"user","content":"hi"}]});
@@ -971,9 +920,10 @@ mod tests {
             }
             let prepared = prepared_for(model, body);
             let case = format!("{model} effort={effort:?} thinking={thinking:?}");
+            let serialized = serde_json::to_value(&prepared).expect("serializes");
             assert_eq!(
-                serde_json::to_value(&prepared).expect("serializes")["generation_config"]["thinking_level"],
-                json!(level),
+                serialized["request"]["generationConfig"]["thinkingConfig"],
+                json!({"includeThoughts":true,"thinkingLevel":level}),
                 "{case}"
             );
             assert_eq!(prepared.emit_thinking, emit_thinking, "{case}");
@@ -1000,7 +950,7 @@ mod tests {
             }
             let wire = wire(body);
             assert_eq!(
-                wire["generation_config"].get("max_output_tokens"),
+                wire["request"]["generationConfig"].get("maxOutputTokens"),
                 expected.map(|value| json!(value)).as_ref(),
                 "{case}"
             );
@@ -1068,6 +1018,6 @@ mod tests {
             assert!(message.contains(expected), "{body}: {message}");
         }
         let empty_stops = wire(json!({"stop_sequences":[],"messages":user}));
-        assert!(empty_stops.get("stop_sequences").is_none());
+        assert!(empty_stops["request"].get("stopSequences").is_none());
     }
 }

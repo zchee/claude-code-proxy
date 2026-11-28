@@ -28,7 +28,9 @@ On macOS, Codex and Cursor use Keychain services:
 - `claude-code-proxy.codex`
 - `claude-code-proxy.cursor`
 
-Kimi, Grok, Muse, and the Google AI Ultra plan use `<configuration-root>/<provider>/auth.json` on every platform; the Google AI Ultra plan's directory is `google-ai-plan`. Its file holds the access and refresh tokens, the access token's expiry, the OAuth client ID, the DPoP private key the tokens are bound to, and Google's latest DPoP nonce; the client secret is not written to it. The Muse file holds the Meta login token, the display name, the subscription state, and the tier name; the API key and e-mail address are not written to disk. Codex and Cursor use the same file layout on Linux and Windows. File-backed credentials are written with restrictive permissions where supported.
+Kimi, Grok, Muse, and the Google AI Ultra plan use `<configuration-root>/<provider>/auth.json` on every platform. The Muse file holds the Meta login token, the display name, the subscription state, and the tier name; the API key and e-mail address are not written to disk. Codex and Cursor use the same file layout on Linux and Windows. File-backed credentials are written with restrictive permissions where supported.
+
+The Google AI Ultra plan stores access and refresh tokens, access-token expiry, the OAuth client ID, and, once discovered and saved, the Cloud AI Companion project ID in `<configuration-root>/google-ai-plan/auth.json`. When saving the project ID fails, the storage error is logged and the ID is kept in memory only; a save skipped because the credential changed logs nothing. It does not store the OAuth client secret. With no proxy sign-in, the provider can read an existing Antigravity CLI sign-in from `~/.gemini/jetski-standalone-oauth-token` or, on macOS, from Keychain; a token refresh or a project ID save then writes a copy of that sign-in to the proxy's `auth.json`, which is used from then on instead of the native one. Setting `CCP_CONFIG_DIR` disables both native lookups. Proxy logout writes `<configuration-root>/google-ai-plan/logged-out` to suppress native fallback; proxy login tries to remove the marker and still succeeds when it cannot, in which case native fallback stays off. Neither command modifies Antigravity's files or Keychain entry. See [Signing in again](/providers/google-ai-plan/#signing-in-again) for older proxy credentials.
 
 When `CCP_CONFIG_DIR` is set, file-backed provider credentials use
 `<CCP_CONFIG_DIR>/<provider>/auth.json`, including Codex and Cursor on macOS.
@@ -46,7 +48,7 @@ Default Credentials from `GOOGLE_APPLICATION_CREDENTIALS`, from
 the metadata server, and keeps the access token in memory only. It does not
 follow `CLOUDSDK_CONFIG`.
 
-The proxy owns these credentials independently of native Codex, Grok, and Cursor Agent stores. Vertex AI is the exception: its credential belongs to gcloud, a key file, or the metadata server, not to the proxy.
+Proxy-owned credentials are separate from native provider credentials. See the exceptions above for Antigravity's native credential fallback and Vertex AI's use of Application Default Credentials.
 
 ## Kimi device ID
 

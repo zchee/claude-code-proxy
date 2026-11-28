@@ -1,8 +1,12 @@
-//! Error responses of the Google AI Ultra plan endpoint
-//! (`interactions:createPerUserQuota`), turned into Anthropic errors.
+//! Error responses of the Google AI Ultra plan Cloud Code endpoints
+//! (`v1internal:streamGenerateContent`, `v1internal:loadCodeAssist` and
+//! `v1internal:onboardUser`), turned into Anthropic errors.
 //!
-//! The message is always Google's own text, plus a hint where that text does
-//! not say what to do (sign in again, upgrade, switch model). Only 429s need
+//! The message is Google's own text, or a status-only fallback text when the
+//! body carries none (the client passes an empty body when it was too long,
+//! broke off or came too late), plus a hint where that text does not say
+//! what to do (sign in again, upgrade, switch model). An error inside a
+//! started stream is worded by the stream translator instead. Only 429s need
 //! a retry decision: a per-minute limit is retried, while a daily limit or a
 //! model the plan does not include is final. Claude Code retries a 429 on
 //! its own, so a final one is answered with `x-should-retry: false`.
@@ -92,6 +96,9 @@ struct ErrorBody {
     /// The `QuotaFailure` violation of a per-day quota: `Some(None)` when it
     /// has no readable limit.
     per_day_quota: Option<Option<f64>>,
+    /// `retryDelay` of a `google.rpc.RetryInfo` detail, in whole seconds,
+    /// used as the retry hint when the `Retry-After` header is absent.
+    retry_delay_secs: Option<u64>,
 }
 
 /// Which kind of 429 a response is.
@@ -108,6 +115,30 @@ pub fn classify_error(
     headers: &HeaderMap,
     body: &str,
     model_id: &str,
+) -> ClassifiedError {
+    classify(status, headers, body, model_id, false)
+}
+
+/// Classifies a non-2xx answer from the project-discovery endpoints
+/// (`loadCodeAssist` / `onboardUser`). A generic permission failure there
+/// says nothing about the account's plan, so it keeps the upstream message
+/// without the "upgrade your plan" advice that a generation 403 carries; the
+/// specific scope and client reasons still apply.
+pub fn classify_discovery_error(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &str,
+    model_id: &str,
+) -> ClassifiedError {
+    classify(status, headers, body, model_id, true)
+}
+
+fn classify(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &str,
+    model_id: &str,
+    discovery: bool,
 ) -> ClassifiedError {
     let error = parse_error_body(body);
     let upstream = status.as_u16();
@@ -126,13 +157,18 @@ pub fn classify_error(
 
     if upstream == 429 {
         let (hint, retry_after, should_retry) = match classify_rate_limit(&error) {
-            RateLimit::PerMinute => (None, retry_after_secs(headers), true),
+            RateLimit::PerMinute => (
+                None,
+                retry_after_secs(headers)
+                    .or_else(|| error.retry_delay_secs.map(|secs| secs.to_string())),
+                true,
+            ),
             RateLimit::NotOnPlan => (Some(not_on_plan(model_id)), None, false),
             RateLimit::Daily { reset_in_message } => {
                 let reset = if reset_in_message {
                     String::new()
                 } else {
-                    format_reset(headers)
+                    format_reset(headers, error.retry_delay_secs)
                 };
                 let hint = format!(
                     "Daily limit reached for {model_id}{reset}: switch to another model or provider."
@@ -158,7 +194,7 @@ pub fn classify_error(
     ClassifiedError {
         status: answer,
         kind,
-        message: message(hint_for(upstream, &error, model_id)),
+        message: message(hint_for(upstream, &error, model_id, discovery)),
         retry_after: None,
         should_retry: true,
     }
@@ -182,7 +218,7 @@ fn classify_rate_limit(error: &ErrorBody) -> RateLimit {
     }
 }
 
-fn hint_for(status: u16, error: &ErrorBody, model_id: &str) -> Option<String> {
+fn hint_for(status: u16, error: &ErrorBody, model_id: &str, discovery: bool) -> Option<String> {
     if status == 400 && NOT_FOR_PER_USER_QUOTA.is_match(&error.message) {
         return Some(not_on_plan(model_id));
     }
@@ -204,7 +240,9 @@ fn hint_for(status: u16, error: &ErrorBody, model_id: &str) -> Option<String> {
     {
         return Some(CLIENT_NOT_ALLOWED.to_string());
     }
-    if status == 402 || status == 403 {
+    // A discovery 403 reports a plain permission failure; only a generation
+    // 402/403 tells the user their plan is the problem.
+    if !discovery && (status == 402 || status == 403) {
         return Some(format!(
             "Your Google account does not have an eligible Google AI Ultra plan. Upgrade at {PLANS_URL}, or switch to another model or provider."
         ));
@@ -222,13 +260,19 @@ fn retry_after_secs(headers: &HeaderMap) -> Option<String> {
     value.parse::<u64>().ok().map(|secs| secs.to_string())
 }
 
-/// `" (resets in 5h 18m)"` from `Retry-After` seconds, or `""` when absent.
-fn format_reset(headers: &HeaderMap) -> String {
+/// `" (resets in 5h 18m)"` from `Retry-After` seconds, falling back to the
+/// `google.rpc.RetryInfo.retryDelay` seconds, or `""` when neither is present.
+fn format_reset(headers: &HeaderMap, retry_delay_secs: Option<u64>) -> String {
     let seconds = headers
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<f64>().ok())
-        .filter(|seconds| seconds.is_finite() && *seconds > 0.0);
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .or_else(|| {
+            retry_delay_secs
+                .filter(|secs| *secs > 0)
+                .map(|secs| secs as f64)
+        });
     let Some(seconds) = seconds else {
         return String::new();
     };
@@ -309,10 +353,17 @@ fn parse_error_body(body: &str) -> ErrorBody {
         }
         .filter(|limit| limit.is_finite())
     });
+    // `google.rpc.RetryInfo.retryDelay` is a protobuf Duration string such as
+    // `"12s"` or `"2.540s"`; the shared parser rounds it up to whole seconds.
+    let retry_delay_secs = detail_of("google.rpc.RetryInfo")
+        .and_then(|detail| detail.get("retryDelay"))
+        .and_then(Value::as_str)
+        .and_then(crate::providers::vertex::client::retry_delay_secs);
     ErrorBody {
         message: message.to_string(),
         reason,
         per_day_quota,
+        retry_delay_secs,
     }
 }
 
@@ -367,6 +418,24 @@ mod tests {
             body,
             MODEL,
         )
+    }
+
+    #[test]
+    fn a_discovery_403_keeps_the_permission_error_without_plan_upgrade_advice() {
+        let body = json!({"error":{
+            "code":403,
+            "message":"Permission denied on resource project."
+        }})
+        .to_string();
+        let discovery =
+            classify_discovery_error(StatusCode::FORBIDDEN, &headers(None), &body, MODEL);
+        assert_eq!(
+            discovery.message,
+            "403 Permission denied on resource project."
+        );
+        assert_eq!(discovery.kind, ProviderErrorKind::Permission);
+        // The same body on the generation path still points at the plan.
+        assert!(classify(403, &body, None).message.contains(PLANS_URL));
     }
 
     #[test]
@@ -449,6 +518,34 @@ mod tests {
             None
         );
         assert_eq!(classify(429, &body, None).retry_after, None);
+    }
+
+    #[test]
+    fn a_per_minute_429_falls_back_to_the_retry_info_delay_without_a_header() {
+        let retry_info = |delay: &str| {
+            json!({"error":{
+                "message":"Too many requests.",
+                "details":[{
+                    "@type":"type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay":delay
+                }]
+            }})
+            .to_string()
+        };
+        assert_eq!(
+            classify(429, &retry_info("12s"), None).retry_after,
+            Some("12".to_string())
+        );
+        // A fractional delay rounds up to whole seconds.
+        assert_eq!(
+            classify(429, &retry_info("2.540s"), None).retry_after,
+            Some("3".to_string())
+        );
+        // A present Retry-After header is used ahead of the RetryInfo delay.
+        assert_eq!(
+            classify(429, &retry_info("12s"), Some("7")).retry_after,
+            Some("7".to_string())
+        );
     }
 
     #[test]

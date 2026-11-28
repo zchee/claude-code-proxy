@@ -2191,7 +2191,7 @@ fn store_plan_sign_in(home: &TempDir) -> std::path::PathBuf {
         "refresh": "synthetic-plan-refresh-token",
         "expires_at_ms": expires_at_ms,
         "client_id": PLAN_CLIENT_ID,
-        "dpop_key": "synthetic-unused-dpop-key",
+        "project_id": "synthetic-plan-project",
     });
     std::fs::write(&path, auth.to_string()).unwrap();
     path
@@ -2249,6 +2249,58 @@ fn google_ai_plan_auth_status_without_a_sign_in_exits_one() -> Result<(), Box<dy
     Ok(())
 }
 
+/// `CCP_CONFIG_DIR` selects an isolated profile, so a native Antigravity
+/// sign-in under `$HOME` must not be picked up. The `$HOME` here is a temporary
+/// directory holding a valid synthetic native token: should the isolation
+/// regress, the lookup finds that token and stops there, before it reaches
+/// the macOS Keychain.
+#[test]
+fn google_ai_plan_isolated_profile_ignores_a_native_sign_in_under_home()
+-> Result<(), Box<dyn std::error::Error>> {
+    const NATIVE_ACCESS: &str = "ya29.synthetic-native-access-token-9d2b";
+    const NATIVE_REFRESH: &str = "1//synthetic-native-refresh-token-6c1e";
+    let home = TempDir::new()?;
+    let native_dir = home.path().join(".gemini");
+    std::fs::create_dir_all(&native_dir)?;
+    let native_path = native_dir.join("jetski-standalone-oauth-token");
+    let native = serde_json::json!({
+        "access_token": NATIVE_ACCESS,
+        "token_type": "Bearer",
+        "refresh_token": NATIVE_REFRESH,
+        "expiry": "2099-01-01T00:00:00Z",
+    })
+    .to_string();
+    std::fs::write(&native_path, &native)?;
+    let profile = home.path().join("config");
+    std::fs::create_dir_all(&profile)?;
+
+    let output = plan_command(&home, &["google-ai-plan", "auth", "status"])
+        .env("CCP_CONFIG_DIR", &profile)
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(output.status.code(), Some(1), "{stdout}{stderr}");
+    assert!(stdout.contains("Not authenticated"), "{stdout}{stderr}");
+    for synthetic in [NATIVE_ACCESS, NATIVE_REFRESH] {
+        assert!(
+            !stdout.contains(synthetic) && !stderr.contains(synthetic),
+            "{synthetic} printed: {stdout}{stderr}"
+        );
+    }
+    let stored = profile.join("google-ai-plan").join("auth.json");
+    assert!(
+        !stored.exists(),
+        "a credential was written to {}",
+        stored.display()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&native_path)?,
+        native,
+        "the native token file was modified"
+    );
+    Ok(())
+}
+
 #[test]
 fn google_ai_plan_auth_status_reports_the_sign_in_without_secrets()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -2279,6 +2331,51 @@ fn google_ai_plan_auth_status_reports_the_sign_in_without_secrets()
     let output = plan_command(&home, &["google-ai-plan", "auth", "logout"]).output()?;
     assert!(output.status.success());
     assert!(!path.exists(), "logout removes the credential");
+    Ok(())
+}
+
+#[test]
+fn google_ai_plan_auth_logout_on_a_fresh_profile_leaves_the_marker()
+-> Result<(), Box<dyn std::error::Error>> {
+    let home = TempDir::new()?;
+    let provider_dir = home.path().join("config").join("google-ai-plan");
+    assert!(!provider_dir.exists(), "the profile starts empty");
+
+    let output = plan_command(&home, &["google-ai-plan", "auth", "logout"]).output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(output.status.success(), "{stdout}{stderr}");
+    assert!(
+        provider_dir.join("logged-out").is_file(),
+        "logout writes the marker into a new provider directory: {stdout}{stderr}"
+    );
+
+    let output = plan_command(&home, &["google-ai-plan", "auth", "status"]).output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("Not authenticated"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn google_ai_plan_auth_logout_fails_when_the_marker_cannot_be_written()
+-> Result<(), Box<dyn std::error::Error>> {
+    let home = TempDir::new()?;
+    // A directory where the marker file belongs.
+    let marker = home
+        .path()
+        .join("config")
+        .join("google-ai-plan")
+        .join("logged-out");
+    std::fs::create_dir_all(marker.join("blocker"))?;
+
+    let output = plan_command(&home, &["google-ai-plan", "auth", "logout"]).output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    println!("stdout: {stdout}\nstderr: {stderr}");
+    assert!(!output.status.success(), "{stdout}{stderr}");
+    assert!(!stdout.contains("credentials removed"), "{stdout}");
+    assert!(stderr.contains("logout marker"), "{stderr}");
     Ok(())
 }
 
@@ -2343,19 +2440,14 @@ fn plan_upstream(bodies: Vec<String>) -> String {
             );
         }
     });
-    format!("http://{address}/v1beta")
+    format!("http://{address}")
 }
 
 #[cfg(unix)]
 fn plan_frames(events: &[serde_json::Value]) -> String {
     events
         .iter()
-        .map(|event| {
-            format!(
-                "event: {}\ndata: {event}\n\n",
-                event["event_type"].as_str().unwrap()
-            )
-        })
+        .map(|event| format!("data: {event}\n\n"))
         .collect()
 }
 
@@ -2364,13 +2456,19 @@ fn plan_frames(events: &[serde_json::Value]) -> String {
 fn google_ai_plan_server_failed_streams_are_logged_without_upstream_prose_or_the_token()
 -> Result<(), Box<dyn std::error::Error>> {
     use serde_json::json;
-    let text_step = [
-        json!({"event_type":"step.start","index":0,"step":{"type":"model_output"}}),
-        json!({"event_type":"step.delta","index":0,"delta":{"type":"text","text":"partial"}}),
-    ];
+    let text_step = [json!({
+        "response": {
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "partial"}]
+                }
+            }]
+        }
+    })];
     let early_close = plan_frames(&text_step);
     let mut with_error = text_step.to_vec();
-    with_error.push(json!({"event_type":"error","error":{
+    with_error.push(json!({"error":{
         "code":"invalid_request",
         "message":format!("synthetic upstream prose echoing {PLAN_ACCESS_TOKEN}")
     }}));
@@ -2441,7 +2539,7 @@ fn google_ai_plan_server_failed_streams_are_logged_without_upstream_prose_or_the
         assert!(!response.contains("message_stop"), "{response}");
     }
     assert!(
-        downstream[0].contains("ended before interaction.completed"),
+        downstream[0].contains("ended without a finishReason"),
         "{}",
         downstream[0]
     );

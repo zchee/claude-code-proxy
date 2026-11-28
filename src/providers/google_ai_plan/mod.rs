@@ -3,15 +3,19 @@
 //!
 //! The user signs in with Google through a `Desktop app` OAuth client that
 //! Google approved for the Ultra plan ([`auth`]). The proxy ships one, the
-//! client the pi project registered ([`auth::client`]); configuration can
-//! replace it with the user's own. Model calls go to the Interactions API
-//! (`interactions:createPerUserQuota`) with the access token as a Bearer
-//! token ([`client`], [`translate`]).
+//! client Antigravity (`agy`) uses against Cloud Code PA ([`auth::client`]);
+//! configuration can replace it with the user's own. Model calls go to Cloud Code PA's
+//! `v1internal:streamGenerateContent` with the access token as a Bearer
+//! token, for the Cloud AI Companion project that `v1internal:loadCodeAssist`
+//! (and `v1internal:onboardUser` when needed) finds for the sign-in
+//! ([`client`], [`translate`]).
 //!
 //! The upstream is always asked for a stream. A non-streaming client gets a
 //! message built by the same translator, so both modes decide content, stop
-//! reason and errors the same way. A stream that closes before
-//! `interaction.completed` is an error and is not sent again; the client
+//! reason and errors the same way and share its frame and content limits.
+//! The buffered reply also fails when the whole upstream body exceeds 16 MiB,
+//! which a live stream of many small frames does not. A stream that closes
+//! before a `finishReason` is an error and is not sent again; the client
 //! retries by the error it gets.
 
 pub mod auth;
@@ -50,9 +54,11 @@ use crate::provider::{
 use crate::providers::codex::native::NativeResponseOutcome;
 use crate::providers::grok::translate::stream::SseDecoder;
 use crate::providers::kimi::count_tokens;
-use crate::providers::opencode::chat::{redact_every_string, sanitize_upstream_messages};
+use crate::providers::opencode::chat::redact_every_string;
 use crate::providers::vertex::sanitize::{redact_secrets, sanitize_vertex_text};
-use crate::providers::vertex::translate::stream::{Sanitizer, StreamSinks};
+use crate::providers::vertex::translate::stream::{
+    POST_TERMINAL_READ_LIMIT, Sanitizer, StreamSinks,
+};
 use crate::providers::vertex::{MAX_BUFFERED_RESPONSE_BYTES, status_for_error_type};
 use crate::registry::normalize_incoming_model;
 use crate::traffic::{StreamTrafficCapture, TrafficCapture};
@@ -60,7 +66,7 @@ use crate::traffic::{StreamTrafficCapture, TrafficCapture};
 use self::auth::manager::{GoogleAiPlanAuthError, GoogleAiPlanAuthManager};
 use self::auth::token_store::{GoogleAiPlanTokenStore, StoredAuth, file_store};
 use self::client::{InteractionsClient, SendError, byte_stream};
-use self::errors::classify_error;
+use self::errors::{classify_discovery_error, classify_error};
 use self::translate::request::prepare_request;
 use self::translate::stream::{
     LiveStreamTranslator, MAX_SSE_FRAME_BYTES, StreamError, TranslatorConfig,
@@ -125,7 +131,7 @@ impl Default for GoogleAiPlanProvider {
 
 impl<S: AuthStorage<StoredAuth> + 'static> GoogleAiPlanProvider<S> {
     /// A provider from its parts, for tests against local servers: point the
-    /// settings' base URL at a fake Interactions endpoint and build `auth`
+    /// settings' base URL at a fake Cloud Code PA endpoint and build `auth`
     /// with an in-memory store and the URL of a fake token endpoint.
     pub fn with_parts(
         settings: GoogleAiPlanSettings,
@@ -180,17 +186,34 @@ impl<S: AuthStorage<StoredAuth> + 'static> GoogleAiPlanProvider<S> {
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &model.upstream_model);
         }
-        let translated = prepare_request(body, &model).map_err(invalid_request)?;
+        let mut translated = prepare_request(body, &model).map_err(invalid_request)?;
         let ready = self.ready()?;
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
-        let token = ready.auth.get_access_token().await.map_err(auth_error)?;
+        let snapshot = ready.auth.get_auth_snapshot().await.map_err(auth_error)?;
+        let token = snapshot.access_token;
+        let project_id = ready
+            .client
+            .ensure_project(
+                &token,
+                &snapshot.credential_key,
+                snapshot.project_id.as_deref(),
+            )
+            .await
+            .map_err(|error| send_failure(error, &model.upstream_model, &token, true))?;
+        if snapshot.project_id.as_deref() != Some(project_id.as_str()) {
+            ready
+                .auth
+                .set_project_id(&snapshot.credential_key, project_id.clone())
+                .await;
+        }
+        translated.project = project_id;
         let response = ready
             .client
             .send(&translated, &token, ctx.traffic.as_deref())
             .await
-            .map_err(|error| send_failure(error, &model.upstream_model, &token))?;
+            .map_err(|error| send_failure(error, &model.upstream_model, &token, false))?;
         let config = TranslatorConfig {
             message_id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
             model: requested,
@@ -272,14 +295,18 @@ fn auth_error(error: GoogleAiPlanAuthError) -> Failure {
 /// The answer for a model call that produced no stream. A non-2xx status is
 /// decided by [`classify_error`], with the access token removed from the
 /// message again on top of the client's redaction of the body.
-fn send_failure(error: SendError, model_id: &str, token: &str) -> Failure {
+fn send_failure(error: SendError, model_id: &str, token: &str, discovery: bool) -> Failure {
     match error {
         SendError::Status {
             status,
             headers,
             body,
         } => {
-            let classified = classify_error(status, &headers, &body, model_id);
+            let classified = if discovery {
+                classify_discovery_error(status, &headers, &body, model_id)
+            } else {
+                classify_error(status, &headers, &body, model_id)
+            };
             let should_retry = classified.should_retry;
             let mut error = classified.into_provider_error();
             error.message = redact_secrets(&error.message, &[token]);
@@ -288,6 +315,12 @@ fn send_failure(error: SendError, model_id: &str, token: &str) -> Failure {
                 should_retry,
             }
         }
+        SendError::Discovery(_) => ProviderError::new(
+            StatusCode::BAD_GATEWAY,
+            ProviderErrorKind::Api,
+            error.to_string(),
+        )
+        .into(),
         SendError::HeaderTimeout(_) => ProviderError::new(
             StatusCode::GATEWAY_TIMEOUT,
             ProviderErrorKind::Api,
@@ -442,7 +475,8 @@ fn sse_response(body: Body) -> Response {
 type UpstreamBody = Pin<Box<dyn Stream<Item = Result<Bytes, ()>> + Send>>;
 
 /// The Anthropic SSE body of a started request. The upstream is read until
-/// `interaction.completed` or until it closes; a failure ends the body with
+/// the `finishReason` (and the short window after it for a usage-only chunk)
+/// or until it closes; a failure ends the body with
 /// one `error` event, recorded in `outcome`.
 fn stream_response_body(
     started: Started,
@@ -469,6 +503,7 @@ fn stream_response_body(
         },
         redact,
         received: 0,
+        read_deadline: None,
         done: false,
     };
     let stream = futures_util::stream::unfold(state, |mut state| async move {
@@ -488,6 +523,9 @@ struct PlanStream {
     redact: Sanitizer,
     /// Upstream bytes read so far.
     received: u64,
+    /// When the post-terminal read window ends, set once the finish reason
+    /// arrives so a held-open upstream still completes promptly.
+    read_deadline: Option<tokio::time::Instant>,
     done: bool,
 }
 
@@ -497,7 +535,23 @@ impl PlanStream {
             return None;
         }
         loop {
-            let chunk = match self.upstream.next().await {
+            let next = if self.translator.has_finish() {
+                let deadline = *self
+                    .read_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + POST_TERMINAL_READ_LIMIT);
+                match tokio::time::timeout_at(deadline, self.upstream.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        return match self.translator.finish_after_read_limit() {
+                            Ok(output) => self.complete(output),
+                            Err(error) => Some(self.fail(&error)),
+                        };
+                    }
+                }
+            } else {
+                self.upstream.next().await
+            };
+            let chunk = match next {
                 Some(Ok(chunk)) => chunk,
                 Some(Err(())) => return Some(self.fail(&StreamError::Transport)),
                 None => {
@@ -615,10 +669,44 @@ impl Drop for PlanStream {
     }
 }
 
+/// Keys whose string values carry free-form upstream prose: `error.message`,
+/// `candidates[].finishMessage` and `promptFeedback.blockReasonMessage`.
+const CAPTURE_PROSE_KEYS: [&str; 3] = ["message", "finishMessage", "blockReasonMessage"];
+
+/// A copy of `value` with every string under a [`CAPTURE_PROSE_KEYS`] key, at
+/// any depth, passed through `sanitize`. Any depth, because the upstream wraps
+/// `candidates` and `promptFeedback` in `response`. A non-string under such a
+/// key is searched like any other value; every other string is kept as is.
+fn sanitize_capture_prose(value: &Value, sanitize: &dyn Fn(&str) -> String) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, item)| {
+                    let item = match item {
+                        Value::String(text) if CAPTURE_PROSE_KEYS.contains(&key.as_str()) => {
+                            Value::String(sanitize(text))
+                        }
+                        _ => sanitize_capture_prose(item, sanitize),
+                    };
+                    (key.clone(), item)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| sanitize_capture_prose(item, sanitize))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// Traffic capture of one response. Upstream events are recorded decoded,
-/// with every `message` (where Google puts prose) through the sanitiser and
-/// the access token redacted from every string, key and event name; never as
-/// raw bytes.
+/// with every `message`, `finishMessage` and `blockReasonMessage` (where
+/// Google puts prose) through the sanitiser and the access token redacted
+/// from every string, key and event name; never as raw bytes.
 struct UpstreamCapture {
     decoder: SseDecoder,
     events: StreamTrafficCapture,
@@ -650,7 +738,7 @@ impl UpstreamCapture {
             }
             match serde_json::from_str::<Value>(data) {
                 Ok(value) => {
-                    let cleaned = sanitize_upstream_messages(&value, &**sanitize);
+                    let cleaned = sanitize_capture_prose(&value, &**sanitize);
                     let name = event.event.as_deref().map(|name| redact(name));
                     self.events
                         .upstream_event(name.as_deref(), &redact_every_string(&cleaned, &**redact));
@@ -688,7 +776,7 @@ impl UpstreamCapture {
 // Non-streaming
 // ---------------------------------------------------------------------------
 
-/// Reads the upstream response until `interaction.completed` and answers
+/// Reads the upstream response until the `finishReason` and answers
 /// with one Anthropic message, or with the error the stream would have
 /// ended in.
 async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
@@ -773,7 +861,22 @@ where
     let mut upstream = std::pin::pin!(upstream);
     let mut translator = LiveStreamTranslator::new(config);
     let mut read = 0usize;
-    while let Some(chunk) = upstream.next().await {
+    let mut read_deadline: Option<tokio::time::Instant> = None;
+    loop {
+        let next = if translator.has_finish() {
+            let deadline = *read_deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + POST_TERMINAL_READ_LIMIT);
+            match tokio::time::timeout_at(deadline, upstream.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    translator.finish_after_read_limit()?;
+                    return translator.response();
+                }
+            }
+        } else {
+            upstream.next().await
+        };
+        let Some(chunk) = next else { break };
         let chunk = chunk.map_err(|()| StreamError::Transport)?;
         read = read.saturating_add(chunk.len());
         if read > MAX_BUFFERED_RESPONSE_BYTES {
@@ -882,6 +985,15 @@ fn status_report<S: AuthStorage<StoredAuth>>(
             outcome: Err(GoogleAiPlanAuthError::ClientChanged.into()),
         };
     }
+    // A credential from an older DPoP-bound sign-in cannot be refreshed on the
+    // DPoP-less path, so it is reported as needing a fresh sign-in rather than
+    // shown as authenticated.
+    if !stored.dpop_key.is_empty() {
+        return StatusReport {
+            lines,
+            outcome: Err(GoogleAiPlanAuthError::SignInAgain.into()),
+        };
+    }
     let kind = if *client == GoogleAiPlanClient::built_in() {
         "built-in"
     } else {
@@ -923,7 +1035,7 @@ mod tests {
     const MODEL: &str = "google-ai-plan/gemini-4-hydrogen";
     const USER_AGENT: &str = "synthetic-agent/1.0";
 
-    /// What the fake Interactions endpoint answers.
+    /// What the fake Cloud Code PA endpoint answers.
     #[derive(Clone)]
     struct Reply {
         status: u16,
@@ -990,6 +1102,29 @@ mod tests {
                 let recorded = recorded.clone();
                 let reply = reply.clone();
                 async move {
+                    if uri.path().ends_with(":loadCodeAssist") {
+                        let mut response = Response::new(Body::from(
+                            json!({"cloudaicompanionProject": "synthetic-project"}).to_string(),
+                        ));
+                        *response.status_mut() = StatusCode::OK;
+                        response.headers_mut().insert(
+                            http::header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/json"),
+                        );
+                        return response;
+                    }
+                    if uri.path().ends_with(":onboardUser") {
+                        let mut response = Response::new(Body::from(
+                            json!({"response": {"cloudaicompanionProject": {"id": "synthetic-project"}}})
+                                .to_string(),
+                        ));
+                        *response.status_mut() = StatusCode::OK;
+                        response.headers_mut().insert(
+                            http::header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/json"),
+                        );
+                        return response;
+                    }
                     recorded.lock().unwrap().push(Seen {
                         path: uri.path().to_string(),
                         headers,
@@ -1027,7 +1162,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         FakeUpstream {
-            base_url: format!("http://{addr}/v1beta"),
+            base_url: format!("http://{addr}"),
             seen,
         }
     }
@@ -1038,8 +1173,10 @@ mod tests {
             refresh: "synthetic-refresh-token".to_string(),
             expires_at_ms,
             client_id: synthetic_client().client_id,
-            dpop_key: DpopKey::generate().unwrap().to_stored(),
+            // A Cloud Code PA sign-in carries no DPoP key.
+            dpop_key: String::new(),
             dpop_nonce: None,
+            project_id: None,
         }
     }
 
@@ -1136,36 +1273,71 @@ mod tests {
     }
 
     fn frame(data: Value) -> String {
-        let name = data["event_type"].as_str().unwrap_or("message").to_string();
-        format!("event: {name}\ndata: {data}\n\n")
+        format!("data: {data}\n\n")
     }
 
     fn frames(events: &[Value]) -> String {
         events.iter().cloned().map(frame).collect()
     }
 
-    /// Thought, text and a function call, completed with `requires_action`.
+    /// Thought, text and a function call, completed with `finishReason: "STOP"`.
     fn tool_turn_events() -> Vec<Value> {
         vec![
-            json!({"event_type":"step.start","index":0,"step":{"type":"thought"}}),
-            json!({"event_type":"step.delta","index":0,"delta":{"type":"thought_summary","content":{"type":"text","text":"Need the file."}}}),
-            json!({"event_type":"step.delta","index":0,"delta":{"type":"thought_signature","signature":"c3ludGhldGljLXNpZw"}}),
-            json!({"event_type":"step.stop","index":0}),
-            json!({"event_type":"step.start","index":1,"step":{"type":"model_output"}}),
-            json!({"event_type":"step.delta","index":1,"delta":{"type":"text","text":"Reading it."}}),
-            json!({"event_type":"step.stop","index":1}),
-            json!({"event_type":"step.start","index":2,"step":{"type":"function_call","id":"call_1","name":"read_file","arguments":{}}}),
-            json!({"event_type":"step.delta","index":2,"delta":{"type":"arguments_delta","arguments":"{\"path\":\"a.py\"}"}}),
-            json!({"event_type":"step.stop","index":2}),
-            json!({"event_type":"interaction.completed","interaction":{
-                "status":"requires_action",
-                "usage":{"total_tokens":184,"total_input_tokens":114,"total_cached_tokens":10,"total_output_tokens":26,"total_thought_tokens":44}
-            }}),
+            json!({
+                "response": {
+                    "candidates": [{
+                        "content": {
+                            "role": "model",
+                            "parts": [{"thought": true, "text": "Need the file."}]
+                        }
+                    }]
+                },
+                "traceId": "trace-1"
+            }),
+            json!({
+                "response": {
+                    "candidates": [{
+                        "content": {
+                            "role": "model",
+                            "parts": [
+                                {"thought": true, "thoughtSignature": "c3ludGhldGljLXNpZw"},
+                                {"text": "Reading it."}
+                            ]
+                        }
+                    }]
+                },
+                "traceId": "trace-1"
+            }),
+            json!({
+                "response": {
+                    "candidates": [{
+                        "content": {
+                            "role": "model",
+                            "parts": [{
+                                "functionCall": {
+                                    "id": "call_1",
+                                    "name": "read_file",
+                                    "args": {"path": "a.py"}
+                                }
+                            }]
+                        },
+                        "finishReason": "STOP"
+                    }],
+                    "usageMetadata": {
+                        "promptTokenCount": 114,
+                        "cachedContentTokenCount": 10,
+                        "candidatesTokenCount": 26,
+                        "thoughtsTokenCount": 44,
+                        "totalTokenCount": 184
+                    }
+                },
+                "traceId": "trace-1"
+            }),
         ]
     }
 
     fn tool_turn() -> String {
-        frames(&tool_turn_events()) + "event: done\ndata: [DONE]\n\n"
+        frames(&tool_turn_events()) + "data: [DONE]\n\n"
     }
 
     fn events(body: &str) -> Vec<(String, Value)> {
@@ -1193,14 +1365,15 @@ mod tests {
     fn assert_upstream_request(seen: &[Seen], token: &str) {
         assert_eq!(seen.len(), 1, "one upstream call: {seen:?}");
         let seen = &seen[0];
-        assert_eq!(seen.path, "/v1beta/interactions:createPerUserQuota");
+        assert_eq!(seen.path, "/v1internal:streamGenerateContent");
         assert_eq!(header(seen, "authorization"), format!("Bearer {token}"));
         assert_eq!(header(seen, "accept"), "text/event-stream");
         assert_eq!(header(seen, "content-type"), "application/json");
         assert_eq!(header(seen, "user-agent"), USER_AGENT);
+        assert_eq!(seen.body["project"], "synthetic-project", "{}", seen.body);
         assert_eq!(seen.body["model"], "gemini-4-hydrogen", "{}", seen.body);
-        assert_eq!(seen.body["stream"], true, "{}", seen.body);
-        assert_eq!(seen.body["store"], false, "{}", seen.body);
+        assert_eq!(seen.body["userAgent"], "antigravity", "{}", seen.body);
+        assert_eq!(seen.body["requestType"], "agent", "{}", seen.body);
     }
 
     #[tokio::test]
@@ -1297,7 +1470,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_reports_progress_and_usage_to_the_monitor() {
-        // The upstream stays open after `interaction.completed`: the
+        // The upstream stays open after the `finishReason`: the
         // response must end on its own.
         let mut reply = Reply::sse(frames(&tool_turn_events()));
         reply.hold_open = true;
@@ -1361,6 +1534,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_legacy_dpop_sign_in_is_a_401_asking_to_sign_in_again() {
+        // A credential from an older DPoP-bound sign-in cannot be refreshed on
+        // the DPoP-less path, so the proxy asks for a fresh sign-in without
+        // calling the token endpoint or the upstream.
+        let upstream = fake_upstream(Reply::sse(tool_turn())).await;
+        let legacy = StoredAuth {
+            dpop_key: DpopKey::generate().unwrap().to_stored(),
+            ..fresh()
+        };
+        let app = app(provider(&upstream.base_url, Some(legacy)));
+        let (status, _, body) = post(&app, "/v1/messages", request(false)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        let error: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(error["error"]["type"], "authentication_error", "{body}");
+        assert!(body.contains(auth::LOGIN_COMMAND), "{body}");
+        assert!(
+            upstream.seen().is_empty(),
+            "a legacy credential never reaches the upstream"
+        );
+    }
+
+    #[tokio::test]
     async fn an_expired_access_token_is_refreshed_before_the_model_call() {
         let upstream = fake_upstream(Reply::sse(tool_turn())).await;
         let token_endpoint = fake_token_endpoint(vec![FakeReply::ok(
@@ -1378,8 +1573,8 @@ mod tests {
         assert_eq!(refreshes.len(), 1, "one refresh");
         assert_eq!(refreshes[0].form["grant_type"], "refresh_token");
         assert!(
-            refreshes[0].dpop.is_some(),
-            "the refresh carries a DPoP proof"
+            refreshes[0].dpop.is_none(),
+            "the refresh sends no DPoP header"
         );
         assert_upstream_request(&upstream.seen(), "ya29.synthetic-refreshed-token-0f9e8d");
     }
@@ -1552,16 +1747,13 @@ mod tests {
             errors[0].1["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("ended before interaction.completed"),
+                .contains("ended without a finishReason"),
             "{body}"
         );
 
         let (status, _, body) = post(&app, "/v1/messages", request(false)).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-        assert!(
-            body.contains("ended before interaction.completed"),
-            "{body}"
-        );
+        assert!(body.contains("ended without a finishReason"), "{body}");
         assert_eq!(upstream.seen().len(), 2, "not sent again");
     }
 
@@ -1624,16 +1816,29 @@ mod tests {
     async fn the_access_token_stays_out_of_every_capture_file_and_error() {
         let echo = format!("echo {TOKEN} and {}", TOKEN.replace('.', "%2E"));
         let in_stream_error = frames(&[
-            json!({"event_type":"step.start","index":0,"step":{"type":"model_output"}}),
-            json!({"event_type":"step.delta","index":0,"delta":{"type":"text","text":"partial"}}),
-            json!({"event_type":"error","error":{"code":"invalid_request","message":echo}}),
+            json!({
+                "response": {
+                    "candidates": [{
+                        "content": {
+                            "role": "model",
+                            "parts": [{"text": "partial"}]
+                        }
+                    }]
+                }
+            }),
+            json!({"error":{"code":"invalid_request","message":echo}}),
         ]);
-        let completed_with_echo = frames(&[
-            json!({"event_type":"step.start","index":0,"step":{"type":"model_output"}}),
-            json!({"event_type":"step.delta","index":0,"delta":{"type":"text","text":echo}}),
-            json!({"event_type":"step.stop","index":0}),
-            json!({"event_type":"interaction.completed","interaction":{"status":"completed"}}),
-        ]);
+        let completed_with_echo = frames(&[json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": echo}]
+                    },
+                    "finishReason": "STOP"
+                }]
+            }
+        })]);
         let replies = [
             (
                 "error body",
@@ -1846,5 +2051,147 @@ mod tests {
         for secret in ["synthetic-other-secret", TOKEN, "synthetic-refresh-token"] {
             assert!(!error.contains(secret), "{error}");
         }
+    }
+
+    #[test]
+    fn status_reports_a_legacy_dpop_sign_in_as_needing_a_fresh_login() {
+        let store = GoogleAiPlanTokenStore::new(InMemoryAuthStore::new());
+        let legacy = StoredAuth {
+            dpop_key: DpopKey::generate().unwrap().to_stored(),
+            ..signed_in(TOKEN, 90_000)
+        };
+        store.save_auth(legacy).unwrap();
+        let report = status_report(&synthetic_client(), &store, 0);
+        let error = report
+            .outcome
+            .expect_err("a legacy credential is not authenticated")
+            .to_string();
+        assert!(error.contains(auth::LOGIN_COMMAND), "{error}");
+        assert_eq!(
+            report.lines,
+            [format!("Auth path: {}", store.auth_path())],
+            "a legacy credential is not shown as authenticated"
+        );
+    }
+
+    /// Marks a string as passed through the sanitiser, so the expected
+    /// value shows exactly which strings were cleaned.
+    fn marked(text: &str) -> String {
+        format!("<clean:{text}>")
+    }
+
+    #[test]
+    fn capture_sanitises_every_prose_field_and_keeps_the_rest() {
+        let cases = [
+            (
+                "finishMessage in each wrapped candidate",
+                json!({"response": {"candidates": [
+                    {
+                        "content": {"role": "model", "parts": [{"text": "kept text"}]},
+                        "finishReason": "SAFETY",
+                        "finishMessage": "first prose"
+                    },
+                    {"finishReason": "RECITATION", "finishMessage": "second prose"}
+                ]}}),
+                json!({"response": {"candidates": [
+                    {
+                        "content": {"role": "model", "parts": [{"text": "kept text"}]},
+                        "finishReason": "SAFETY",
+                        "finishMessage": "<clean:first prose>"
+                    },
+                    {"finishReason": "RECITATION", "finishMessage": "<clean:second prose>"}
+                ]}}),
+            ),
+            (
+                "blockReasonMessage in wrapped promptFeedback",
+                json!({"response": {"promptFeedback": {
+                    "blockReason": "SAFETY",
+                    "blockReasonMessage": "block prose"
+                }}}),
+                json!({"response": {"promptFeedback": {
+                    "blockReason": "SAFETY",
+                    "blockReasonMessage": "<clean:block prose>"
+                }}}),
+            ),
+            (
+                "unwrapped top-level fields",
+                json!({
+                    "candidates": [{"finishReason": "OTHER", "finishMessage": "top prose"}],
+                    "promptFeedback": {"blockReason": "OTHER", "blockReasonMessage": "top block"}
+                }),
+                json!({
+                    "candidates": [{"finishReason": "OTHER", "finishMessage": "<clean:top prose>"}],
+                    "promptFeedback": {
+                        "blockReason": "OTHER",
+                        "blockReasonMessage": "<clean:top block>"
+                    }
+                }),
+            ),
+            (
+                "error message still sanitised",
+                json!({"error": {
+                    "code": 400,
+                    "status": "INVALID_ARGUMENT",
+                    "message": "err prose"
+                }}),
+                json!({"error": {
+                    "code": 400,
+                    "status": "INVALID_ARGUMENT",
+                    "message": "<clean:err prose>"
+                }}),
+            ),
+            (
+                "non-string under a prose key is searched, not dropped",
+                json!({
+                    "finishMessage": {"detail": "inner", "message": "nested prose"},
+                    "message": [1, null]
+                }),
+                json!({
+                    "finishMessage": {"detail": "inner", "message": "<clean:nested prose>"},
+                    "message": [1, null]
+                }),
+            ),
+            (
+                "non-object values pass through",
+                json!(["plain", 3, true, null]),
+                json!(["plain", 3, true, null]),
+            ),
+        ];
+        for (name, input, expected) in cases {
+            let cleaned = sanitize_capture_prose(&input, &|text: &str| marked(text));
+            assert_eq!(cleaned, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn capture_prose_fields_lose_the_access_token() {
+        let echo = format!("echo {TOKEN}");
+        let event = json!({"response": {
+            "candidates": [{"finishReason": "SAFETY", "finishMessage": echo}],
+            "promptFeedback": {"blockReason": "SAFETY", "blockReasonMessage": echo}
+        }});
+        let sanitize = sanitizer(TOKEN);
+        let cleaned = sanitize_capture_prose(&event, &*sanitize);
+        let response = &cleaned["response"];
+        for (field, text) in [
+            ("finishMessage", &response["candidates"][0]["finishMessage"]),
+            (
+                "blockReasonMessage",
+                &response["promptFeedback"]["blockReasonMessage"],
+            ),
+        ] {
+            let text = text
+                .as_str()
+                .unwrap_or_else(|| panic!("{field}: not a string: {cleaned}"));
+            assert!(!text.contains(TOKEN), "{field} kept the token: {text}");
+        }
+        assert_eq!(
+            response["candidates"][0]["finishReason"], "SAFETY",
+            "{cleaned}"
+        );
+        assert_eq!(
+            response["promptFeedback"]["blockReason"], "SAFETY",
+            "{cleaned}"
+        );
     }
 }

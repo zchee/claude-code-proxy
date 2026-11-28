@@ -7,13 +7,19 @@ description: Release notes for claude-code-proxy.
 
 - Google AI Ultra subscribers can use Gemini on their plan's quota as
   `google-ai-plan/gemini-4-hydrogen`, `google-ai-plan/gemini-4-neon`,
-  `google-ai-plan/gemini-4-carbon`, and `google-ai-plan/gemini-3.5-flash-lite`
-  after `claude-code-proxy google-ai-plan auth login`, with tools, image input,
-  and thinking levels up to `xhigh`. The sign-in uses the OAuth client the pi
-  project registered with Google, which Google or pi can restrict at any time;
-  `googleAiPlan.clientId` and `googleAiPlan.clientSecret` replace it with your
-  own. On `/v1/messages`, a daily limit or a model outside the plan is
-  answered with `x-should-retry: false`, so Claude Code does not retry it.
+  `google-ai-plan/gemini-4-carbon`, and `google-ai-plan/gemini-3.5-flash-lite`.
+  Cloud Code PA supports tools and image input; `xhigh` and `max` both send
+  `HIGH`. Sign in with `claude-code-proxy google-ai-plan auth login` or reuse
+  an existing Antigravity CLI sign-in in the default profile. Older DPoP
+  credentials require a fresh login. Proxy logout leaves the native sign-in
+  untouched and disables fallback; the next proxy login enables it again when
+  it can remove the logout marker. The proxy caches project discovery per
+  credential, reads trailing usage after `finishReason` for up to 2 seconds
+  once it starts waiting, and uses a usable `RetryInfo` delay (rounded up to
+  whole seconds, at most one day) for the `Retry-After` of a per-minute 429
+  that has no whole-second `Retry-After` header. Daily-limit 429s and 429s
+  for models outside the plan carry `x-should-retry: false` on
+  `/v1/messages`. Google can restrict the built-in OAuth client at any time.
   See the
   [Google AI Ultra plan provider page](https://claude-code-proxy.raine.dev/providers/google-ai-plan/).
 - When Vertex AI closes a streaming Gemini response before any

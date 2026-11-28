@@ -2218,9 +2218,12 @@ fn lmstudio_origin(value: &str) -> Result<String, &'static str> {
 // Google AI Ultra plan config
 // ---------------------------------------------------------------------------
 
-/// The Gemini API base URL the Google AI Ultra plan models are called at.
-pub const GOOGLE_AI_PLAN_DEFAULT_BASE_URL: &str =
-    "https://generativelanguage.googleapis.com/v1beta";
+/// The primary Cloud Code PA base URL the Google AI Ultra plan models are called at.
+pub const GOOGLE_AI_PLAN_DEFAULT_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
+
+/// The fallback Cloud Code PA base URL used when the primary daily endpoint is
+/// unreachable or returns a 5xx status.
+pub const GOOGLE_AI_PLAN_FALLBACK_BASE_URL: &str = "https://cloudcode-pa.googleapis.com";
 
 /// A Google `Desktop app` OAuth client for the Google AI Ultra plan: the
 /// built-in one, or one the user registered and configured.
@@ -2256,7 +2259,18 @@ pub struct GoogleAiPlanSettings {
 
 /// The `User-Agent` model calls send when none is configured.
 pub fn google_ai_plan_default_user_agent() -> String {
-    format!("claude-code-proxy/{}", env!("CARGO_PKG_VERSION"))
+    let goos = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let goarch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    };
+    format!(
+        "antigravity/1.104.0 (aidev_client; os_type={goos}; arch={goarch}; cl=1031513713; auth_method=consumer)"
+    )
 }
 
 impl GoogleAiPlanClient {
@@ -4641,9 +4655,24 @@ mod tests {
         };
         let empty = tempfile::TempDir::new().unwrap();
         let settings = resolve_google_ai_plan_settings(&lmstudio_env(&[]), empty.path()).unwrap();
-        println!("default client id: {}", settings.client.client_id);
-        assert_eq!(settings.client.client_id, built_in_client_id());
-        assert_eq!(settings.client.client_secret, built_in_client_secret());
+        assert_eq!(
+            settings.base_url,
+            "https://daily-cloudcode-pa.googleapis.com"
+        );
+        assert_eq!(
+            GOOGLE_AI_PLAN_FALLBACK_BASE_URL,
+            "https://cloudcode-pa.googleapis.com"
+        );
+        // `assert!` rather than `assert_eq!`: a failure must not print the
+        // built-in client values.
+        assert!(
+            settings.client.client_id == built_in_client_id(),
+            "the default client id is not the built-in one"
+        );
+        assert!(
+            settings.client.client_secret == built_in_client_secret(),
+            "the default client secret is not the built-in one"
+        );
         assert!(!built_in_client_id().is_empty() && !built_in_client_secret().is_empty());
     }
 
@@ -4657,7 +4686,8 @@ mod tests {
         )
         .unwrap();
         let default = google_ai_plan_default_user_agent();
-        assert!(default.starts_with("claude-code-proxy/"), "{default}");
+        assert!(default.starts_with("antigravity/"), "{default}");
+        assert!(default.contains("aidev_client;"), "{default}");
         // (name, env, config directory, expected User-Agent)
         type Case<'a> = (
             &'a str,

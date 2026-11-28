@@ -1,5 +1,5 @@
 //! The browser sign-in: Google OAuth with a loopback redirect, PKCE (S256),
-//! `state`, an OIDC `nonce` and a DPoP-bound code exchange.
+//! `state`, and an OIDC `nonce`, checked when Google returns an ID token.
 
 use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal, Read, Write};
@@ -11,19 +11,24 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use url::Url;
 
-use super::dpop::{DpopKey, ProofClaims, code_exchange_jti};
 use super::token_store::{GoogleAiPlanTokenStore, StoredAuth};
 use super::{AUTHORIZE_URL, QUOTA_SCOPE, SCOPES, TOKEN_URL, TokenReply, access_expiry_ms, now_ms};
 use crate::auth::AuthStorage;
 use crate::config::GoogleAiPlanClient;
 use crate::providers::grok::auth::pkce::{PkceCodes, generate_pkce, generate_state};
+use crate::providers::vertex::sanitize::redact_secrets;
 
-const CALLBACK_PATH: &str = "/oauth2callback";
+const CALLBACK_PATH: &str = "/auth/callback";
+const LEGACY_CALLBACK_PATH: &str = "/oauth2callback";
 /// Long enough to finish a plan upgrade checkout in the browser.
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// How far the ID token's `exp` may lie in the past, for clock skew.
 const ID_TOKEN_EXPIRY_LEEWAY_MS: u64 = 60_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// The whole page for a callback with this sign-in's `state` that did not
+/// sign in.
+const CALLBACK_FAILED_PAGE: &str =
+    "Sign-in did not complete. Return to the terminal for the reason.";
 
 /// Signs in with Google in the browser and stores the credential.
 ///
@@ -68,7 +73,6 @@ struct SignInSession<'a> {
     pkce: PkceCodes,
     state: String,
     nonce: String,
-    key: DpopKey,
 }
 
 impl<'a> SignInSession<'a> {
@@ -87,7 +91,6 @@ impl<'a> SignInSession<'a> {
             pkce: generate_pkce(),
             state: generate_state(),
             nonce: generate_state(),
-            key: DpopKey::generate()?,
         })
     }
 
@@ -98,6 +101,8 @@ impl<'a> SignInSession<'a> {
             .append_pair("redirect_uri", &self.redirect_uri)
             .append_pair("response_type", "code")
             .append_pair("scope", SCOPES)
+            .append_pair("access_type", "offline")
+            .append_pair("prompt", "consent")
             .append_pair("code_challenge", &self.pkce.challenge)
             .append_pair("code_challenge_method", "S256")
             .append_pair("state", &self.state)
@@ -163,7 +168,7 @@ impl<'a> SignInSession<'a> {
                 .flatten()
         })?;
         let url = Url::parse(&format!("http://127.0.0.1{target}")).ok()?;
-        if url.path() != CALLBACK_PATH {
+        if !matches!(url.path(), CALLBACK_PATH | LEGACY_CALLBACK_PATH) {
             respond(&mut stream, "404 Not Found", "Not found");
             return None;
         }
@@ -177,7 +182,9 @@ impl<'a> SignInSession<'a> {
             return None;
         }
         // Finishing before answering lets the page show a failed exchange or
-        // check instead of "Signed in".
+        // check instead of "Signed in". The page never carries the error:
+        // its text comes from Google's reply and the redirect, and any other
+        // page in the browser could read it. The terminal prints it.
         let result = self.complete(&params);
         match &result {
             Ok(_) => respond(
@@ -186,11 +193,7 @@ impl<'a> SignInSession<'a> {
                 "Signed in to the Google AI Ultra plan. You can close this tab and return to the \
                  terminal.",
             ),
-            Err(error) => respond(
-                &mut stream,
-                "400 Bad Request",
-                &format!("Sign-in did not complete: {error}\n\nReturn to the terminal."),
-            ),
+            Err(_) => respond(&mut stream, "400 Bad Request", CALLBACK_FAILED_PAGE),
         }
         Some(result)
     }
@@ -238,14 +241,6 @@ impl<'a> SignInSession<'a> {
     /// builds the credential.
     fn finish(&self, code: &str) -> anyhow::Result<StoredAuth> {
         println!("Finishing sign-in...");
-        let proof = self.key.proof(
-            &self.token_url,
-            &ProofClaims {
-                jti: code_exchange_jti(code),
-                nonce: None,
-                iat: None,
-            },
-        )?;
         let form = super::token_form(
             self.client,
             &[
@@ -259,21 +254,36 @@ impl<'a> SignInSession<'a> {
             .http
             .post(&self.token_url)
             .header(http::header::ACCEPT, "application/json")
-            .header("DPoP", proof)
             .form(&form)
             .send()?;
         let status = response.status().as_u16();
-        let headers = response.headers().clone();
         let text = response.text()?;
-        // The exchange also returns a `DPoP-Nonce`, but refreshes use a
-        // separate nonce, so it is not kept.
-        let reply = TokenReply::from_parts(status, &headers, &text);
+        // Google's text may quote the request. The code, the PKCE verifier
+        // and the client secret must not reach the terminal, so they are
+        // removed from an error body before `from_parts` cuts it to a length,
+        // and again from the parsed fields, which also covers a JSON-escaped
+        // quote and a success reply without the tokens. A success body is
+        // left whole: it carries the tokens to store.
+        let secrets = [
+            code,
+            self.pkce.verifier.as_str(),
+            self.client.client_secret.as_str(),
+        ];
+        let text = if (200..300).contains(&status) {
+            text
+        } else {
+            redact_secrets(&text, &secrets)
+        };
+        let mut reply = TokenReply::from_parts(status, &text);
         let non_empty = |value: &Option<String>| value.clone().filter(|value| !value.is_empty());
         let (200, Some(access), Some(refresh)) = (
             reply.status,
             non_empty(&reply.body.access_token),
             non_empty(&reply.body.refresh_token),
         ) else {
+            for field in [&mut reply.body.error, &mut reply.body.error_description] {
+                *field = field.as_deref().map(|text| redact_secrets(text, &secrets));
+            }
             anyhow::bail!(reply.describe("Google sign-in failed"));
         };
         if !reply
@@ -288,19 +298,22 @@ impl<'a> SignInSession<'a> {
                 "Google did not grant access to the Google AI Ultra plan. Try signing in again."
             );
         }
-        check_id_token(
-            reply.body.id_token.as_deref(),
-            &self.nonce,
-            &self.client.client_id,
-            now_ms(),
-        )?;
+        if let Some(id_token) = non_empty(&reply.body.id_token) {
+            check_id_token(
+                Some(&id_token),
+                &self.nonce,
+                &self.client.client_id,
+                now_ms(),
+            )?;
+        }
         Ok(StoredAuth {
             access,
             refresh,
             expires_at_ms: access_expiry_ms(&reply.body),
             client_id: self.client.client_id.clone(),
-            dpop_key: self.key.to_stored(),
+            dpop_key: String::new(),
             dpop_nonce: None,
+            project_id: None,
         })
     }
 }
@@ -427,6 +440,8 @@ mod tests {
     use super::*;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(20);
+    /// Shaped like a Google authorization code: `4/` and a long body.
+    const SYNTHETIC_CODE: &str = "4/0ASynthetic0Authorization0Code0Body0xYz9_Kq-Lm3";
 
     fn b64_json(value: &serde_json::Value) -> String {
         URL_SAFE_NO_PAD.encode(value.to_string())
@@ -517,6 +532,19 @@ mod tests {
         );
     }
 
+    /// Asserts that `page` is the answer to a callback with this sign-in's
+    /// `state` that did not sign in: the fixed page and nothing else.
+    fn assert_failed_page(name: &str, page: &str) {
+        assert!(
+            page.starts_with("HTTP/1.1 400 Bad Request"),
+            "{name}: {page}"
+        );
+        assert!(
+            page.ends_with(&format!("\r\n\r\n{CALLBACK_FAILED_PAGE}")),
+            "{name}: {page}"
+        );
+    }
+
     fn assert_no_token_request(endpoint: &FakeTokenEndpoint, name: &str) {
         let seen = endpoint.seen();
         assert!(
@@ -541,14 +569,12 @@ mod tests {
             ("client_id", "synthetic-client".to_string()),
             (
                 "redirect_uri",
-                format!("http://127.0.0.1:{port}/oauth2callback"),
+                format!("http://127.0.0.1:{port}/auth/callback"),
             ),
             ("response_type", "code".to_string()),
-            (
-                "scope",
-                "openid email profile https://www.googleapis.com/auth/generative-language.peruserquota"
-                    .to_string(),
-            ),
+            ("scope", SCOPES.to_string()),
+            ("access_type", "offline".to_string()),
+            ("prompt", "consent".to_string()),
             (
                 "code_challenge",
                 URL_SAFE_NO_PAD.encode(Sha256::digest(session.pkce.verifier.as_bytes())),
@@ -598,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn pasted_url_with_the_state_exchanges_the_decoded_code_with_a_code_bound_proof() {
+    fn pasted_url_with_the_state_exchanges_the_decoded_code_without_dpop() {
         let endpoint = fake_token_endpoint(vec![FakeReply::error("invalid_grant", &[])]);
         let client = synthetic_client();
         let session = SignInSession::start(&client, &endpoint.url).unwrap();
@@ -617,8 +643,6 @@ mod tests {
         assert_eq!(seen.len(), 1);
         let request = &seen[0];
         println!("form: {:?}", request.form);
-        println!("proof header: {}", request.proof_header());
-        println!("proof claims: {}", request.proof_claims());
         let expected_form: HashMap<String, String> = [
             ("grant_type", "authorization_code"),
             ("code", "4/0Aabc"),
@@ -632,15 +656,7 @@ mod tests {
         .collect();
         assert_eq!(request.form, expected_form);
         assert_eq!(request.accept.as_deref(), Some("application/json"));
-        let claims = request.proof_claims();
-        // base64url(SHA-256("4/0Aabc")), computed outside this code.
-        assert_eq!(claims["jti"], "M0wg5hNYWyb1souX0gifr6laC81x-17RZLCgty8r5Ww");
-        assert_eq!(claims["htm"], "POST");
-        assert_eq!(claims["htu"], endpoint.url.as_str());
-        assert!(claims.get("nonce").is_none(), "{claims}");
-        let jwk = session.key.public_jwk();
-        assert_eq!(request.proof_header()["jwk"]["x"], jwk.x);
-        assert_eq!(request.proof_header()["jwk"]["y"], jwk.y);
+        assert_eq!(request.dpop, None);
     }
 
     #[test]
@@ -691,7 +707,7 @@ mod tests {
         drop(sender);
         let browser = browser_get(
             &session,
-            format!("/oauth2callback?state={}&code=4%2F0Aabc", session.state),
+            format!("/auth/callback?state={}&code=4%2F0Aabc", session.state),
         );
         let auth = session.wait(&lines, TEST_TIMEOUT).unwrap();
         let page = browser.join().unwrap();
@@ -706,11 +722,12 @@ mod tests {
         assert_eq!(auth.access, "synthetic-access");
         assert_eq!(auth.refresh, "synthetic-refresh");
         assert_eq!(auth.client_id, "synthetic-client");
+        assert!(auth.dpop_key.is_empty());
         assert_eq!(auth.dpop_nonce, None);
+        assert_eq!(auth.project_id, None);
         assert!(auth.expires_at_ms > now_ms() + 3_500_000);
-        let stored_key = DpopKey::from_stored(&auth.dpop_key).unwrap();
-        assert_eq!(stored_key.public_jwk(), session.key.public_jwk());
         assert_eq!(endpoint.seen()[0].form["code"], "4/0Aabc");
+        assert_eq!(endpoint.seen()[0].dpop, None);
     }
 
     #[test]
@@ -730,11 +747,168 @@ mod tests {
             error.to_string(),
             "Google sign-in failed: 400 invalid_grant"
         );
-        assert!(page.starts_with("HTTP/1.1 400"), "{page}");
-        assert!(
-            page.contains("Sign-in did not complete: Google sign-in failed: 400 invalid_grant"),
-            "{page}"
+        assert_failed_page("failed exchange", &page);
+    }
+
+    #[test]
+    fn callback_failure_page_never_carries_the_error_or_the_redirect_text() {
+        let code = SYNTHETIC_CODE;
+        let client = synthetic_client();
+        let mut session = SignInSession::start(&client, TOKEN_URL).unwrap();
+        let verifier = session.pkce.verifier.clone();
+        let echo = format!("code={code} code_verifier={verifier} client_secret=synthetic-secret");
+        let endpoint = fake_token_endpoint(vec![FakeReply {
+            status: 400,
+            headers: Vec::new(),
+            body: serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": format!("Bad request: {echo}"),
+            })
+            .to_string(),
+        }]);
+        session.token_url = endpoint.url.clone();
+        let (_sender, lines) = pasted(&[]);
+        let browser = browser_get_all(
+            &session,
+            vec![
+                // Google's redirect error, with prose that must stay off the
+                // page.
+                format!(
+                    "/auth/callback?state={}&error=synthetic_error&error_description=synthetic-prose",
+                    session.state
+                ),
+            ],
         );
+        let error = session.wait(&lines, TEST_TIMEOUT).unwrap_err();
+        let [error_page]: [String; 1] = browser.join().unwrap().try_into().unwrap();
+        println!("wait: {error}\nerror page: {error_page}");
+        assert_eq!(error.to_string(), "Google sign-in failed: synthetic_error");
+        assert_failed_page("redirect error", &error_page);
+        for leaked in ["synthetic_error", "synthetic-prose"] {
+            assert!(!error_page.contains(leaked), "{leaked} in {error_page}");
+        }
+
+        // A failed exchange whose reply quotes the request.
+        let browser = browser_get(
+            &session,
+            format!(
+                "/auth/callback?state={}&code=4%2F0ASynthetic",
+                session.state
+            ),
+        );
+        let error = session.wait(&lines, TEST_TIMEOUT).unwrap_err();
+        let exchange_page = browser.join().unwrap();
+        println!("wait: {error}\nexchange page: {exchange_page}");
+        assert!(
+            error
+                .to_string()
+                .starts_with("Google sign-in failed: 400 invalid_grant"),
+            "{error}"
+        );
+        assert_failed_page("failed exchange quoting the request", &exchange_page);
+        for leaked in [
+            "invalid_grant",
+            "Bad request",
+            "4/0ASynthetic",
+            verifier.as_str(),
+            "synthetic-secret",
+        ] {
+            assert!(
+                !exchange_page.contains(leaked),
+                "{leaked} in {exchange_page}"
+            );
+        }
+    }
+
+    #[test]
+    fn exchange_errors_never_carry_the_code_the_verifier_or_the_client_secret() {
+        let code = SYNTHETIC_CODE;
+        let client = synthetic_client();
+        let mut session = SignInSession::start(&client, TOKEN_URL).unwrap();
+        let verifier = session.pkce.verifier.clone();
+        let secret = client.client_secret.clone();
+        let echo = format!("code={code} code_verifier={verifier} client_secret={secret}");
+        let form_echo = format!(
+            "code={} code_verifier={verifier} client_secret={secret}",
+            code.replace('/', "%2F")
+        );
+        // The verifier starts 7 characters before the 512-character cut of
+        // an unparsed body, so only redaction before the cut leaves none of
+        // it: `<html>` (6) + 485 + `code_verifier=` (14) is 505.
+        let long_html = format!(
+            "<html>{}code_verifier={verifier} client_secret={secret} code={code}</html>",
+            "x".repeat(485)
+        );
+        let reply = |status: u16, body: String| FakeReply {
+            status,
+            headers: Vec::new(),
+            body,
+        };
+        // (name, reply, text the error keeps)
+        let tests = [
+            (
+                "JSON error quoting all three",
+                reply(
+                    400,
+                    serde_json::json!({
+                        "error": format!("invalid_request {code}"),
+                        "error_description": format!("Bad request: {echo}"),
+                    })
+                    .to_string(),
+                ),
+                "Google sign-in failed: 400 invalid_request",
+            ),
+            (
+                "JSON error quoting the code with escaped slashes",
+                reply(
+                    400,
+                    format!(
+                        r#"{{"error":"invalid_grant","error_description":"Bad code: {}"}}"#,
+                        code.replace('/', r"\/")
+                    ),
+                ),
+                "Google sign-in failed: 400 invalid_grant Bad code: [redacted]",
+            ),
+            (
+                "text error quoting the form",
+                reply(400, form_echo),
+                "Google sign-in failed: 400 HTTP 400 code=[redacted]",
+            ),
+            (
+                "page quoting all three across the cut",
+                reply(502, long_html),
+                "code_verifier=[redact",
+            ),
+            (
+                "success without a refresh token quoting all three",
+                reply(
+                    200,
+                    serde_json::json!({
+                        "access_token": "synthetic-access",
+                        "error_description": format!("Partial grant: {echo}"),
+                    })
+                    .to_string(),
+                ),
+                "Google sign-in failed: 200 Partial grant: code=[redacted]",
+            ),
+        ];
+        for (name, reply, kept) in tests {
+            let endpoint = fake_token_endpoint(vec![reply]);
+            session.token_url = endpoint.url.clone();
+            let error = session.finish(code).unwrap_err();
+            let printed = format!("{error} / {error:?}");
+            println!("{name}: {printed}");
+            assert!(printed.contains(kept), "{name}: {printed}");
+            for leaked in [
+                code,
+                "4%2F0ASynthetic",
+                verifier.as_str(),
+                secret.as_str(),
+                "synthetic-access",
+            ] {
+                assert!(!printed.contains(leaked), "{name}: {leaked} in {printed}");
+            }
+        }
     }
 
     #[test]
@@ -765,12 +939,7 @@ mod tests {
         for ((name, _), page) in turned_away.iter().zip(&pages) {
             assert_turned_away(name, page);
         }
-        let denial_page = &pages[turned_away.len()];
-        assert!(denial_page.starts_with("HTTP/1.1 400"), "{denial_page}");
-        assert!(
-            denial_page.contains("Sign-in did not complete: Sign-in was canceled"),
-            "{denial_page}"
-        );
+        assert_failed_page("denial with the state", &pages[turned_away.len()]);
         assert_no_token_request(&endpoint, "callback rejections");
     }
 
@@ -900,11 +1069,11 @@ mod tests {
                 "did not grant access to the Google AI Ultra plan",
             ),
             (
-                "no ID token",
+                "invalid ID token",
                 with(&|body| {
-                    body.as_object_mut().unwrap().remove("id_token");
+                    body["id_token"] = "not-a-valid-jwt".into();
                 }),
-                "Google sign-in returned no ID token",
+                "Google sign-in returned an ID token that failed validation",
             ),
         ];
         for (name, body, expected) in cases {
@@ -915,6 +1084,15 @@ mod tests {
             assert!(error.to_string().contains(expected), "{name}: {error}");
             assert!(!error.to_string().contains("synthetic-access"), "{name}");
         }
+
+        // Absence of an ID token succeeds (agy's oauth2 exchange does not require id_token).
+        let without_id_token = with(&|body| {
+            body.as_object_mut().unwrap().remove("id_token");
+        });
+        let endpoint = fake_token_endpoint(vec![FakeReply::ok(without_id_token)]);
+        session.token_url = endpoint.url.clone();
+        let auth = session.finish("c").unwrap();
+        assert_eq!(auth.access, "synthetic-access");
     }
 
     #[test]
