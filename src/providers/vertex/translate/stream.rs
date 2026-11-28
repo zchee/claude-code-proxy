@@ -11,7 +11,7 @@
 //! | order | condition | result |
 //! |---|---|---|
 //! | 1 | a chunk with an `error` key, `promptFeedback.blockReason`, or a `finishReason` other than `STOP` / `MAX_TOKENS` (unknown values included) | error, even when tool calls were already sent |
-//! | 2 | the stream ends without a `finishReason` | error |
+//! | 2 | the stream ends without a `finishReason` | streaming: the request is sent again when the client has no text and no tool call from it and fewer than [`MAX_INCOMPLETE_RETRIES`] retries were made, error otherwise; non-streaming: error |
 //! | 3 | `MAX_TOKENS` | `max_tokens`; tool calls sent so far are complete, because each `functionCall` arrives whole in one part |
 //! | 4 | `STOP` after at least one `functionCall` | `tool_use` |
 //! | 5 | `STOP` without a `functionCall` | `end_turn` |
@@ -20,6 +20,18 @@
 //! usage-only chunk is accepted. The response is final when the upstream
 //! closes, or [`POST_TERMINAL_READ_LIMIT`] after the `finishReason` if it
 //! does not.
+//!
+//! Vertex AI sometimes closes a 200 stream cleanly before any
+//! `finishReason`. Claude Code does not retry an `api_error` event, which
+//! has no HTTP status, so the turn would end there. The streaming response
+//! sends the request again instead ([`stream_body_resending`]), as long as
+//! what the client has is only thought summaries (they are never sent back
+//! to the model, so a second attempt's thoughts can follow the first's).
+//! Text cannot be taken back and a tool call may already be running, so
+//! after either the stream still ends in the error. The non-streaming
+//! response is not sent again: its error has a status, 502, which the
+//! client can retry by, and a second retry loop here would multiply the
+//! billed requests.
 
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -28,6 +40,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -35,6 +48,7 @@ use serde_json::{Map, Value, json};
 use super::thought_signature::encode_envelope;
 use crate::anthropic::sse::{encode_sse_event, parse_sse_events};
 use crate::monitor::{MonitorHandle, usage_from_anthropic_sse};
+use crate::provider::ProviderError;
 use crate::providers::codex::native::NativeResponseOutcome;
 use crate::providers::grok::translate::stream::SseDecoder;
 use crate::providers::opencode::chat::redact_every_string;
@@ -49,6 +63,15 @@ pub const MAX_SSE_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// usage-only chunk; an upstream that neither sends it nor closes must not
 /// hold the response open.
 pub const POST_TERMINAL_READ_LIMIT: Duration = Duration::from_secs(2);
+
+/// How many times a request is sent again after the upstream closed its
+/// stream without a `finishReason`. Every attempt is billed for the whole
+/// prompt, so the count is small.
+pub const MAX_INCOMPLETE_RETRIES: u32 = 2;
+
+/// The wait before the first retry of an incomplete stream. Each later
+/// retry waits twice as long as the one before it.
+pub const INCOMPLETE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Most response content one translator accepts, counted in bytes: text,
 /// forwarded thinking text, every signature envelope (the empty one too),
@@ -239,13 +262,10 @@ impl StreamError {
     }
 }
 
-/// The Anthropic `error` SSE event for `error`, with upstream prose passed
-/// through `sanitize`.
-pub fn error_event(error: &StreamError, sanitize: &dyn Fn(&str) -> String) -> Vec<u8> {
-    let data = json!({
-        "type":"error",
-        "error":{"type":error.error_type(),"message":error.message_with(sanitize)},
-    });
+/// The Anthropic `error` SSE event. `message` is what the client reads and
+/// must already be sanitised.
+fn encode_error_event(error_type: &str, message: &str) -> Vec<u8> {
+    let data = json!({"type":"error","error":{"type":error_type,"message":message}});
     encode_sse_event(Some("error"), &data.to_string())
 }
 
@@ -273,6 +293,12 @@ impl Received {
         fields.insert("usage".into(), json!(self.usage));
         fields.insert("pendingFrameBytes".into(), json!(self.pending_frame_bytes));
     }
+}
+
+/// The wait before retry number `retry` (counted from zero) of an
+/// incomplete stream.
+pub fn incomplete_retry_delay(retry: u32) -> Duration {
+    INCOMPLETE_RETRY_DELAY.saturating_mul(2_u32.saturating_pow(retry))
 }
 
 #[derive(Debug, Deserialize)]
@@ -446,6 +472,9 @@ struct TranslationState {
     block_count: usize,
     open: Option<Open>,
     tool_count: usize,
+    /// Whether answer text was produced: once it was, the response cannot
+    /// be replaced by a second attempt.
+    text_emitted: bool,
     /// Thought-summary parts with text in the current attempt, forwarded or
     /// not.
     thought_parts: u64,
@@ -467,6 +496,7 @@ impl TranslationState {
             block_count: 0,
             open: None,
             tool_count: 0,
+            text_emitted: false,
             thought_parts: 0,
             text_parts: 0,
             finish: None,
@@ -577,6 +607,7 @@ impl TranslationState {
             Ok(())
         } else {
             self.text_parts = self.text_parts.saturating_add(1);
+            self.text_emitted = true;
             self.text_delta(&text, out)
         }
     }
@@ -1069,6 +1100,35 @@ impl LiveStreamTranslator {
         self.state.finished
     }
 
+    /// Whether the request may be sent again now that the upstream closed:
+    /// no `finishReason` arrived, and no answer text and no tool call was
+    /// produced from the response. Thought summaries may have been.
+    pub fn can_resend(&self) -> bool {
+        let state = &self.state;
+        !state.finished && state.finish.is_none() && !state.text_emitted && state.tool_count == 0
+    }
+
+    /// Prepares for the response to the same request sent again, and
+    /// returns the Anthropic SSE bytes that takes. A thinking block the
+    /// abandoned attempt left open is closed with the envelope that marks
+    /// it as unsigned, so the next attempt's thoughts start a block of
+    /// their own. That attempt's unfinished frame, usage and part counts
+    /// are forgotten; the message and its block indexes continue.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError::Malformed`] when closing the block passes
+    /// [`MAX_CONTENT_BYTES`].
+    pub fn restart(&mut self) -> Result<Vec<u8>, StreamError> {
+        let mut out = Vec::new();
+        self.state.close_open(&mut out)?;
+        self.state.usage = None;
+        self.state.thought_parts = 0;
+        self.state.text_parts = 0;
+        self.decoder = SseDecoder::with_max_frame_bytes(MAX_SSE_FRAME_BYTES);
+        Ok(out)
+    }
+
     /// What the current attempt has received.
     pub fn received(&self) -> Received {
         Received {
@@ -1137,25 +1197,52 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: Send + 'static,
 {
-    body_of(upstream, config, sinks, None)
+    body_of(upstream, config, sinks, None, None)
 }
 
-/// [`stream_body`] whose traffic capture also applies `redact` to every
-/// string of every upstream and downstream event it records, object keys
-/// and the upstream SSE event name included, after [`sanitize_capture`].
-/// `redact` is meant to replace the request's
-/// secrets and leave the rest of the text whole.
-pub fn stream_body_redacted<S, E>(
+/// An upstream response body as it arrives.
+pub type UpstreamBody<E> = Pin<Box<dyn Stream<Item = Result<Bytes, E>> + Send>>;
+
+/// The response to a request that was sent again.
+pub struct Resent<E> {
+    /// The new response body.
+    pub upstream: UpstreamBody<E>,
+    /// The sanitiser for upstream prose of this response. The request may
+    /// have carried a different access token from the first one.
+    pub sanitize: Sanitizer,
+    /// The capture redactor for this response.
+    pub redact: Sanitizer,
+}
+
+/// Sends the request of a stream again and returns its response. The error
+/// is what the client is told when that fails; its message has already been
+/// sanitised.
+pub type Resend<E> =
+    Box<dyn FnMut() -> BoxFuture<'static, Result<Resent<E>, ProviderError>> + Send>;
+
+/// [`stream_body`] that sends the request again with `resend` when the
+/// upstream closes without a `finishReason` and the client has no text and
+/// no tool call from the response, at most [`MAX_INCOMPLETE_RETRIES`]
+/// times, waiting [`incomplete_retry_delay`] before each. The next
+/// response continues the same Anthropic message.
+///
+/// Its traffic capture also applies `redact` to every string of every
+/// upstream and downstream event it records, object keys and the upstream
+/// SSE event name included, after [`sanitize_capture`]. `redact` is meant
+/// to replace the request's secrets and leave the rest of the text whole;
+/// a response to the request sent again brings its own ([`Resent`]).
+pub fn stream_body_resending<S, E>(
     upstream: S,
     config: TranslatorConfig,
     sinks: StreamSinks,
     redact: Sanitizer,
+    resend: Resend<E>,
 ) -> Body
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: Send + 'static,
 {
-    body_of(upstream, config, sinks, Some(redact))
+    body_of(upstream, config, sinks, Some(redact), Some(resend))
 }
 
 fn body_of<S, E>(
@@ -1163,6 +1250,7 @@ fn body_of<S, E>(
     config: TranslatorConfig,
     sinks: StreamSinks,
     redact: Option<Sanitizer>,
+    resend: Option<Resend<E>>,
 ) -> Body
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -1173,6 +1261,8 @@ where
         translator: LiveStreamTranslator::streaming(config),
         capture_decoder: SseDecoder::with_max_frame_bytes(MAX_SSE_FRAME_BYTES),
         read_deadline: None,
+        resend,
+        retries: 0,
         done: false,
         bytes: 0,
         chunks: 0,
@@ -1192,13 +1282,15 @@ where
     Body::from_stream(stream)
 }
 
-type UpstreamStream<E> = Pin<Box<dyn Stream<Item = Result<Bytes, E>> + Send>>;
-
 struct VertexStreamState<E> {
-    upstream: UpstreamStream<E>,
+    upstream: UpstreamBody<E>,
     translator: LiveStreamTranslator,
     capture_decoder: SseDecoder,
     read_deadline: Option<tokio::time::Instant>,
+    /// Sends the request again, when the caller supplied a way to.
+    resend: Option<Resend<E>>,
+    /// How many times the request has been sent again.
+    retries: u32,
     done: bool,
     bytes: u64,
     chunks: u64,
@@ -1231,10 +1323,19 @@ impl<E> VertexStreamState<E> {
             let chunk = match next {
                 Some(Ok(chunk)) => chunk,
                 Some(Err(_)) => return Some(self.fail(&StreamError::Transport)),
-                None => {
-                    let result = self.translator.finish();
-                    return self.complete(result);
-                }
+                None => match self.resend_incomplete().await {
+                    Some(Ok(output)) if output.is_empty() => continue,
+                    Some(Ok(output)) => {
+                        self.report_progress(&output);
+                        self.capture_downstream(&output);
+                        return Some(output);
+                    }
+                    Some(Err(output)) => return Some(output),
+                    None => {
+                        let result = self.translator.finish();
+                        return self.complete(result);
+                    }
+                },
             };
             if self.bytes == 0
                 && let Some(monitor) = self.sinks.monitor.as_ref()
@@ -1271,33 +1372,110 @@ impl<E> VertexStreamState<E> {
         }
     }
 
-    fn fail(&mut self, error: &StreamError) -> Vec<u8> {
-        self.done = true;
-        self.log_failure(error);
-        let sanitize = self.sinks.sanitize.clone();
-        if let Some(outcome) = self.sinks.outcome.as_ref() {
-            outcome.fail(error.message_with(&*sanitize));
+    /// Sends the request again after the upstream closed, when the stream
+    /// is one that may be retried ([`LiveStreamTranslator::can_resend`])
+    /// and retries are left. `None` when it is not, and the caller ends the
+    /// response as before. `Ok` holds the bytes that continue the message
+    /// (possibly none) once the new response is in place; `Err` holds the
+    /// error event of a retry that failed.
+    async fn resend_incomplete(&mut self) -> Option<Result<Vec<u8>, Vec<u8>>> {
+        if self.resend.is_none()
+            || self.retries >= MAX_INCOMPLETE_RETRIES
+            || !self.translator.can_resend()
+        {
+            return None;
         }
-        let output = error_event(error, &*sanitize);
+        let delay = incomplete_retry_delay(self.retries);
+        self.log_retry(delay);
+        tokio::time::sleep(delay).await;
+        self.retries += 1;
+        let sending = self.resend.as_mut().map(|resend| resend())?;
+        let resent = match sending.await {
+            Ok(resent) => resent,
+            Err(error) => return Some(Err(self.fail_resend(&error))),
+        };
+        self.upstream = resent.upstream;
+        self.sinks.sanitize = resent.sanitize;
+        self.redact = Some(resent.redact);
+        self.capture_decoder = SseDecoder::with_max_frame_bytes(MAX_SSE_FRAME_BYTES);
+        Some(self.translator.restart().map_err(|error| self.fail(&error)))
+    }
+
+    fn fail(&mut self, error: &StreamError) -> Vec<u8> {
+        let message = error.message_with(&*self.sinks.sanitize.clone());
+        self.fail_with(
+            error.error_type(),
+            message,
+            error.kind(),
+            &error.to_string(),
+        )
+    }
+
+    /// Ends the response because sending the request again failed. The
+    /// client is told why the retry failed, with that failure's error type.
+    fn fail_resend(&mut self, error: &ProviderError) -> Vec<u8> {
+        let message = format!(
+            "{}; sending the request again failed: {}",
+            StreamError::Incomplete,
+            error.message
+        );
+        let summary = format!(
+            "the retry failed with {} (HTTP {})",
+            error.error_type(),
+            error.status.as_u16()
+        );
+        self.fail_with(error.error_type(), message, "retry_failed", &summary)
+    }
+
+    /// Ends the response with one `error` event. `message` is what the
+    /// client reads and must already be sanitised; `summary` goes to the log
+    /// and must hold no upstream prose.
+    fn fail_with(
+        &mut self,
+        error_type: &str,
+        message: String,
+        kind: &'static str,
+        summary: &str,
+    ) -> Vec<u8> {
+        self.done = true;
+        self.log_failure(kind, summary);
+        let output = encode_error_event(error_type, &message);
+        if let Some(outcome) = self.sinks.outcome.as_ref() {
+            outcome.fail(message);
+        }
         if let Some(capture) = self.stream_capture.as_mut() {
-            capture.malformed("translation", error.kind());
+            capture.malformed("translation", kind);
         }
         self.capture_downstream(&output);
         self.finish_capture(false);
         output
     }
 
-    /// Records a failed stream in the proxy log. The server logs a
-    /// streaming request as completed once the response headers are sent,
-    /// so without this line a failure inside the stream leaves no trace.
-    /// The line holds no upstream prose: [`StreamError`]'s `Display` is
-    /// proxy-authored words and enum tokens.
-    fn log_failure(&self, error: &StreamError) {
+    /// Records in the proxy log that the request is sent again, after
+    /// `delay`, because the current attempt closed without a `finishReason`.
+    fn log_retry(&self, delay: Duration) {
         let mut fields = Map::new();
         fields.insert("reqId".into(), json!(self.sinks.req_id));
         fields.insert("model".into(), json!(self.translator.model()));
-        fields.insert("kind".into(), json!(error.kind()));
-        fields.insert("error".into(), json!(error.to_string()));
+        fields.insert("failedAttempt".into(), json!(self.retries + 1));
+        fields.insert("maxAttempts".into(), json!(MAX_INCOMPLETE_RETRIES + 1));
+        fields.insert("delayMs".into(), json!(delay.as_millis()));
+        fields.insert("bytes".into(), json!(self.bytes));
+        fields.insert("chunks".into(), json!(self.chunks));
+        self.translator.received().log_fields(&mut fields);
+        crate::logging::create_logger("vertex").warn("vertex_stream_retry", Some(fields));
+    }
+
+    /// Records a failed stream in the proxy log. The server logs a
+    /// streaming request as completed once the response headers are sent,
+    /// so without this line a failure inside the stream leaves no trace.
+    fn log_failure(&self, kind: &'static str, summary: &str) {
+        let mut fields = Map::new();
+        fields.insert("reqId".into(), json!(self.sinks.req_id));
+        fields.insert("model".into(), json!(self.translator.model()));
+        fields.insert("kind".into(), json!(kind));
+        fields.insert("error".into(), json!(summary));
+        fields.insert("attempt".into(), json!(self.retries + 1));
         fields.insert("bytes".into(), json!(self.bytes));
         fields.insert("chunks".into(), json!(self.chunks));
         self.translator.received().log_fields(&mut fields);
@@ -1378,6 +1556,7 @@ impl<E> VertexStreamState<E> {
                     "kind":if completed { "stream_completion" } else { "stream_error" },
                     "bytes":self.bytes,
                     "chunks":self.chunks,
+                    "attempts":self.retries + 1,
                 }),
                 SUMMARY_NAME,
             );
@@ -1400,6 +1579,7 @@ impl<E> Drop for VertexStreamState<E> {
                     "reason":"downstream_body_dropped",
                     "bytes":self.bytes,
                     "chunks":self.chunks,
+                    "attempts":self.retries + 1,
                 }),
                 SUMMARY_NAME,
             );
@@ -2582,5 +2762,498 @@ mod tests {
             }
         );
         assert_eq!(translator.model(), format!("vertex/{MODEL}"));
+    }
+
+    type Attempt = Vec<Result<Bytes, std::io::Error>>;
+
+    /// The body of one upstream response: `chunks` as SSE frames, then a
+    /// clean close.
+    fn attempt(chunks: &[String]) -> Attempt {
+        chunks
+            .iter()
+            .map(|chunk| Ok(Bytes::from(frame(chunk))))
+            .collect()
+    }
+
+    /// A [`Resend`] that answers with `responses` in order and counts how
+    /// often the request was sent again. Its sanitiser and its redactor
+    /// clean `TOKEN2`, which those of the first response leave alone.
+    fn resend_with(
+        responses: Vec<Result<Attempt, ProviderError>>,
+        calls: &Arc<std::sync::atomic::AtomicU32>,
+    ) -> Resend<std::io::Error> {
+        let calls = calls.clone();
+        let mut responses = responses.into_iter();
+        Box::new(move || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let next = responses
+                .next()
+                .expect("the request was sent again more often than the test allows");
+            Box::pin(async move {
+                next.map(|chunks| Resent {
+                    upstream: Box::pin(futures_util::stream::iter(chunks)),
+                    sanitize: Arc::new(|text: &str| text.replace("TOKEN2", "[redacted]")),
+                    redact: Arc::new(|text: &str| text.replace("TOKEN2", "[redacted]")),
+                })
+            })
+        })
+    }
+
+    fn sent_again(calls: &Arc<std::sync::atomic::AtomicU32>) -> u32 {
+        calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn resending_body(first: Attempt, emit_thinking: bool, resend: Resend<std::io::Error>) -> Body {
+        let outcome = NativeResponseOutcome::default();
+        resending_body_with(first, emit_thinking, resend, &outcome)
+    }
+
+    fn resending_body_with(
+        first: Attempt,
+        emit_thinking: bool,
+        resend: Resend<std::io::Error>,
+        outcome: &NativeResponseOutcome,
+    ) -> Body {
+        stream_body_resending(
+            futures_util::stream::iter(first),
+            config(emit_thinking),
+            sinks(outcome),
+            Arc::new(|text: &str| text.to_string()),
+            resend,
+        )
+    }
+
+    fn events_of(text: &str) -> Vec<(String, Value)> {
+        parse_sse_events(text.as_bytes())
+            .into_iter()
+            .map(|event| {
+                (
+                    event.event.unwrap_or_default(),
+                    serde_json::from_str(&event.data).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn count_events(events: &[(String, Value)], name: &str) -> usize {
+        events.iter().filter(|(event, _)| event == name).count()
+    }
+
+    fn last_error(events: &[(String, Value)]) -> &Value {
+        let (name, data) = events.last().expect("the body has events");
+        assert_eq!(name, "error", "{events:?}");
+        &data["error"]
+    }
+
+    #[test]
+    fn a_stream_may_be_sent_again_until_text_or_a_tool_call_was_produced() {
+        let tests = [
+            ("nothing received", vec![], true),
+            ("thoughts only", vec![thought_chunk("plan")], true),
+            (
+                "usage only",
+                vec![json!({"usageMetadata":{"promptTokenCount":9}}).to_string()],
+                true,
+            ),
+            ("answer text", vec![text_chunk("hi")], false),
+            (
+                "thoughts, then answer text",
+                vec![thought_chunk("plan"), text_chunk("hi")],
+                false,
+            ),
+            ("a tool call", vec![call_chunk("Read", Some(SIG_A))], false),
+            (
+                "a finishReason",
+                vec![thought_chunk("plan"), finish_chunk("STOP")],
+                false,
+            ),
+        ];
+        for (name, chunks, expected) in tests {
+            for emit_thinking in [false, true] {
+                let mut translator = LiveStreamTranslator::streaming(config(emit_thinking));
+                let chunks: Vec<&str> = chunks.iter().map(String::as_str).collect();
+                translator.push(frames(&chunks).as_bytes()).unwrap();
+                assert_eq!(
+                    translator.can_resend(),
+                    expected,
+                    "{name}, emit_thinking {emit_thinking}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restart_closes_the_open_thinking_block_and_forgets_the_abandoned_attempt() {
+        let mut translator = LiveStreamTranslator::streaming(config(true));
+        let usage = json!({"usageMetadata":{"promptTokenCount":900,"candidatesTokenCount":800}})
+            .to_string();
+        let mut input = frames(&[&thought_chunk("plan A"), &usage]);
+        // The upstream closed inside a frame.
+        input.push_str("data: {\"candidates\":[{\"content\"");
+        let mut out = translator.push(input.as_bytes()).unwrap();
+        assert_eq!(
+            translator.received(),
+            Received {
+                thought_parts: 1,
+                text_parts: 0,
+                tool_calls: 0,
+                usage: true,
+                pending_frame_bytes: "data: {\"candidates\":[{\"content\"".len(),
+            }
+        );
+
+        out.extend(translator.restart().unwrap());
+        assert_eq!(translator.received(), Received::default());
+        assert!(translator.can_resend());
+
+        let second = frames(&[
+            &thought_chunk("plan B"),
+            &call_chunk("Read", Some(SIG_A)),
+            &finish_chunk("STOP"),
+        ]);
+        out.extend(translator.push(second.as_bytes()).unwrap());
+        out.extend(translator.finish().unwrap());
+        let events = events_of(std::str::from_utf8(&out).unwrap());
+        assert_eq!(count_events(&events, "message_start"), 1, "{events:?}");
+        let (content, stop_reason) = rebuild(&events);
+        assert_eq!(stop_reason, "tool_use");
+        assert_eq!(content.len(), 3, "{content:?}");
+        // The abandoned attempt's thoughts keep their own block, marked as
+        // unsigned; the signature belongs to the attempt that produced it.
+        assert_eq!(content[0]["thinking"], "plan A");
+        assert_eq!(
+            content[0]["signature"],
+            format!("{ENVELOPE_PREFIX}{MODEL}:")
+        );
+        assert_eq!(content[1]["thinking"], "plan B");
+        assert_eq!(
+            signature_for_model(content[1]["signature"].as_str().unwrap(), MODEL),
+            Some(SIG_A)
+        );
+        assert_eq!(content[2]["type"], "tool_use");
+        // Usage is the completed attempt's, not the abandoned one's.
+        let (_, delta) = events
+            .iter()
+            .find(|(name, _)| name == "message_delta")
+            .unwrap();
+        assert_eq!(delta["usage"]["input_tokens"], 70);
+        assert_eq!(delta["usage"]["output_tokens"], 25);
+    }
+
+    #[test]
+    fn the_retry_delay_doubles() {
+        assert_eq!(incomplete_retry_delay(0), INCOMPLETE_RETRY_DELAY);
+        assert_eq!(incomplete_retry_delay(1), INCOMPLETE_RETRY_DELAY * 2);
+        assert_eq!(incomplete_retry_delay(2), INCOMPLETE_RETRY_DELAY * 4);
+        // A count far past the limit saturates instead of overflowing.
+        assert_eq!(
+            incomplete_retry_delay(u32::MAX),
+            INCOMPLETE_RETRY_DELAY * u32::MAX
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_stream_closed_after_thoughts_is_sent_again_and_continues_the_message() {
+        let calls = Arc::default();
+        let resend = resend_with(
+            vec![Ok(attempt(&[
+                thought_chunk("plan B"),
+                call_chunk("Read", Some(SIG_A)),
+                finish_chunk("STOP"),
+            ]))],
+            &calls,
+        );
+        let outcome = NativeResponseOutcome::default();
+        let started = tokio::time::Instant::now();
+        let text = body_text(resending_body_with(
+            attempt(&[thought_chunk("plan A")]),
+            true,
+            resend,
+            &outcome,
+        ))
+        .await;
+        assert_eq!(started.elapsed(), INCOMPLETE_RETRY_DELAY);
+        assert_eq!(sent_again(&calls), 1);
+        assert_eq!(outcome.failure(), None);
+        let events = events_of(&text);
+        assert_eq!(count_events(&events, "message_start"), 1, "{text}");
+        assert_eq!(count_events(&events, "error"), 0, "{text}");
+        assert_eq!(count_events(&events, "message_stop"), 1, "{text}");
+        let (content, stop_reason) = rebuild(&events);
+        assert_eq!(stop_reason, "tool_use");
+        let kinds: Vec<&str> = content
+            .iter()
+            .map(|block| block["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["thinking", "thinking", "tool_use"]);
+        assert_eq!(content[0]["thinking"], "plan A");
+        assert_eq!(content[1]["thinking"], "plan B");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_stream_closed_before_anything_arrived_is_sent_again() {
+        let calls = Arc::default();
+        let resend = resend_with(
+            vec![Ok(attempt(&[text_chunk("hi"), finish_chunk("STOP")]))],
+            &calls,
+        );
+        let text = body_text(resending_body(Vec::new(), false, resend)).await;
+        assert_eq!(sent_again(&calls), 1);
+        let events = events_of(&text);
+        assert_eq!(count_events(&events, "message_start"), 1, "{text}");
+        let (content, stop_reason) = rebuild(&events);
+        assert_eq!(stop_reason, "end_turn");
+        assert_eq!(content, [json!({"type":"text","text":"hi"})]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_stream_closed_after_text_or_a_tool_call_is_not_sent_again() {
+        let tests = [
+            ("answer text", vec![thought_chunk("plan"), text_chunk("hi")]),
+            ("a tool call", vec![call_chunk("Read", Some(SIG_A))]),
+        ];
+        for (name, chunks) in tests {
+            let calls = Arc::default();
+            let outcome = NativeResponseOutcome::default();
+            let text = body_text(resending_body_with(
+                attempt(&chunks),
+                true,
+                resend_with(Vec::new(), &calls),
+                &outcome,
+            ))
+            .await;
+            assert_eq!(sent_again(&calls), 0, "{name}");
+            let events = events_of(&text);
+            let error = last_error(&events);
+            assert_eq!(error["type"], "api_error", "{name}");
+            assert_eq!(
+                error["message"], "Vertex AI stream ended without a finishReason",
+                "{name}"
+            );
+            assert_eq!(count_events(&events, "message_stop"), 0, "{name}: {text}");
+            assert_eq!(
+                outcome.failure().as_deref(),
+                Some("Vertex AI stream ended without a finishReason"),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_stream_that_stays_incomplete_ends_in_the_error_after_the_retry_limit() {
+        let calls = Arc::default();
+        let responses = (0..MAX_INCOMPLETE_RETRIES)
+            .map(|retry| Ok(attempt(&[thought_chunk(&format!("retry {retry}"))])))
+            .collect();
+        let outcome = NativeResponseOutcome::default();
+        let root = tempfile::tempdir().expect("temporary capture directory");
+        let started = tokio::time::Instant::now();
+        let text = body_text(stream_body_resending(
+            futures_util::stream::iter(attempt(&[thought_chunk("first")])),
+            config(true),
+            capturing_sinks(&outcome, root.path()),
+            Arc::new(|text: &str| text.to_string()),
+            resend_with(responses, &calls),
+        ))
+        .await;
+        let waited: Duration = (0..MAX_INCOMPLETE_RETRIES)
+            .map(incomplete_retry_delay)
+            .sum();
+        assert_eq!(started.elapsed(), waited);
+        assert_eq!(sent_again(&calls), MAX_INCOMPLETE_RETRIES);
+        let events = events_of(&text);
+        assert_eq!(count_events(&events, "message_start"), 1, "{text}");
+        assert_eq!(
+            last_error(&events)["message"],
+            "Vertex AI stream ended without a finishReason"
+        );
+        assert!(outcome.failure().is_some());
+        let completion = captured_completion(&captured_files(root.path()));
+        assert_eq!(completion["kind"], "stream_error");
+        assert_eq!(completion["attempts"], MAX_INCOMPLETE_RETRIES + 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_stream_whose_retry_fails_reports_that_failure_to_the_client() {
+        let calls = Arc::default();
+        let quota = ProviderError::new(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            crate::provider::ProviderErrorKind::RateLimit,
+            "RESOURCE_EXHAUSTED: quota (upstream HTTP 429)",
+        );
+        let outcome = NativeResponseOutcome::default();
+        let root = tempfile::tempdir().expect("temporary capture directory");
+        let text = body_text(stream_body_resending(
+            futures_util::stream::iter(attempt(&[thought_chunk("plan")])),
+            config(true),
+            capturing_sinks(&outcome, root.path()),
+            Arc::new(|text: &str| text.to_string()),
+            resend_with(vec![Err(quota)], &calls),
+        ))
+        .await;
+        assert_eq!(sent_again(&calls), 1);
+        let events = events_of(&text);
+        let error = last_error(&events);
+        let message = "Vertex AI stream ended without a finishReason; sending the request \
+                       again failed: RESOURCE_EXHAUSTED: quota (upstream HTTP 429)";
+        assert_eq!(error["type"], "rate_limit_error");
+        assert_eq!(error["message"], message);
+        assert_eq!(outcome.failure().as_deref(), Some(message));
+        assert_eq!(count_events(&events, "message_stop"), 0, "{text}");
+        // The request that failed to be sent again counts as an attempt.
+        let completion = captured_completion(&captured_files(root.path()));
+        assert_eq!(completion["kind"], "stream_error");
+        assert_eq!(completion["attempts"], 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_stream_sent_again_is_cleaned_with_the_new_responses_sanitizer() {
+        // The second request may carry a refreshed access token, which only
+        // the sanitiser built from the second response knows.
+        let calls = Arc::default();
+        let stopped =
+            json!({"candidates":[{"finishReason":"SAFETY","finishMessage":"echoed TOKEN2"}]})
+                .to_string();
+        let outcome = NativeResponseOutcome::default();
+        let text = body_text(resending_body_with(
+            attempt(&[thought_chunk("plan")]),
+            true,
+            resend_with(vec![Ok(attempt(&[stopped]))], &calls),
+            &outcome,
+        ))
+        .await;
+        let message = "Vertex AI stopped the response: finishReason SAFETY: echoed [redacted]";
+        assert!(!text.contains("TOKEN2"), "{text}");
+        assert_eq!(last_error(&events_of(&text))["message"], message);
+        assert_eq!(outcome.failure().as_deref(), Some(message));
+    }
+
+    /// [`sinks`] with a traffic capture under `root`.
+    fn capturing_sinks(outcome: &NativeResponseOutcome, root: &std::path::Path) -> StreamSinks {
+        StreamSinks {
+            traffic: Some(Arc::new(crate::traffic::test_capture(root.to_path_buf()))),
+            ..sinks(outcome)
+        }
+    }
+
+    /// Every capture file under `root`, with its text.
+    fn captured_files(root: &std::path::Path) -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("capture directory is readable") {
+                let path = entry.expect("capture entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let text = std::fs::read_to_string(&path).expect("capture file is text");
+                    files.push((path.to_string_lossy().into_owned(), text));
+                }
+            }
+        }
+        files
+    }
+
+    /// The `completion` object of the capture summary under `root`.
+    fn captured_completion(files: &[(String, String)]) -> Value {
+        let (_, text) = files
+            .iter()
+            .find(|(path, _)| path.ends_with(&format!("{SUMMARY_NAME}.json")))
+            .expect("the capture has a summary");
+        serde_json::from_str::<Value>(text).unwrap()["completion"].clone()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_capture_of_a_stream_sent_again_starts_clean_with_the_new_redactor() {
+        let root = tempfile::tempdir().expect("temporary capture directory");
+        let calls = Arc::default();
+        // The first response closes inside a frame; the capture must not
+        // join that half frame to the first frame of the second response.
+        let mut first = attempt(&[thought_chunk("plan A")]);
+        first.push(Ok(Bytes::from_static(
+            b"data: {\"candidates\":[{\"content\"",
+        )));
+        let resend = resend_with(
+            vec![Ok(attempt(&[
+                thought_chunk("plan B echoes TOKEN2"),
+                finish_chunk("STOP"),
+            ]))],
+            &calls,
+        );
+        let outcome = NativeResponseOutcome::default();
+        let text = body_text(stream_body_resending(
+            futures_util::stream::iter(first),
+            config(true),
+            capturing_sinks(&outcome, root.path()),
+            Arc::new(|text: &str| text.to_string()),
+            resend,
+        ))
+        .await;
+        assert!(text.contains("message_stop"), "{text}");
+
+        let files = captured_files(root.path());
+        let upstream: Vec<&String> = files
+            .iter()
+            .filter(|(path, _)| path.contains("-040-upstream-event"))
+            .map(|(_, text)| text)
+            .collect();
+        assert!(
+            upstream
+                .iter()
+                .any(|text| text.contains("plan B echoes [redacted]")),
+            "{upstream:?}"
+        );
+        for (path, text) in &files {
+            assert!(!text.contains("TOKEN2"), "{path} kept the token: {text}");
+        }
+        let completion = captured_completion(&files);
+        assert_eq!(completion["kind"], "stream_completion");
+        assert_eq!(completion["attempts"], 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_client_that_leaves_during_the_retry_wait_stops_the_retry() {
+        let root = tempfile::tempdir().expect("temporary capture directory");
+        let calls = Arc::default();
+        let outcome = NativeResponseOutcome::default();
+        let body = stream_body_resending(
+            futures_util::stream::iter(attempt(&[thought_chunk("plan")])),
+            config(true),
+            capturing_sinks(&outcome, root.path()),
+            Arc::new(|text: &str| text.to_string()),
+            resend_with(Vec::new(), &calls),
+        );
+        let mut stream = body.into_data_stream();
+        let first = stream.next().await.expect("the thoughts arrive").unwrap();
+        assert!(
+            String::from_utf8_lossy(&first).contains("thinking_delta"),
+            "{first:?}"
+        );
+        // The upstream has closed; the body is now waiting to send again.
+        let waiting = tokio::time::timeout(INCOMPLETE_RETRY_DELAY / 2, stream.next()).await;
+        assert!(waiting.is_err(), "{waiting:?}");
+        drop(stream);
+
+        assert_eq!(sent_again(&calls), 0);
+        assert_eq!(outcome.failure(), None);
+        let completion = captured_completion(&captured_files(root.path()));
+        assert_eq!(completion["kind"], "stream_abandoned");
+        assert_eq!(completion["attempts"], 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synthetic_stream_body_without_a_resend_still_ends_incomplete() {
+        let outcome = NativeResponseOutcome::default();
+        let text = body_text(stream_body(
+            futures_util::stream::iter(attempt(&[thought_chunk("plan")])),
+            config(true),
+            sinks(&outcome),
+        ))
+        .await;
+        let events = events_of(&text);
+        assert_eq!(
+            last_error(&events)["message"],
+            "Vertex AI stream ended without a finishReason"
+        );
     }
 }

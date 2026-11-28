@@ -5,6 +5,14 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
+- When Vertex AI closes a streaming Gemini response before any
+  `finishReason`, the proxy now sends the request again, up to twice, instead
+  of ending the turn with `Vertex AI stream ended without a finishReason`. It
+  does so as long as Claude Code has received no answer text and no tool call
+  from the response; Google bills each attempt. A streaming Gemini response
+  that ends in an error is now recorded in the proxy log as
+  `vertex_stream_failed`. See the
+  [Vertex AI provider page](https://claude-code-proxy.raine.dev/providers/vertex/#stop-reasons-and-usage).
 - Codex users can select GPT-6.2 Astra and GPT-6.2 Sol with `gpt-6.2-astra` and
   `gpt-6.2-sol` without a local Codex CLI model cache, with their
   `gpt-6.2-astra-fast` and `gpt-6.2-sol-fast` priority-tier variants, and

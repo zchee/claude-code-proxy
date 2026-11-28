@@ -10,7 +10,10 @@
 //!
 //! The upstream is always asked for a stream. A non-streaming client gets a
 //! message built from the same translation, so both modes decide the stop
-//! reason and content the same way.
+//! reason and content the same way. They differ in one case: a Gemini
+//! stream that closes without a `finishReason` is sent again for a
+//! streaming client (see [`translate::stream`]), while a non-streaming
+//! client gets the 502, which it can retry by its status.
 //!
 //! Anthropic Claude models (`vertex/anthropic/<model-id>`) are passed
 //! through as Anthropic Messages instead; see [`claude`].
@@ -63,10 +66,10 @@ use self::client::{VertexClient, VertexError, VertexResponse, VertexTarget};
 use self::endpoints::{DedicatedHosts, EndpointCall};
 use self::models::{ModelError, ResolvedModel, WireFormat};
 use self::sanitize::{redact_secrets, sanitize_vertex_text};
-use self::translate::request::prepare_request;
+use self::translate::request::{GenerateContentRequest, prepare_request};
 use self::translate::stream::{
-    LiveStreamTranslator, MAX_SSE_FRAME_BYTES, Sanitizer, StreamError, StreamSinks,
-    TranslatorConfig, sanitize_capture, stream_body_redacted,
+    LiveStreamTranslator, MAX_SSE_FRAME_BYTES, Resend, Resent, Sanitizer, StreamError, StreamSinks,
+    TranslatorConfig, sanitize_capture, stream_body_resending,
 };
 
 /// Largest upstream body read for a non-streaming response. The body is
@@ -105,8 +108,13 @@ struct Started {
 
 /// How the upstream body of a started request is translated.
 enum Reception {
-    /// Gemini `streamGenerateContent`.
-    Gemini(TranslatorConfig),
+    /// Gemini `streamGenerateContent`. `resend` sends the request again;
+    /// the streaming path uses it when the stream closes without a
+    /// `finishReason`.
+    Gemini {
+        config: TranslatorConfig,
+        resend: Resend<VertexError>,
+    },
     /// An OpenAI Responses stream (xAI Grok, OpenAI, Meta Muse).
     /// `model` is the name the client asked for.
     Responses { message_id: String, model: String },
@@ -389,12 +397,14 @@ impl VertexProvider {
             estimated_input_tokens: count_tokens::count_tokens(body),
             emit_thinking: translated.includes_thoughts(),
         };
+        let model_id = model.upstream_model.clone();
+        let resend = gemini_resend(Arc::clone(ready), model, translated, ctx.traffic.clone());
         Ok(Started {
             sanitize: sanitizer(&upstream),
             redact: redactor(&upstream),
             upstream,
-            reception: Reception::Gemini(config),
-            model_id: model.upstream_model,
+            reception: Reception::Gemini { config, resend },
+            model_id,
         })
     }
 
@@ -461,6 +471,41 @@ pub(super) fn redactor(upstream: &VertexResponse) -> Sanitizer {
     Arc::new(move |text: &str| {
         let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
         redact_secrets(text, &secrets)
+    })
+}
+
+/// How to send a Gemini request again: the same body, to the same model,
+/// with the credentials as they are then. The translated request is kept
+/// until the response has been read.
+fn gemini_resend(
+    ready: Arc<Ready>,
+    model: ResolvedModel,
+    request: GenerateContentRequest,
+    traffic: Option<Arc<TrafficCapture>>,
+) -> Resend<VertexError> {
+    let parts = Arc::new((ready, model, request, traffic));
+    Box::new(move || {
+        let parts = Arc::clone(&parts);
+        Box::pin(async move {
+            let (ready, model, request, traffic) = &*parts;
+            let credentials = VertexProvider::credentials(ready).await?;
+            let upstream = ready
+                .client
+                .stream_generate_content(
+                    &ready.config,
+                    model,
+                    request,
+                    credentials,
+                    traffic.as_deref(),
+                )
+                .await
+                .map_err(VertexError::into_provider_error)?;
+            Ok(Resent {
+                sanitize: sanitizer(&upstream),
+                redact: redactor(&upstream),
+                upstream: Box::pin(upstream.into_byte_stream()),
+            })
+        })
     })
 }
 
@@ -577,7 +622,7 @@ fn stream_response_body(
     } = started;
     let upstream = upstream.into_byte_stream();
     match reception {
-        Reception::Gemini(config) => stream_body_redacted(
+        Reception::Gemini { config, resend } => stream_body_resending(
             upstream,
             config,
             StreamSinks {
@@ -588,6 +633,7 @@ fn stream_response_body(
                 sanitize,
             },
             redact,
+            resend,
         ),
         Reception::Responses { message_id, model } => report_error_events(
             responses::stream_body_redacted(upstream, message_id, model, ctx, sanitize, redact),
@@ -657,9 +703,15 @@ async fn buffered_response(started: Started, ctx: &RequestContext) -> Response {
         .map(|_| BufferedCapture::for_reception(&reception).with_redactor(redact.clone()));
     let upstream = upstream.into_byte_stream();
     let result = match reception {
-        Reception::Gemini(config) => read_message(upstream, config, &sanitize, capture.as_mut())
-            .await
-            .map_err(BufferedFailure::Read),
+        Reception::Gemini { config, resend } => {
+            // Not sent again when the stream is incomplete: the 502 has a
+            // status, which the client can retry by. Dropping `resend` now
+            // frees the translated request it keeps.
+            drop(resend);
+            read_message(upstream, config, &sanitize, capture.as_mut())
+                .await
+                .map_err(BufferedFailure::Read)
+        }
         Reception::Responses { message_id, model } => {
             responses::read_response(upstream, &message_id, &model, &sanitize, capture.as_mut())
                 .await
@@ -815,7 +867,7 @@ impl BufferedCapture {
     /// translators clean the events they capture.
     fn for_reception(reception: &Reception) -> Self {
         match reception {
-            Reception::Gemini(_) => Self::new(),
+            Reception::Gemini { .. } => Self::new(),
             Reception::Responses { .. }
             | Reception::Mistral { .. }
             | Reception::OpenModel { .. }
@@ -2340,6 +2392,173 @@ mod tests {
             .iter()
             .map(|event| format!("data: {event}\n\n"))
             .collect()
+    }
+
+    /// What a recording server saw of one request.
+    #[derive(Debug, Clone, PartialEq)]
+    struct SeenRequest {
+        authorization: Option<String>,
+        request_type: Option<String>,
+        body: Value,
+    }
+
+    /// A local server that answers request `n` with `responses[n]` (the
+    /// last one from then on) as an event stream, and records each request.
+    async fn synthetic_recording_server(
+        responses: Vec<String>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<SeenRequest>>>) {
+        let seen: Arc<std::sync::Mutex<Vec<SeenRequest>>> = Arc::default();
+        let recorded = seen.clone();
+        let app = axum::Router::new().route(
+            "/{*path}",
+            axum::routing::post(move |headers: http::HeaderMap, body: Bytes| {
+                let seen = recorded.clone();
+                let responses = responses.clone();
+                async move {
+                    let header = |name: &http::HeaderName| {
+                        headers
+                            .get(name)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string)
+                    };
+                    let mut seen = seen.lock().unwrap();
+                    let sse = responses[seen.len().min(responses.len() - 1)].clone();
+                    seen.push(SeenRequest {
+                        authorization: header(&http::header::AUTHORIZATION),
+                        request_type: header(&client::SHARED_REQUEST_TYPE),
+                        body: serde_json::from_slice(&body).expect("the request body is JSON"),
+                    });
+                    ([(http::header::CONTENT_TYPE, "text/event-stream")], sse)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), seen)
+    }
+
+    fn synthetic_thought(text: &str) -> Value {
+        json!({"candidates":[{"content":{"role":"model","parts":[{"text":text,"thought":true}]}}]})
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_synthetic_closed_without_finish_reason_is_sent_again_unchanged() {
+        // The first response closes after thoughts, with no finishReason.
+        let incomplete = synthetic_sse(&[synthetic_thought("plan A")]);
+        let complete = synthetic_sse(&[
+            synthetic_thought("plan B"),
+            json!({
+                "candidates":[{"content":{"role":"model","parts":[{"text":"done"}]},"finishReason":"STOP"}],
+                "usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":3}
+            }),
+        ]);
+        let (base, seen) = synthetic_recording_server(vec![incomplete, complete]).await;
+        let provider = synthetic_local_provider(&base, "global");
+        let root = tempfile::tempdir().expect("temporary capture directory");
+        let mut ctx = synthetic_context();
+        ctx.traffic = Some(Arc::new(crate::traffic::test_capture(
+            root.path().to_path_buf(),
+        )));
+        let body: MessagesRequest = serde_json::from_value(json!({
+            "model": "gemini-4-carbon-fast",
+            "max_tokens": 64,
+            "stream": true,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+
+        let response = provider.handle_messages(body, ctx).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let outcome = response
+            .extensions()
+            .get::<NativeResponseOutcome>()
+            .cloned()
+            .expect("a streaming response carries its outcome");
+        let answer = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let answer = String::from_utf8_lossy(&answer);
+        let events = crate::anthropic::sse::parse_sse_events(answer.as_bytes());
+        let named = |name: &str| {
+            events
+                .iter()
+                .filter(|event| event.event.as_deref() == Some(name))
+                .count()
+        };
+        assert_eq!(named("message_start"), 1, "{answer}");
+        assert_eq!(named("message_stop"), 1, "{answer}");
+        assert_eq!(named("error"), 0, "{answer}");
+        assert!(answer.contains("plan A"), "{answer}");
+        assert!(answer.contains("plan B"), "{answer}");
+        assert!(answer.contains("\"stop_reason\":\"end_turn\""), "{answer}");
+        assert_eq!(outcome.failure(), None);
+
+        // The second request is the first one again: same body, same
+        // Priority PayGo header, same credentials.
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0], seen[1]);
+        assert_eq!(
+            seen[1].request_type.as_deref(),
+            Some(client::PRIORITY_REQUEST_TYPE)
+        );
+        assert_eq!(
+            seen[1].authorization.as_deref(),
+            Some(format!("Bearer {SYNTHETIC_TOKEN}").as_str())
+        );
+
+        let files = synthetic_files_under(root.path());
+        let named_like = |part: &str| {
+            files
+                .iter()
+                .filter(|(path, _)| path.to_string_lossy().contains(part))
+                .count()
+        };
+        assert_eq!(named_like("-020-upstream-request"), 2, "{files:?}");
+        let (_, summary) = files
+            .iter()
+            .find(|(path, _)| {
+                path.to_string_lossy()
+                    .ends_with("061-vertex-stream-summary.json")
+            })
+            .expect("the capture has a stream summary");
+        let summary: Value = serde_json::from_str(summary).unwrap();
+        assert_eq!(summary["completion"]["kind"], "stream_completion");
+        assert_eq!(summary["completion"]["attempts"], 2);
+        for (path, text) in &files {
+            assert!(
+                !text.contains(SYNTHETIC_TOKEN),
+                "{} leaked the token: {text}",
+                path.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gemini_non_streaming_synthetic_incomplete_stream_is_a_502_and_is_not_sent_again() {
+        let incomplete = synthetic_sse(&[synthetic_thought("plan A")]);
+        let (base, seen) = synthetic_recording_server(vec![incomplete]).await;
+        let provider = synthetic_local_provider(&base, "global");
+        let body: MessagesRequest = serde_json::from_value(json!({
+            "model": "vertex/gemini-3.5-flash",
+            "max_tokens": 64,
+            "stream": false,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let response = provider.handle_messages(body, synthetic_context()).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let answer = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let answer: Value = serde_json::from_slice(&answer).unwrap();
+        assert_eq!(
+            answer["error"]["message"],
+            "Vertex AI stream ended without a finishReason"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
