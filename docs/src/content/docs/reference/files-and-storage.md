@@ -28,7 +28,7 @@ On macOS, Codex and Cursor use Keychain services:
 - `claude-code-proxy.codex`
 - `claude-code-proxy.cursor`
 
-Kimi, Grok, and Muse use `<configuration-root>/<provider>/auth.json` on every platform. The Muse file holds the Meta login token, the display name, the subscription state, and the tier name; the API key and e-mail address are not written to disk. Codex and Cursor use the same file layout on Linux and Windows. File-backed credentials are written with restrictive permissions where supported.
+Kimi, Grok, Muse, and the Google AI Ultra plan use `<configuration-root>/<provider>/auth.json` on every platform; the Google AI Ultra plan's directory is `google-ai-plan`. Its file holds the access and refresh tokens, the access token's expiry, the OAuth client ID, the DPoP private key the tokens are bound to, and Google's latest DPoP nonce; the client secret is not written to it. The Muse file holds the Meta login token, the display name, the subscription state, and the tier name; the API key and e-mail address are not written to disk. Codex and Cursor use the same file layout on Linux and Windows. File-backed credentials are written with restrictive permissions where supported.
 
 When `CCP_CONFIG_DIR` is set, file-backed provider credentials use
 `<CCP_CONFIG_DIR>/<provider>/auth.json`, including Codex and Cursor on macOS.

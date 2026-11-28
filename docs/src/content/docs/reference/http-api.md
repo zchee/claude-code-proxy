@@ -45,7 +45,7 @@ Accepts the same basic Anthropic request shape and returns:
 {"input_tokens":1234}
 ```
 
-Codex tokenizes text locally with `o200k_base` and adds estimates for images, encrypted reasoning, and protocol framing. Kimi, Grok, Muse, OpenCode Go, and Vertex AI use local text heuristics, while Cursor estimates the rendered prompt from its character length. Counts support Claude Code compaction behavior and are estimates rather than provider billing values.
+Codex tokenizes text locally with `o200k_base` and adds estimates for images, encrypted reasoning, and protocol framing. Kimi, Grok, Muse, OpenCode Go, Vertex AI, and the Google AI Ultra plan use local text heuristics, while Cursor estimates the rendered prompt from its character length. Counts support Claude Code compaction behavior and are estimates rather than provider billing values.
 
 ## `GET /v1/models`
 
@@ -72,7 +72,7 @@ Claude Code gateway discovery filters IDs according to its own model rules. See 
 
 ## `POST /v1/chat/completions`
 
-Enable this route with `CCP_CODEX_RESPONSES_API=1` or `codex.responsesApi: true`. The `model` field selects Codex, Kimi, Grok, Muse, OpenCode Go, Vertex AI, or Cursor. The proxy ignores incoming bearer credentials and uses the configured provider credential.
+Enable this route with `CCP_CODEX_RESPONSES_API=1` or `codex.responsesApi: true`. The `model` field selects Codex, Kimi, Grok, Muse, OpenCode Go, Vertex AI, the Google AI Ultra plan, or Cursor. The proxy ignores incoming bearer credentials and uses the configured provider credential.
 
 ```sh
 curl http://127.0.0.1:18765/v1/chat/completions \
@@ -80,7 +80,7 @@ curl http://127.0.0.1:18765/v1/chat/completions \
   -d '{"model":"kimi-k2.6","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-For Kimi, Grok, Muse, OpenCode Go, Vertex AI, and Cursor, the route accepts:
+For Kimi, Grok, Muse, OpenCode Go, Vertex AI, the Google AI Ultra plan, and Cursor, the route accepts:
 
 - `system`, `developer`, `user`, `assistant`, and `tool` messages
 - text, supported user images, function calls, and tool results
@@ -94,6 +94,8 @@ For Grok, `reasoning_effort` accepts `none`, `low`, `medium`, `high`, `xhigh`, a
 For Muse, `reasoning_effort` accepts `low`, `medium`, `high`, `xhigh`, and `max`. `max` is sent as `xhigh` for `muse-spark-1.2`.
 
 For Vertex AI, `reasoning_effort` accepts `low`, `medium`, `high`, `xhigh`, and `max` for every model. Gemini models receive them as thinking levels `LOW`, `MEDIUM`, and `HIGH`, with `xhigh` and `max` becoming `HIGH`. Claude models on Vertex AI receive the value as `output_config.effort` and OpenAI models on Vertex AI as `reasoning.effort`; Grok, Muse, and Mistral models on Vertex AI receive no effort. Among the managed open models on Vertex AI, gpt-oss receives `reasoning_effort` (`low` and `medium` as they are, `high`, `xhigh`, and `max` as `high`), GLM and Gemma receive `enable_thinking: true` for any of the five values and `enable_thinking: false` when no effort is set, and the others receive nothing. See [Vertex AI](/providers/vertex/#openai-compatible-apis).
+
+For the Google AI Ultra plan, `reasoning_effort` accepts the same five values and chooses the thinking level as on `/v1/messages`; the response carries no thinking text and no thought signature, and `parallel_tool_calls` is accepted but not enforced. See [Google AI Ultra plan](/providers/google-ai-plan/#openai-compatible-routes).
 
 Codex uses its own compatibility path. It supports text messages, `reasoning_effort`, `response_format`, `stream_options.include_usage`, `temperature`, `top_p`, and `user`. Reasoning effort defaults to `medium`, and the proxy-wide Codex effort setting takes precedence. Function calls, images, audio, log probabilities, multiple choices, storage, and output token limits are not supported on the Codex Chat Completions path.
 
@@ -130,7 +132,7 @@ The Images API is an internal ChatGPT Codex integration, not the public OpenAI P
 
 ## `POST /v1/responses`
 
-Enable this route with `CCP_CODEX_RESPONSES_API=1` or `codex.responsesApi: true`. The `model` field selects Codex, Kimi, Grok, Muse, OpenCode Go, Vertex AI, or Cursor.
+Enable this route with `CCP_CODEX_RESPONSES_API=1` or `codex.responsesApi: true`. The `model` field selects Codex, Kimi, Grok, Muse, OpenCode Go, Vertex AI, the Google AI Ultra plan, or Cursor.
 
 ```sh
 curl http://127.0.0.1:18765/v1/responses \
@@ -138,7 +140,7 @@ curl http://127.0.0.1:18765/v1/responses \
   -d '{"model":"grok-4.5","input":"Hello"}'
 ```
 
-Codex models use native Responses passthrough, including native JSON and SSE output. For Kimi, Grok, Muse, OpenCode Go, Vertex AI, and Cursor, the route accepts:
+Codex models use native Responses passthrough, including native JSON and SSE output. For Kimi, Grok, Muse, OpenCode Go, Vertex AI, the Google AI Ultra plan, and Cursor, the route accepts:
 
 - string input or message items
 - `instructions`

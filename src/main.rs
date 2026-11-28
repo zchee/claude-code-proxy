@@ -83,6 +83,11 @@ enum Commands {
         #[command(subcommand)]
         command: ProviderGroup,
     },
+    /// Manage Google AI Ultra plan authentication
+    GoogleAiPlan {
+        #[command(subcommand)]
+        command: ProviderGroup,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -210,6 +215,7 @@ fn main() -> Result<()> {
         Commands::Grok { command } => run_provider_cli("grok", command),
         Commands::Muse { command } => run_provider_cli("muse", command),
         Commands::Vertex { command } => run_provider_cli("vertex", command),
+        Commands::GoogleAiPlan { command } => run_provider_cli("google-ai-plan", command),
     }
 }
 
@@ -352,7 +358,16 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
 fn print_models(registry: &Registry, full: bool, catalog_notes: &BTreeMap<String, CatalogNote>) {
     let grouped = registry.grouped_models();
     for provider in [
-        "codex", "kimi", "grok", "muse", "opencode", "vertex", "cursor", "local", "lmstudio",
+        "codex",
+        "kimi",
+        "grok",
+        "muse",
+        "opencode",
+        "vertex",
+        "google-ai-plan",
+        "cursor",
+        "local",
+        "lmstudio",
     ] {
         let Some(models) = grouped.get(provider) else {
             continue;

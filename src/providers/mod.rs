@@ -1,6 +1,7 @@
 pub(crate) mod anthropic_passthrough;
 pub mod codex;
 pub mod cursor;
+pub mod google_ai_plan;
 pub mod grok;
 pub mod kimi;
 pub mod lmstudio;

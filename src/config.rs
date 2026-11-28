@@ -48,6 +48,20 @@ struct FileConfig {
     pub opencode: Option<OpenCodeConfig>,
     pub vertex: Option<VertexConfig>,
     pub lmstudio: Option<LmStudioConfig>,
+    #[serde(rename = "googleAiPlan")]
+    pub google_ai_plan: Option<GoogleAiPlanConfig>,
+}
+
+#[derive(Deserialize, Clone)]
+struct GoogleAiPlanConfig {
+    #[serde(rename = "clientId")]
+    pub client_id: Option<String>,
+    #[serde(rename = "clientSecret")]
+    pub client_secret: Option<String>,
+    #[serde(rename = "baseUrl")]
+    pub base_url: Option<String>,
+    #[serde(rename = "userAgent")]
+    pub user_agent: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -377,6 +391,18 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
         out.push("lmstudio.apiKey (env)".to_string());
     } else if env.contains_key("LM_API_TOKEN") {
         out.push("lmstudio.apiKey (LM Studio env)".to_string());
+    }
+    if env.contains_key("CCP_GOOGLE_AI_PLAN_CLIENT_ID") {
+        out.push("googleAiPlan.clientId (env)".to_string());
+    }
+    if env.contains_key("CCP_GOOGLE_AI_PLAN_CLIENT_SECRET") {
+        out.push("googleAiPlan.clientSecret (env)".to_string());
+    }
+    if env.contains_key("CCP_GOOGLE_AI_PLAN_BASE_URL") {
+        out.push("googleAiPlan.baseUrl (env)".to_string());
+    }
+    if env.contains_key("CCP_GOOGLE_AI_PLAN_USER_AGENT") {
+        out.push("googleAiPlan.userAgent (env)".to_string());
     }
     for (key, setting) in vertex_settings {
         match setting.map(|setting| setting.source) {
@@ -2186,6 +2212,159 @@ fn lmstudio_origin(value: &str) -> Result<String, &'static str> {
         return Err("must be a scheme, a host and a port only, without a path such as /v1");
     }
     Ok(url.origin().ascii_serialization())
+}
+
+// ---------------------------------------------------------------------------
+// Google AI Ultra plan config
+// ---------------------------------------------------------------------------
+
+/// The Gemini API base URL the Google AI Ultra plan models are called at.
+pub const GOOGLE_AI_PLAN_DEFAULT_BASE_URL: &str =
+    "https://generativelanguage.googleapis.com/v1beta";
+
+/// A Google `Desktop app` OAuth client for the Google AI Ultra plan: the
+/// built-in one, or one the user registered and configured.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GoogleAiPlanClient {
+    /// The OAuth client id.
+    pub client_id: String,
+    /// The OAuth client secret. Google treats an installed app's secret as
+    /// non-confidential, but it is still kept out of logs.
+    pub client_secret: String,
+}
+
+impl std::fmt::Debug for GoogleAiPlanClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleAiPlanClient")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The Google AI Ultra plan settings of this process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoogleAiPlanSettings {
+    /// The Gemini API base URL, without a trailing slash.
+    pub base_url: String,
+    /// The OAuth client: the configured one, else the built-in one.
+    pub client: GoogleAiPlanClient,
+    /// The `User-Agent` of every model call: the configured one, else
+    /// [`google_ai_plan_default_user_agent`].
+    pub user_agent: String,
+}
+
+/// The `User-Agent` model calls send when none is configured.
+pub fn google_ai_plan_default_user_agent() -> String {
+    format!("claude-code-proxy/{}", env!("CARGO_PKG_VERSION"))
+}
+
+impl GoogleAiPlanClient {
+    /// The built-in client the proxy uses when none is configured.
+    pub fn built_in() -> Self {
+        use crate::providers::google_ai_plan::auth::client;
+        Self {
+            client_id: client::built_in_client_id().to_string(),
+            client_secret: client::built_in_client_secret().to_string(),
+        }
+    }
+}
+
+/// The Google AI Ultra plan settings of this process. A setting that is
+/// present but invalid, or a client with only one of its id and secret, is an
+/// error naming the setting.
+pub fn google_ai_plan_settings() -> anyhow::Result<GoogleAiPlanSettings> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    resolve_google_ai_plan_settings(&env, &paths::config_dir())
+}
+
+/// Resolves the Google AI Ultra plan settings with env over config.json over
+/// the defaults, one setting at a time. Blank values count as unset, as for
+/// the other providers. The client id and secret replace the built-in client
+/// only together.
+pub fn resolve_google_ai_plan_settings(
+    env: &HashMap<String, String>,
+    config_dir: &Path,
+) -> anyhow::Result<GoogleAiPlanSettings> {
+    let file = read_file_config(config_dir).and_then(|file| file.google_ai_plan);
+    let set = |raw: &String| {
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    let pick = |env_name: &str,
+                file_key: &str,
+                from_file: fn(&GoogleAiPlanConfig) -> Option<&String>|
+     -> Option<(String, String)> {
+        match env.get(env_name).and_then(set) {
+            Some(value) => Some((value, env_name.to_string())),
+            None => file
+                .as_ref()
+                .and_then(from_file)
+                .and_then(set)
+                .map(|value| (value, format!("googleAiPlan.{file_key} in config.json"))),
+        }
+    };
+
+    let base_url = match pick("CCP_GOOGLE_AI_PLAN_BASE_URL", "baseUrl", |file| {
+        file.base_url.as_ref()
+    }) {
+        Some((value, setting)) => google_ai_plan_base_url(&value).map_err(|reason| {
+            anyhow::anyhow!("Invalid Google AI Ultra plan setting {setting}: {reason}")
+        })?,
+        None => GOOGLE_AI_PLAN_DEFAULT_BASE_URL.to_string(),
+    };
+
+    let client_id = pick("CCP_GOOGLE_AI_PLAN_CLIENT_ID", "clientId", |file| {
+        file.client_id.as_ref()
+    });
+    let client_secret = pick("CCP_GOOGLE_AI_PLAN_CLIENT_SECRET", "clientSecret", |file| {
+        file.client_secret.as_ref()
+    });
+    let client = match (client_id, client_secret) {
+        (None, None) => GoogleAiPlanClient::built_in(),
+        (Some((client_id, _)), Some((client_secret, _))) => GoogleAiPlanClient {
+            client_id,
+            client_secret,
+        },
+        (Some(_), None) => anyhow::bail!(
+            "The Google AI Ultra plan OAuth client is incomplete: set \
+             CCP_GOOGLE_AI_PLAN_CLIENT_SECRET or googleAiPlan.clientSecret in config.json \
+             next to the client id"
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "The Google AI Ultra plan OAuth client is incomplete: set \
+             CCP_GOOGLE_AI_PLAN_CLIENT_ID or googleAiPlan.clientId in config.json \
+             next to the client secret"
+        ),
+    };
+    let user_agent = match pick("CCP_GOOGLE_AI_PLAN_USER_AGENT", "userAgent", |file| {
+        file.user_agent.as_ref()
+    }) {
+        Some((value, setting)) => {
+            validate_muse_user_agent(&value).map_err(|reason| {
+                anyhow::anyhow!("Invalid Google AI Ultra plan setting {setting}: {reason}")
+            })?;
+            value
+        }
+        None => google_ai_plan_default_user_agent(),
+    };
+    Ok(GoogleAiPlanSettings {
+        base_url,
+        client,
+        user_agent,
+    })
+}
+
+/// Checks the Gemini API base URL and drops trailing slashes. It receives the
+/// access token, so it follows the rule of the other token endpoints; model
+/// paths are appended to it, so it carries no query or fragment.
+fn google_ai_plan_base_url(value: &str) -> Result<String, &'static str> {
+    validate_token_endpoint(value)?;
+    let url = url::Url::parse(value).map_err(|_| "not a valid URL")?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("must not contain a query or a fragment");
+    }
+    Ok(value.trim_end_matches('/').to_string())
 }
 
 #[cfg(test)]
@@ -4234,5 +4413,325 @@ mod tests {
         let printed = format!("{settings:?}");
         assert!(!printed.contains("very-secret"), "{printed}");
         assert!(printed.contains("<redacted>"), "{printed}");
+    }
+
+    #[test]
+    fn google_ai_plan_settings_take_env_over_config_json_over_the_default() {
+        let without_file = tempfile::TempDir::new().unwrap();
+        let with_file = tempfile::TempDir::new().unwrap();
+        fs::write(
+            with_file.path().join("config.json"),
+            r#"{"googleAiPlan":{"clientId":"file-client","clientSecret":"file-secret","baseUrl":"https://gemini.example/v1beta//"}}"#,
+        )
+        .unwrap();
+        let client = |id: &str, secret: &str| GoogleAiPlanClient {
+            client_id: id.to_string(),
+            client_secret: secret.to_string(),
+        };
+        let settings = |base_url: &str, client: GoogleAiPlanClient| GoogleAiPlanSettings {
+            base_url: base_url.to_string(),
+            client,
+            user_agent: google_ai_plan_default_user_agent(),
+        };
+        // (name, env, config directory, expected settings)
+        type Case<'a> = (
+            &'a str,
+            &'a [(&'a str, &'a str)],
+            &'a tempfile::TempDir,
+            GoogleAiPlanSettings,
+        );
+        let tests: [Case<'_>; 6] = [
+            (
+                "default: the built-in client, the public Gemini API",
+                &[],
+                &without_file,
+                settings(
+                    GOOGLE_AI_PLAN_DEFAULT_BASE_URL,
+                    GoogleAiPlanClient::built_in(),
+                ),
+            ),
+            (
+                "config.json, trailing slashes dropped",
+                &[],
+                &with_file,
+                settings(
+                    "https://gemini.example/v1beta",
+                    client("file-client", "file-secret"),
+                ),
+            ),
+            (
+                "env over config.json",
+                &[
+                    ("CCP_GOOGLE_AI_PLAN_CLIENT_ID", "env-client"),
+                    ("CCP_GOOGLE_AI_PLAN_CLIENT_SECRET", "env-secret"),
+                    ("CCP_GOOGLE_AI_PLAN_BASE_URL", "http://127.0.0.1:9/v1beta/"),
+                ],
+                &with_file,
+                settings(
+                    "http://127.0.0.1:9/v1beta",
+                    client("env-client", "env-secret"),
+                ),
+            ),
+            (
+                "each setting resolves on its own",
+                &[("CCP_GOOGLE_AI_PLAN_CLIENT_ID", "env-client")],
+                &with_file,
+                settings(
+                    "https://gemini.example/v1beta",
+                    client("env-client", "file-secret"),
+                ),
+            ),
+            (
+                "blank values fall through",
+                &[
+                    ("CCP_GOOGLE_AI_PLAN_CLIENT_ID", " "),
+                    ("CCP_GOOGLE_AI_PLAN_CLIENT_SECRET", ""),
+                    ("CCP_GOOGLE_AI_PLAN_BASE_URL", "  "),
+                ],
+                &with_file,
+                settings(
+                    "https://gemini.example/v1beta",
+                    client("file-client", "file-secret"),
+                ),
+            ),
+            (
+                "values are trimmed",
+                &[
+                    ("CCP_GOOGLE_AI_PLAN_CLIENT_ID", " env-client "),
+                    ("CCP_GOOGLE_AI_PLAN_CLIENT_SECRET", "\tenv-secret\n"),
+                ],
+                &without_file,
+                settings(
+                    GOOGLE_AI_PLAN_DEFAULT_BASE_URL,
+                    client("env-client", "env-secret"),
+                ),
+            ),
+        ];
+        for (name, env, config, expected) in tests {
+            let resolved = resolve_google_ai_plan_settings(&lmstudio_env(env), config.path())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(resolved, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn google_ai_plan_half_configured_client_names_the_missing_setting() {
+        let empty = tempfile::TempDir::new().unwrap();
+        let secret_only = tempfile::TempDir::new().unwrap();
+        fs::write(
+            secret_only.path().join("config.json"),
+            r#"{"googleAiPlan":{"clientSecret":"file-secret"}}"#,
+        )
+        .unwrap();
+        // (name, env, config directory, missing env var, missing config key)
+        type Case<'a> = (
+            &'a str,
+            &'a [(&'a str, &'a str)],
+            &'a tempfile::TempDir,
+            &'a str,
+            &'a str,
+        );
+        let tests: [Case<'_>; 3] = [
+            (
+                "id in env, no secret",
+                &[("CCP_GOOGLE_AI_PLAN_CLIENT_ID", "env-client")],
+                &empty,
+                "CCP_GOOGLE_AI_PLAN_CLIENT_SECRET",
+                "googleAiPlan.clientSecret",
+            ),
+            (
+                "secret in env, blank id",
+                &[
+                    ("CCP_GOOGLE_AI_PLAN_CLIENT_ID", "  "),
+                    ("CCP_GOOGLE_AI_PLAN_CLIENT_SECRET", "env-secret"),
+                ],
+                &empty,
+                "CCP_GOOGLE_AI_PLAN_CLIENT_ID",
+                "googleAiPlan.clientId",
+            ),
+            (
+                "secret in config.json only",
+                &[],
+                &secret_only,
+                "CCP_GOOGLE_AI_PLAN_CLIENT_ID",
+                "googleAiPlan.clientId",
+            ),
+        ];
+        for (name, env, config, missing_env, missing_key) in tests {
+            let error = resolve_google_ai_plan_settings(&lmstudio_env(env), config.path())
+                .expect_err(name)
+                .to_string();
+            assert!(error.contains(missing_env), "{name}: {error}");
+            assert!(error.contains(missing_key), "{name}: {error}");
+            assert!(!error.contains("env-secret"), "{name}: {error}");
+            assert!(!error.contains("file-secret"), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn google_ai_plan_base_urls_that_could_leak_the_token_are_rejected() {
+        let empty = tempfile::TempDir::new().unwrap();
+        for (base_url, expected) in [
+            (
+                "http://gemini.example/v1beta",
+                "plain http only for a loopback host",
+            ),
+            (
+                "https://user:pw@gemini.example/v1beta",
+                "user name or password",
+            ),
+            ("https://gemini.example/v1beta?key=1", "query or a fragment"),
+            ("ftp://127.0.0.1/v1beta", "must use https"),
+            ("not a url", "not a valid URL"),
+        ] {
+            let error = resolve_google_ai_plan_settings(
+                &lmstudio_env(&[("CCP_GOOGLE_AI_PLAN_BASE_URL", base_url)]),
+                empty.path(),
+            )
+            .expect_err(base_url)
+            .to_string();
+            assert!(
+                error.contains("CCP_GOOGLE_AI_PLAN_BASE_URL"),
+                "{base_url}: {error}"
+            );
+            assert!(error.contains(expected), "{base_url}: {error}");
+            assert!(!error.contains("pw@"), "{base_url}: {error}");
+        }
+        let in_file = tempfile::TempDir::new().unwrap();
+        fs::write(
+            in_file.path().join("config.json"),
+            r#"{"googleAiPlan":{"baseUrl":"http://10.0.0.1/v1beta"}}"#,
+        )
+        .unwrap();
+        let error = resolve_google_ai_plan_settings(&lmstudio_env(&[]), in_file.path())
+            .expect_err("plain http to a remote host")
+            .to_string();
+        assert!(
+            error.contains("googleAiPlan.baseUrl in config.json"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn google_ai_plan_debug_output_hides_the_client_secret() {
+        let settings = GoogleAiPlanSettings {
+            base_url: GOOGLE_AI_PLAN_DEFAULT_BASE_URL.to_string(),
+            client: GoogleAiPlanClient {
+                client_id: "synthetic-client".to_string(),
+                client_secret: "synthetic-secret".to_string(),
+            },
+            user_agent: google_ai_plan_default_user_agent(),
+        };
+        let printed = format!("{settings:?}");
+        assert!(!printed.contains("synthetic-secret"), "{printed}");
+        assert!(printed.contains("synthetic-client"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+        let built_in = format!("{:?}", GoogleAiPlanClient::built_in());
+        assert!(
+            !built_in
+                .contains(crate::providers::google_ai_plan::auth::client::built_in_client_secret()),
+            "the built-in secret is printed"
+        );
+    }
+
+    #[test]
+    fn google_ai_plan_default_settings_carry_the_built_in_client() {
+        use crate::providers::google_ai_plan::auth::client::{
+            built_in_client_id, built_in_client_secret,
+        };
+        let empty = tempfile::TempDir::new().unwrap();
+        let settings = resolve_google_ai_plan_settings(&lmstudio_env(&[]), empty.path()).unwrap();
+        println!("default client id: {}", settings.client.client_id);
+        assert_eq!(settings.client.client_id, built_in_client_id());
+        assert_eq!(settings.client.client_secret, built_in_client_secret());
+        assert!(!built_in_client_id().is_empty() && !built_in_client_secret().is_empty());
+    }
+
+    #[test]
+    fn google_ai_plan_user_agent_takes_env_over_config_json_over_the_default() {
+        let without_file = tempfile::TempDir::new().unwrap();
+        let with_file = tempfile::TempDir::new().unwrap();
+        fs::write(
+            with_file.path().join("config.json"),
+            r#"{"googleAiPlan":{"userAgent":" file-agent/1 "}}"#,
+        )
+        .unwrap();
+        let default = google_ai_plan_default_user_agent();
+        assert!(default.starts_with("claude-code-proxy/"), "{default}");
+        // (name, env, config directory, expected User-Agent)
+        type Case<'a> = (
+            &'a str,
+            &'a [(&'a str, &'a str)],
+            &'a tempfile::TempDir,
+            &'a str,
+        );
+        let tests: [Case<'_>; 4] = [
+            ("default", &[], &without_file, default.as_str()),
+            ("config.json, trimmed", &[], &with_file, "file-agent/1"),
+            (
+                "env over config.json",
+                &[("CCP_GOOGLE_AI_PLAN_USER_AGENT", "env-agent/2")],
+                &with_file,
+                "env-agent/2",
+            ),
+            (
+                "blank env falls through",
+                &[("CCP_GOOGLE_AI_PLAN_USER_AGENT", "  ")],
+                &with_file,
+                "file-agent/1",
+            ),
+        ];
+        for (name, env, config, expected) in tests {
+            let resolved = resolve_google_ai_plan_settings(&lmstudio_env(env), config.path())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(resolved.user_agent, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn google_ai_plan_invalid_user_agent_is_an_error_naming_the_setting() {
+        let empty = tempfile::TempDir::new().unwrap();
+        let too_long = format!("synthetic-marker-{}", "a".repeat(240));
+        for (value, reason) in [
+            (too_long.as_str(), "must be at most 256 characters"),
+            (
+                "synthetic-marker\r\nX-Injected: 1",
+                "must contain only printable ASCII characters",
+            ),
+            (
+                "synthetic-marker/\u{e9}",
+                "must contain only printable ASCII characters",
+            ),
+        ] {
+            let error = resolve_google_ai_plan_settings(
+                &lmstudio_env(&[("CCP_GOOGLE_AI_PLAN_USER_AGENT", value)]),
+                empty.path(),
+            )
+            .expect_err(value)
+            .to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "Invalid Google AI Ultra plan setting CCP_GOOGLE_AI_PLAN_USER_AGENT: {reason}"
+                ),
+                "{value:?}"
+            );
+            assert!(!error.contains("synthetic-marker"), "{error}");
+        }
+        let in_file = tempfile::TempDir::new().unwrap();
+        fs::write(
+            in_file.path().join("config.json"),
+            serde_json::json!({"googleAiPlan": {"userAgent": "synthetic-marker\tagent"}})
+                .to_string(),
+        )
+        .unwrap();
+        let error = resolve_google_ai_plan_settings(&lmstudio_env(&[]), in_file.path())
+            .expect_err("a tab in config.json")
+            .to_string();
+        assert_eq!(
+            error,
+            "Invalid Google AI Ultra plan setting googleAiPlan.userAgent in config.json: \
+             must contain only printable ASCII characters"
+        );
     }
 }

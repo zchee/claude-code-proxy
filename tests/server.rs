@@ -2448,3 +2448,188 @@ mod muse {
         }
     }
 }
+
+mod google_ai_plan {
+    use super::*;
+    use claude_code_proxy::auth::InMemoryAuthStore;
+    use claude_code_proxy::config::{GoogleAiPlanClient, GoogleAiPlanSettings};
+    use claude_code_proxy::providers::google_ai_plan::GoogleAiPlanProvider;
+    use claude_code_proxy::providers::google_ai_plan::auth::manager::GoogleAiPlanAuthManager;
+    use claude_code_proxy::providers::google_ai_plan::auth::token_store::{
+        GoogleAiPlanTokenStore, StoredAuth,
+    };
+    use claude_code_proxy::providers::google_ai_plan::client::InteractionsClient;
+    use claude_code_proxy::providers::vertex::client::client_builder;
+
+    const TOKEN: &str = "ya29.synthetic-plan-server-token-5e6f7a";
+
+    /// One text turn the way the Interactions API streams it.
+    fn text_turn() -> String {
+        [
+            json!({"event_type":"step.start","index":0,"step":{"type":"model_output"}}),
+            json!({"event_type":"step.delta","index":0,"delta":{"type":"text","text":"ok"}}),
+            json!({"event_type":"step.stop","index":0}),
+            json!({"event_type":"interaction.completed","interaction":{"status":"completed",
+                "usage":{"total_input_tokens":9,"total_output_tokens":1}}}),
+        ]
+        .iter()
+        .map(|event| {
+            format!(
+                "event: {}\ndata: {event}\n\n",
+                event["event_type"].as_str().unwrap()
+            )
+        })
+        .collect()
+    }
+
+    /// A fake Interactions endpoint that answers every call with `text_turn`
+    /// and counts the calls, and a registry with a provider pointed at it.
+    async fn registry() -> (Arc<Registry>, Arc<Mutex<Vec<Value>>>) {
+        let bodies: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let seen = bodies.clone();
+        let upstream = axum::Router::new().route(
+            "/{*path}",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+                    (
+                        [(http::header::CONTENT_TYPE, "text/event-stream")],
+                        text_turn(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let client = GoogleAiPlanClient {
+            client_id: "synthetic-server-client".to_string(),
+            client_secret: "synthetic-server-secret".to_string(),
+        };
+        let settings = GoogleAiPlanSettings {
+            base_url: format!("http://{addr}/v1beta"),
+            client: client.clone(),
+            user_agent: "synthetic-agent/1".to_string(),
+        };
+        let store = GoogleAiPlanTokenStore::new(InMemoryAuthStore::new());
+        store
+            .save_auth(StoredAuth {
+                access: TOKEN.to_string(),
+                refresh: "synthetic-refresh".to_string(),
+                expires_at_ms: u64::MAX / 2,
+                client_id: client.client_id.clone(),
+                // Read only by a refresh, which a fresh token never needs.
+                dpop_key: "synthetic-unused".to_string(),
+                dpop_nonce: None,
+            })
+            .unwrap();
+        let auth =
+            GoogleAiPlanAuthManager::with_token_url(store, client, "http://127.0.0.1:9/token")
+                .unwrap();
+        let interactions = InteractionsClient::with_client(
+            client_builder().no_proxy().build().unwrap(),
+            &settings,
+        );
+        let provider = GoogleAiPlanProvider::with_parts(settings, interactions, auth);
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(provider)];
+        (
+            Arc::new(Registry::from_providers(AliasProvider::Codex, providers)),
+            bodies,
+        )
+    }
+
+    async fn post_json(app: axum::Router, uri: &str, body: Value) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let bounded = std::time::Duration::from_secs(20);
+        let response = tokio::time::timeout(bounded, app.oneshot(request))
+            .await
+            .expect("the proxy answers within 20 seconds")
+            .unwrap();
+        let status = response.status();
+        let bytes = tokio::time::timeout(
+            bounded,
+            http_body_util::BodyExt::collect(response.into_body()),
+        )
+        .await
+        .expect("the body ends within 20 seconds")
+        .unwrap()
+        .to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn openai_routes_answer_from_the_plan_streaming_and_not() {
+        let (registry, bodies) = registry().await;
+        let model = "google-ai-plan/gemini-4-neon";
+        let (status, body) = post_json(
+            app_with_options(registry.clone(), None, true),
+            "/v1/chat/completions",
+            json!({"model": model, "messages": [{"role": "user", "content": "Say ok"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["choices"][0]["message"]["content"], "ok", "{body}");
+        // The echoed name routes back here; the bare upstream ID would
+        // route to Vertex AI.
+        assert_eq!(value["model"], model, "{body}");
+
+        let (status, body) = post_json(
+            app_with_options(registry.clone(), None, true),
+            "/v1/chat/completions",
+            json!({"model": model, "stream": true, "messages": [{"role": "user", "content": "Say ok"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains(r#""content":"ok""#), "{body}");
+        assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+        assert!(
+            body.contains(&format!(r#""model":"{model}""#)),
+            "every chunk names the routable model: {body}"
+        );
+        assert!(!body.contains(r#""model":"gemini-4-neon""#), "{body}");
+
+        let (status, body) = post_json(
+            app_with_options(registry.clone(), None, true),
+            "/v1/responses",
+            json!({"model": model, "input": "Say ok"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["model"], model, "{body}");
+        assert!(body.contains(r#""text":"ok""#), "{body}");
+        assert!(!body.contains(TOKEN), "{body}");
+
+        let (status, body) = post_json(
+            app_with_options(registry.clone(), None, true),
+            "/v1/responses",
+            json!({"model": model, "stream": true, "input": "Say ok"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("event: response.completed"), "{body}");
+        assert!(body.contains(r#""delta":"ok""#), "{body}");
+        assert!(
+            body.contains(&format!(r#""model":"{model}""#)),
+            "the response names the routable model: {body}"
+        );
+        assert!(!body.contains(r#""model":"gemini-4-neon""#), "{body}");
+
+        let sent = bodies.lock().unwrap().clone();
+        assert_eq!(sent.len(), 4, "{sent:?}");
+        for body in sent {
+            assert_eq!(body["model"], "gemini-4-neon", "{body}");
+            assert_eq!(body["stream"], true, "{body}");
+        }
+    }
+}

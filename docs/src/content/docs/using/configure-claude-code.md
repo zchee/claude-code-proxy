@@ -41,6 +41,8 @@ Grok 4.5 and Grok 4.6 are 500,000 tokens. Set `CLAUDE_CODE_MAX_CONTEXT_TOKENS=50
 
 Muse models are 1,007,997 tokens. Set `CLAUDE_CODE_MAX_CONTEXT_TOKENS=1007997`.
 
+Google AI Ultra plan models are 1,048,576 tokens. Set `CLAUDE_CODE_MAX_CONTEXT_TOKENS=1048576`.
+
 For a provider and model with a different real context limit, choose a safe value or omit the override. `DISABLE_AUTO_COMPACT=1` disables automatic compaction while preserving manual `/compact`, but the session can then hit the upstream limit.
 
 ## Persistent Claude Code settings

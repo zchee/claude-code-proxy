@@ -50,6 +50,7 @@ export default defineConfig({
             { label: 'Muse', slug: 'providers/muse' },
             { label: 'OpenCode Go', slug: 'providers/opencode-go' },
             { label: 'Vertex AI', slug: 'providers/vertex' },
+            { label: 'Google AI Ultra plan', slug: 'providers/google-ai-plan' },
             { label: 'Cursor Agent', slug: 'providers/cursor-agent' },
             { label: 'LM Studio', slug: 'providers/lmstudio' },
           ],

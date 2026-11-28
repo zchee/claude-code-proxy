@@ -104,6 +104,10 @@ impl Registry {
             "opencode".into(),
             crate::providers::opencode::advertised_models(),
         );
+        models.insert(
+            "google-ai-plan".into(),
+            crate::providers::google_ai_plan::models::advertised_models(),
+        );
         // The deployed endpoints of config.json are read once, here: a
         // listing needs their names before any request is sent.
         models.insert(
@@ -123,6 +127,9 @@ impl Registry {
                 "muse" => Arc::new(crate::providers::muse::MuseProvider::new()),
                 "opencode" => Arc::new(crate::providers::opencode::OpenCodeProvider::new()),
                 "vertex" => Arc::new(crate::providers::vertex::VertexProvider::new()),
+                "google-ai-plan" => {
+                    Arc::new(crate::providers::google_ai_plan::GoogleAiPlanProvider::new())
+                }
                 _ => Arc::new(PlaceholderProvider::new(name, entries.clone())),
             };
             handlers.insert(name.clone(), handler);
@@ -260,6 +267,11 @@ impl Registry {
         // it can serve it and answers 400 when it cannot.
         if normalized.starts_with(crate::providers::vertex::models::MODEL_PREFIX) {
             return self.handlers.get("vertex").cloned();
+        }
+        // Any `google-ai-plan/` name, listed or not: Google answers for a
+        // model outside the list, and the provider explains that answer.
+        if normalized.starts_with(crate::providers::google_ai_plan::models::MODEL_PREFIX) {
+            return self.handlers.get("google-ai-plan").cloned();
         }
         // Any `lmstudio/` name: LM Studio loads a downloaded model on its
         // first request and answers for one it does not have.
@@ -634,6 +646,43 @@ mod tests {
             assert_eq!(
                 registry.provider_for_model(model, None).unwrap().name(),
                 "codex"
+            );
+        }
+    }
+
+    #[test]
+    fn google_ai_plan_names_route_to_google_ai_plan_listed_or_not() {
+        let registry = Registry::new(AliasProvider::Codex);
+        let advertised = registry.supported_models_for("google-ai-plan");
+        assert_eq!(
+            advertised,
+            [
+                "google-ai-plan/gemini-3.5-flash-lite",
+                "google-ai-plan/gemini-4-carbon",
+                "google-ai-plan/gemini-4-hydrogen",
+                "google-ai-plan/gemini-4-neon",
+            ],
+            "listed sorted"
+        );
+        for model in advertised.iter().map(String::as_str).chain([
+            "google-ai-plan/gemini-4-neon[1m]",
+            // Not listed: the prefix still routes, and Google's answer for a
+            // model outside the plan is explained by the provider.
+            "google-ai-plan/gemini-4-argon",
+            "google-ai-plan/",
+        ]) {
+            assert_eq!(
+                registry.provider_for_model(model, None).unwrap().name(),
+                "google-ai-plan",
+                "{model}"
+            );
+        }
+        // The bare Gemini IDs stay with Vertex AI.
+        for model in ["gemini-4-hydrogen", "gemini-3.5-flash-lite"] {
+            assert_eq!(
+                registry.provider_for_model(model, None).unwrap().name(),
+                "vertex",
+                "{model}"
             );
         }
     }

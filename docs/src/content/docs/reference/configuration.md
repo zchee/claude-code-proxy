@@ -58,6 +58,10 @@ These settings configure the proxy process. Claude Code client settings such as 
       "mistralai": "us-central1"
     }
   },
+  "googleAiPlan": {
+    "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+    "userAgent": "claude-code-proxy/0.1.48"
+  },
   "cursor": {
     "baseUrl": "https://api2.cursor.sh",
     "clientVersion": "0.48.5",
@@ -203,6 +207,17 @@ A `vertex.endpoints` entry needs `endpoint` (the endpoint ID), `location` (its r
 The server reads these settings on the first Vertex AI request and keeps them until it exits, so restart the proxy after changing them. When they are invalid, for example because no project is set, nothing is kept, and the next request reads `config.json` again. A request that fails only because no access token could be obtained keeps the settings and leaves the credentials to be looked up again; see [Vertex AI](/providers/vertex/#project-and-location).
 
 Credentials are not configured here. The Google library reads `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_QUOTA_PROJECT` itself; see [Vertex AI](/providers/vertex/#credentials).
+
+## Google AI Ultra plan
+
+| Environment | Config key | Default | Purpose |
+| --- | --- | --- | --- |
+| `CCP_GOOGLE_AI_PLAN_CLIENT_ID` | `googleAiPlan.clientId` | the built-in client | Your own Google OAuth `Desktop app` client ID, set together with the secret. |
+| `CCP_GOOGLE_AI_PLAN_CLIENT_SECRET` | `googleAiPlan.clientSecret` | the built-in client | Your own client's secret, set together with the ID. |
+| `CCP_GOOGLE_AI_PLAN_BASE_URL` | `googleAiPlan.baseUrl` | `https://generativelanguage.googleapis.com/v1beta` | The Gemini API base URL; `/interactions:createPerUserQuota` is appended. |
+| `CCP_GOOGLE_AI_PLAN_USER_AGENT` | `googleAiPlan.userAgent` | `claude-code-proxy/<version>` | The user-agent of every model call: 1 to 256 printable ASCII characters. |
+
+Each setting is taken from the environment, then from `config.json`; an empty value counts as not set. The client ID and secret replace the built-in client only together; one without the other is an error. The base URL receives the access token, so it must use `https` (plain `http` only for a loopback host) and must not contain a user name, a password, a query, or a fragment. A non-empty invalid value is an error that names the setting, not a fallback to the default: a request with a valid model name and body fails with a 500 naming the setting (a malformed request still gets its 400 first), and `google-ai-plan auth login` and `auth status` stop with it, while `auth logout` works regardless. The server reads these settings at startup; the `google-ai-plan auth` commands read them each time they run. See [Google AI Ultra plan](/providers/google-ai-plan/#settings).
 
 ## Cursor Agent
 

@@ -15,6 +15,7 @@ The model ID in each request selects its provider. One proxy listener can serve 
 | `muse-spark-1.3`, `muse-spark-1.2`, `muse-wonder-1.0`, `muse-wonder-full-1.0`, `muse-ember-1.0` | Muse |
 | Non-conflicting registered OpenCode Go IDs and every `opencode-go/<model-id>` | OpenCode Go |
 | `gemini-4-argon`, `gemini-4-carbon`, `gemini-4-hydrogen`, `gemini-4-neon`, `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, the `-fast` forms of the four Gemini 4 IDs, and every `vertex/<model-id>` or `vertex/<publisher>/<model-id>` | Vertex AI |
+| Every `google-ai-plan/<model-id>`; listed: `gemini-4-hydrogen`, `gemini-4-neon`, `gemini-4-carbon`, `gemini-3.5-flash-lite` | Google AI Ultra plan |
 | `cursor`, Cursor legacy aliases, `cursor:<id>`, `cursor-plan:<id>`, `cursor-ask:<id>` | Cursor Agent |
 | Every `lmstudio/<model key>`, listed from the running LM Studio server | LM Studio |
 | Anthropic-style aliases such as `haiku`, `sonnet`, `opus`, `fable`, and registered `claude-*` aliases | The `aliasProvider`, Codex by default |
@@ -35,6 +36,8 @@ Every name that starts with `vertex/` routes to Vertex AI, and the Vertex AI pro
 | `vertex/endpoint/<name>`, where `<name>` is a key of `vertex.endpoints` in `config.json` | An endpoint you deployed |
 
 Unregistered IDs in these forms are sent too, so a new model works before the proxy lists it. Every other `vertex/<publisher>/<model-id>`, and a `vertex/endpoint/<name>` that names no configured endpoint, return HTTP 400. A bare ID that is not registered, such as a new `gemini-*` model, is not routed to Vertex AI; use the `vertex/` form.
+
+Every name that starts with `google-ai-plan/` routes to the Google AI Ultra plan, listed or not, so the same Gemini model is reached on the plan's quota as `google-ai-plan/gemini-4-hydrogen` and on a Google Cloud project as `gemini-4-hydrogen` or `vertex/gemini-4-hydrogen`. See [Google AI Ultra plan models](/providers/google-ai-plan/#models).
 
 Only Gemini IDs reach Vertex AI without the prefix. Bare `claude-*`, `gpt-*`, `grok-*`, and `muse-*` IDs keep their own providers: `claude-opus-5-5` is an Anthropic-style alias that follows the alias provider setting (Codex by default; see [Alias routing](#alias-routing)), `gpt-6.1-sol` is Codex, `grok-4.7` is Grok, and `muse-spark-1.3` is Muse. A bare open-model ID such as `glm-5.2-maas` does not reach Vertex AI either. The same model on Vertex AI is reached only as `vertex/<publisher>/<model-id>`, billed to your Google Cloud project. See [Vertex AI models](/providers/vertex/#models).
 

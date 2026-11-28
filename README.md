@@ -1,8 +1,8 @@
 # claude-code-proxy
 
 Claude Code, powered by **OpenAI Codex**, **Kimi**, **Grok**, **Muse**,
-**OpenCode Go**, **Vertex AI**, **Cursor Agent**, **LM Studio**, or a local
-**GGUF** model.
+**OpenCode Go**, **Vertex AI**, the **Google AI Ultra plan**, **Cursor Agent**,
+**LM Studio**, or a local **GGUF** model.
 
 Docs: <https://claude-code-proxy.raine.dev>
 
@@ -103,6 +103,7 @@ The opt-in Images API returns base64 image data and consumes the signed-in accou
 | Muse         | Meta account with Muse Code    | Registered `muse-*` models                      |
 | OpenCode Go  | OpenCode Go subscription       | Non-conflicting IDs and `opencode-go/<model-id>` |
 | Vertex AI    | Google Cloud project           | Registered `gemini-*` models, `vertex/<model-id>`, `vertex/<publisher>/<model-id>` |
+| Google AI Ultra plan | Google AI Ultra subscription | `google-ai-plan/<model-id>` |
 | Cursor Agent | Cursor account                 | Cursor aliases and `cursor:<model-id>` prefixes |
 | Local GGUF   | Local llama.cpp server         | `local/gguf` when `CCP_LLAMA_PORT` is set       |
 | LM Studio    | LM Studio 0.4.1+ local server  | `lmstudio/<model key>`, listed live from LM Studio |

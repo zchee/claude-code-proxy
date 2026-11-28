@@ -8,6 +8,7 @@ use crate::config::AliasProvider;
 use crate::logging::REDACT_KEYS;
 use crate::paths;
 use crate::providers::codex::translate::reasoning_signature::is_proxy_reasoning_signature;
+use crate::providers::google_ai_plan::translate::thought_signature::is_google_ai_plan_thought_signature;
 use crate::providers::muse::sanitize::{redact_secrets, sanitize_error_value};
 use crate::providers::muse::translate::reasoning_signature::is_muse_reasoning_signature;
 use crate::providers::vertex::translate::thought_signature::is_vertex_thought_signature;
@@ -375,7 +376,8 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
                     out.insert(key.clone(), redact_traffic_value(value));
                 } else if normalized == "data" && looks_like_inline_data(map) {
                     // Gemini `inlineData` parts carry raw base64 media beside
-                    // `mimeType`.
+                    // `mimeType`, and Interactions image content beside
+                    // `mime_type`.
                     out.insert(key.clone(), redact_traffic_value(value));
                 } else if normalized == "thoughtsignature" || normalized == "thought_signature" {
                     // Gemini thought signatures are opaque model state replayed
@@ -391,6 +393,7 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
                         is_proxy_reasoning_signature(signature)
                             || is_muse_reasoning_signature(signature)
                             || is_vertex_thought_signature(signature)
+                            || is_google_ai_plan_thought_signature(signature)
                     })
                 {
                     // The Codex and Muse translators replay reasoning as an
@@ -398,9 +401,16 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
                     // `ccp:<provider>:v1:<encoded-id>:<encrypted_content>`,
                     // which carries the same opaque conversation handle as the
                     // `encrypted_content` key; the Vertex translator carries a
-                    // Gemini thought signature as `ccp:vertex:v1:<model>:<sig>`.
+                    // Gemini thought signature as `ccp:vertex:v1:<model>:<sig>`,
+                    // and the Google AI Ultra plan translator as
+                    // `ccp:google-ai-plan:v1:<model>:<sig>`.
                     // Only proxy-owned signatures are touched; foreign ones
                     // (for example, real Anthropic signatures) are preserved.
+                    out.insert(key.clone(), redact_traffic_value(value));
+                } else if normalized == "signature" && looks_like_interactions_thought(map) {
+                    // Interactions `thought` steps and `thought_signature`
+                    // deltas carry the raw Gemini thought signature under a
+                    // plain `signature` key.
                     out.insert(key.clone(), redact_traffic_value(value));
                 } else if REDACT_KEYS.contains(&normalized.as_str())
                     || matches!(
@@ -517,7 +527,14 @@ fn looks_like_image_source(map: &Map<String, Value>) -> bool {
 /// An object shaped like a Gemini `Blob` (`inlineData`): a `mimeType` key
 /// beside `data`. Any media type is redacted, not only images.
 fn looks_like_inline_data(map: &Map<String, Value>) -> bool {
-    map.keys().any(|key| key.eq_ignore_ascii_case("mimetype"))
+    map.keys()
+        .any(|key| key.eq_ignore_ascii_case("mimetype") || key.eq_ignore_ascii_case("mime_type"))
+}
+
+fn looks_like_interactions_thought(map: &Map<String, Value>) -> bool {
+    map.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "thought" || kind == "thought_signature")
 }
 
 fn redact_traffic_value(value: &Value) -> Value {
@@ -1182,6 +1199,74 @@ mod tests {
         assert!(!captured.contains(VERTEX_SIGNATURE), "{captured}");
         assert!(!captured.contains("ccp:vertex:v1:"), "{captured}");
         assert!(captured.contains("signature_delta"), "{captured}");
+    }
+
+    const PLAN_ENVELOPE: &str =
+        "ccp:google-ai-plan:v1:gemini-4-hydrogen:c3ludGhldGljLWludGVyYWN0aW9ucw";
+    const PLAN_SIGNATURE: &str = "c3ludGhldGljLWludGVyYWN0aW9ucw";
+
+    #[test]
+    fn redact_traffic_strips_google_ai_plan_envelopes_raw_signatures_and_images() {
+        let value = serde_json::json!({
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "kept", "signature": PLAN_ENVELOPE}
+            ]}],
+            "input": [
+                {"type": "thought", "signature": PLAN_SIGNATURE, "summary": [{"type": "text", "text": "kept"}]},
+                {"type": "function_call", "id": "call_1", "name": "Read", "arguments": {}},
+                {"type": "user_input", "content": [
+                    {"type": "image", "mime_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"}
+                ]}
+            ],
+            "step": {"type": "thought", "signature": PLAN_SIGNATURE},
+            "delta": {"type": "thought_signature", "signature": PLAN_SIGNATURE}
+        });
+        let redacted = redact_traffic(&value);
+        let rendered = redacted.to_string();
+        for leaked in [PLAN_SIGNATURE, "ccp:google-ai-plan:v1:", "iVBORw0KGgo"] {
+            assert!(!rendered.contains(leaked), "{leaked} leaked: {rendered}");
+        }
+        assert_eq!(
+            redacted["input"][0]["signature"],
+            format!("[redacted len={}]", PLAN_SIGNATURE.len())
+        );
+        assert_eq!(redacted["input"][0]["summary"][0]["text"], "kept");
+        assert_eq!(redacted["input"][1]["name"], "Read");
+        assert_eq!(redacted["input"][2]["content"][0]["mime_type"], "image/png");
+        assert_eq!(redacted["messages"][0]["content"][0]["thinking"], "kept");
+    }
+
+    #[test]
+    fn traffic_capture_redacts_google_ai_plan_signatures_in_stream_events() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let capture = test_capture(temp.path().join("traffic"));
+        let mut stream = capture.stream_capture();
+        stream.upstream_event(
+            Some("step.delta"),
+            &serde_json::json!({"event_type": "step.delta", "index": 0, "delta": {"type": "thought_signature", "signature": PLAN_SIGNATURE}}),
+        );
+        stream.downstream_event(
+            "content_block_delta",
+            serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": PLAN_ENVELOPE}}),
+        );
+        stream.finish_named(
+            &capture,
+            serde_json::json!({}),
+            "061-google-ai-plan-stream-summary",
+        );
+        let captured = captured_files(&capture);
+        assert!(!captured.contains(PLAN_SIGNATURE), "{captured}");
+        assert!(!captured.contains("ccp:google-ai-plan:v1:"), "{captured}");
+        assert!(captured.contains("signature_delta"), "{captured}");
+    }
+
+    #[test]
+    fn redact_traffic_keeps_signatures_that_are_not_interactions_thoughts() {
+        let value = serde_json::json!({
+            "signature": "ccp:google-ai-planish:v1:not-ours",
+            "other": {"type": "text", "signature": "kept"}
+        });
+        assert_eq!(redact_traffic(&value), value);
     }
 
     #[test]

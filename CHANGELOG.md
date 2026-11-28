@@ -5,6 +5,17 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
+- Google AI Ultra subscribers can use Gemini on their plan's quota as
+  `google-ai-plan/gemini-4-hydrogen`, `google-ai-plan/gemini-4-neon`,
+  `google-ai-plan/gemini-4-carbon`, and `google-ai-plan/gemini-3.5-flash-lite`
+  after `claude-code-proxy google-ai-plan auth login`, with tools, image input,
+  and thinking levels up to `xhigh`. The sign-in uses the OAuth client the pi
+  project registered with Google, which Google or pi can restrict at any time;
+  `googleAiPlan.clientId` and `googleAiPlan.clientSecret` replace it with your
+  own. On `/v1/messages`, a daily limit or a model outside the plan is
+  answered with `x-should-retry: false`, so Claude Code does not retry it.
+  See the
+  [Google AI Ultra plan provider page](https://claude-code-proxy.raine.dev/providers/google-ai-plan/).
 - When Vertex AI closes a streaming Gemini response before any
   `finishReason`, the proxy now sends the request again, up to twice, instead
   of ending the turn with `Vertex AI stream ended without a finishReason`. It

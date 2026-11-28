@@ -2142,3 +2142,381 @@ fn models_lists_the_configured_vertex_endpoints_synthetic() -> Result<(), Box<dy
     assert!(!line.contains("vertex/endpoint/"), "{line}");
     Ok(())
 }
+
+/// Shaped like a Google OAuth access token.
+const PLAN_ACCESS_TOKEN: &str = "ya29.synthetic-plan-access-token-7f3a9c2e5b1d";
+const PLAN_CLIENT_ID: &str = "synthetic-plan-client.apps.example";
+const PLAN_CLIENT_SECRET: &str = "synthetic-plan-client-secret-41c7";
+
+/// Variables that would point a Google AI Ultra plan command at the user's
+/// real settings.
+const PLAN_REAL_ENV: &[&str] = &[
+    "CCP_GOOGLE_AI_PLAN_CLIENT_ID",
+    "CCP_GOOGLE_AI_PLAN_CLIENT_SECRET",
+    "CCP_GOOGLE_AI_PLAN_BASE_URL",
+    "CCP_GOOGLE_AI_PLAN_USER_AGENT",
+];
+
+/// A `google-ai-plan` command whose config, state and home directories are
+/// `home`, with the synthetic OAuth client configured.
+fn plan_command(home: &TempDir, args: &[&str]) -> Command {
+    let mut cmd = Command::cargo_bin("claude-code-proxy").unwrap();
+    cmd.args(args);
+    for name in PLAN_REAL_ENV {
+        cmd.env_remove(name);
+    }
+    cmd.env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("XDG_STATE_HOME", home.path().join("state"))
+        .env("CCP_CONFIG_DIR", home.path().join("config"))
+        .env("CCP_GOOGLE_AI_PLAN_CLIENT_ID", PLAN_CLIENT_ID)
+        .env("CCP_GOOGLE_AI_PLAN_CLIENT_SECRET", PLAN_CLIENT_SECRET)
+        .timeout(std::time::Duration::from_secs(60));
+    cmd
+}
+
+/// Writes a sign-in whose access token is good for an hour. The DPoP key is
+/// only read by a refresh, which these tests never reach.
+fn store_plan_sign_in(home: &TempDir) -> std::path::PathBuf {
+    let dir = home.path().join("config").join("google-ai-plan");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("auth.json");
+    let expires_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 3_600_000;
+    let auth = serde_json::json!({
+        "access": PLAN_ACCESS_TOKEN,
+        "refresh": "synthetic-plan-refresh-token",
+        "expires_at_ms": expires_at_ms,
+        "client_id": PLAN_CLIENT_ID,
+        "dpop_key": "synthetic-unused-dpop-key",
+    });
+    std::fs::write(&path, auth.to_string()).unwrap();
+    path
+}
+
+#[test]
+fn models_lists_the_four_google_ai_plan_models_after_vertex()
+-> Result<(), Box<dyn std::error::Error>> {
+    let home = TempDir::new()?;
+    let output = plan_command(&home, &["models"]).output()?;
+    let out = String::from_utf8(output.stdout)?;
+    let vertex = out.find("\nvertex:").unwrap_or_else(|| panic!("{out}"));
+    let plan = out
+        .find("\ngoogle-ai-plan:")
+        .unwrap_or_else(|| panic!("{out}"));
+    let cursor = out.find("\ncursor:").unwrap_or_else(|| panic!("{out}"));
+    assert!(vertex < plan && plan < cursor, "{out}");
+    let line = out
+        .lines()
+        .find(|line| line.starts_with("google-ai-plan:"))
+        .unwrap();
+    assert_eq!(
+        line,
+        "google-ai-plan: google-ai-plan/gemini-3.5-flash-lite, google-ai-plan/gemini-4-carbon, \
+         google-ai-plan/gemini-4-hydrogen, google-ai-plan/gemini-4-neon"
+    );
+    Ok(())
+}
+
+#[test]
+fn help_lists_the_google_ai_plan_command_and_its_auth_actions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let home = TempDir::new()?;
+    let output = plan_command(&home, &["--help"]).output()?;
+    assert!(
+        String::from_utf8(output.stdout)?.contains("Manage Google AI Ultra plan authentication")
+    );
+    let output = plan_command(&home, &["google-ai-plan", "auth", "--help"]).output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    for action in ["login", "device", "status", "logout"] {
+        assert!(stdout.contains(action), "missing {action}: {stdout}");
+    }
+    Ok(())
+}
+
+#[test]
+fn google_ai_plan_auth_status_without_a_sign_in_exits_one() -> Result<(), Box<dyn std::error::Error>>
+{
+    let home = TempDir::new()?;
+    let output = plan_command(&home, &["google-ai-plan", "auth", "status"]).output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("Not authenticated"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn google_ai_plan_auth_status_reports_the_sign_in_without_secrets()
+-> Result<(), Box<dyn std::error::Error>> {
+    let home = TempDir::new()?;
+    let path = store_plan_sign_in(&home);
+    let output = plan_command(&home, &["google-ai-plan", "auth", "status"]).output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(output.status.success(), "{stdout}{stderr}");
+    assert!(
+        stdout.contains(&format!("Auth path: {}", path.display())),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Authenticated: true"), "{stdout}");
+    assert!(stdout.contains("OAuth client: configured"), "{stdout}");
+    assert!(stdout.contains("Access token expires in "), "{stdout}");
+    for secret in [
+        PLAN_ACCESS_TOKEN,
+        PLAN_CLIENT_SECRET,
+        "synthetic-plan-refresh-token",
+    ] {
+        assert!(
+            !stdout.contains(secret) && !stderr.contains(secret),
+            "{stdout}{stderr}"
+        );
+    }
+
+    let output = plan_command(&home, &["google-ai-plan", "auth", "logout"]).output()?;
+    assert!(output.status.success());
+    assert!(!path.exists(), "logout removes the credential");
+    Ok(())
+}
+
+#[test]
+fn google_ai_plan_invalid_setting_is_named_by_the_cli() -> Result<(), Box<dyn std::error::Error>> {
+    let home = TempDir::new()?;
+    store_plan_sign_in(&home);
+    let output = plan_command(&home, &["google-ai-plan", "auth", "status"])
+        .env("CCP_GOOGLE_AI_PLAN_BASE_URL", "http://10.0.0.1/v1beta")
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(output.status.code(), Some(2), "{stdout}");
+    assert!(
+        stdout.contains("Invalid Google AI Ultra plan setting CCP_GOOGLE_AI_PLAN_BASE_URL"),
+        "{stdout}"
+    );
+    // The provider is still listed.
+    let output = plan_command(&home, &["models"])
+        .env("CCP_GOOGLE_AI_PLAN_BASE_URL", "http://10.0.0.1/v1beta")
+        .output()?;
+    assert!(String::from_utf8(output.stdout)?.contains("google-ai-plan:"));
+    Ok(())
+}
+
+/// A loopback stand-in for the Interactions endpoint that answers request
+/// `n` with `bodies[n]` as an event stream and closes the connection.
+#[cfg(unix)]
+fn plan_upstream(bodies: Vec<String>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for body in bodies {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            // Read the headers and the body the content length announces.
+            while let Ok(read) = stream.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text[..end]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+            );
+        }
+    });
+    format!("http://{address}/v1beta")
+}
+
+#[cfg(unix)]
+fn plan_frames(events: &[serde_json::Value]) -> String {
+    events
+        .iter()
+        .map(|event| {
+            format!(
+                "event: {}\ndata: {event}\n\n",
+                event["event_type"].as_str().unwrap()
+            )
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn google_ai_plan_server_failed_streams_are_logged_without_upstream_prose_or_the_token()
+-> Result<(), Box<dyn std::error::Error>> {
+    use serde_json::json;
+    let text_step = [
+        json!({"event_type":"step.start","index":0,"step":{"type":"model_output"}}),
+        json!({"event_type":"step.delta","index":0,"delta":{"type":"text","text":"partial"}}),
+    ];
+    let early_close = plan_frames(&text_step);
+    let mut with_error = text_step.to_vec();
+    with_error.push(json!({"event_type":"error","error":{
+        "code":"invalid_request",
+        "message":format!("synthetic upstream prose echoing {PLAN_ACCESS_TOKEN}")
+    }}));
+    let in_stream_error = plan_frames(&with_error);
+    let base = plan_upstream(vec![early_close, in_stream_error]);
+
+    let home = TempDir::new()?;
+    store_plan_sign_in(&home);
+    let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"));
+    for name in PLAN_REAL_ENV {
+        command.env_remove(name);
+    }
+    let child = command
+        .args(["serve", "--no-monitor", "--port", &port.to_string()])
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("XDG_STATE_HOME", home.path().join("state"))
+        .env("CCP_CONFIG_DIR", home.path().join("config"))
+        .env("CCP_TRAFFIC_LOG", "1")
+        .env("CCP_GOOGLE_AI_PLAN_CLIENT_ID", PLAN_CLIENT_ID)
+        .env("CCP_GOOGLE_AI_PLAN_CLIENT_SECRET", PLAN_CLIENT_SECRET)
+        .env("CCP_GOOGLE_AI_PLAN_BASE_URL", &base)
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut child = ChildGuard(child);
+    drop(wait_for_service(&mut child, port)?);
+
+    let body = json!({
+        "model": "google-ai-plan/gemini-4-hydrogen",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}]
+    })
+    .to_string();
+    let mut downstream = Vec::new();
+    for _ in 0..2 {
+        downstream.push(post_raw(port, &body)?);
+    }
+    // The log line is written before the error event is sent, so both lines
+    // are there once both responses have ended; the poll only bounds a
+    // regression.
+    let state_dir = home.path().join("state").join("claude-code-proxy");
+    let failed_lines = || {
+        std::fs::read_to_string(state_dir.join("proxy.log"))
+            .unwrap_or_default()
+            .matches("\"google_ai_plan_stream_failed\"")
+            .count()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while failed_lines() < 2 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    child.0.kill()?;
+    child.0.wait()?;
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.0.stderr.take() {
+        pipe.read_to_string(&mut stderr)?;
+    }
+
+    for response in &downstream {
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(response.matches("event: error").count(), 1, "{response}");
+        assert!(!response.contains("message_stop"), "{response}");
+    }
+    assert!(
+        downstream[0].contains("ended before interaction.completed"),
+        "{}",
+        downstream[0]
+    );
+    assert!(
+        downstream[1].contains("synthetic upstream prose"),
+        "the client reads Google's message: {}",
+        downstream[1]
+    );
+
+    let log = std::fs::read_to_string(state_dir.join("proxy.log"))?;
+    assert_eq!(
+        log.matches("\"google_ai_plan_stream_failed\"").count(),
+        2,
+        "{log}"
+    );
+    assert!(log.contains("\"incomplete_stream\""), "{log}");
+    assert!(log.contains("\"upstream_error\""), "{log}");
+    assert!(!log.contains("synthetic upstream prose"), "{log}");
+    let secrets = [
+        PLAN_ACCESS_TOKEN,
+        PLAN_CLIENT_SECRET,
+        "synthetic-plan-refresh-token",
+    ];
+    for (place, text) in [("stderr", &stderr), ("responses", &downstream.concat())] {
+        for secret in secrets {
+            assert!(!text.contains(secret), "{place} holds {secret}:\n{text}");
+        }
+    }
+    let files = plan_files_under(&state_dir);
+    let named = |part: &str| {
+        files
+            .iter()
+            .filter(|(path, _)| path.to_string_lossy().contains(part))
+            .collect::<Vec<_>>()
+    };
+    let summaries = named("061-google-ai-plan-stream-summary");
+    assert_eq!(summaries.len(), 2, "one summary per request: {files:?}");
+    for (path, text) in &summaries {
+        assert!(text.contains("stream_error"), "{}: {text}", path.display());
+    }
+    assert_eq!(
+        named("021-upstream-request-metadata").len(),
+        2,
+        "one request metadata file per request: {files:?}"
+    );
+    for (path, text) in &files {
+        for secret in secrets {
+            assert!(
+                !text.contains(secret),
+                "{} holds {secret}:\n{text}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Every file under `dir` with its text.
+#[cfg(unix)]
+fn plan_files_under(dir: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+    let mut files = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                files.push((path, text));
+            }
+        }
+    }
+    files
+}
