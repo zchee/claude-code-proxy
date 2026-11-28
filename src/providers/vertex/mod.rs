@@ -1495,7 +1495,7 @@ mod tests {
         }
         let names = provider.supported_models();
         assert!(
-            names.contains(&"vertex/endpoint/no-tools".to_string()),
+            names.iter().any(|name| name == "vertex/endpoint/no-tools"),
             "{names:?}"
         );
         assert!(

@@ -2704,19 +2704,19 @@ mod tests {
     fn supported_models_includes_fast_variants() {
         let provider = CodexProvider::new();
         let models = provider.supported_models();
-        assert!(models.contains(&"gpt-5.6-sol".to_string()));
-        assert!(models.contains(&"gpt-5.6-sol-fast".to_string()));
-        assert!(models.contains(&"gpt-5.6-terra".to_string()));
-        assert!(models.contains(&"gpt-5.6-luna".to_string()));
-        assert!(models.contains(&"gpt-6-sol".to_string()));
-        assert!(models.contains(&"gpt-6-sol-fast".to_string()));
-        assert!(models.contains(&"gpt-6-luna".to_string()));
-        assert!(models.contains(&"gpt-6.1-sol".to_string()));
-        assert!(models.contains(&"gpt-6.1-sol-fast".to_string()));
-        assert!(models.contains(&"gpt-6.1-sol-ultrafast".to_string()));
-        assert!(models.contains(&"gpt-6.1-terra".to_string()));
-        assert!(models.contains(&"gpt-6.1-terra-fast".to_string()));
-        assert!(!models.contains(&"gpt-6.1-terra-ultrafast".to_string()));
+        assert!(models.iter().any(|name| name == "gpt-5.6-sol"));
+        assert!(models.iter().any(|name| name == "gpt-5.6-sol-fast"));
+        assert!(models.iter().any(|name| name == "gpt-5.6-terra"));
+        assert!(models.iter().any(|name| name == "gpt-5.6-luna"));
+        assert!(models.iter().any(|name| name == "gpt-6-sol"));
+        assert!(models.iter().any(|name| name == "gpt-6-sol-fast"));
+        assert!(models.iter().any(|name| name == "gpt-6-luna"));
+        assert!(models.iter().any(|name| name == "gpt-6.1-sol"));
+        assert!(models.iter().any(|name| name == "gpt-6.1-sol-fast"));
+        assert!(models.iter().any(|name| name == "gpt-6.1-sol-ultrafast"));
+        assert!(models.iter().any(|name| name == "gpt-6.1-terra"));
+        assert!(models.iter().any(|name| name == "gpt-6.1-terra-fast"));
+        assert!(!models.iter().any(|name| name == "gpt-6.1-terra-ultrafast"));
         for model in ["gpt-6.2-astra", "gpt-6.2-sol"] {
             for name in [
                 model.to_string(),
@@ -2726,11 +2726,11 @@ mod tests {
                 assert!(models.contains(&name), "{name}");
             }
         }
-        assert!(models.contains(&"gpt-5.4".to_string()));
-        assert!(models.contains(&"gpt-5.4-mini".to_string()));
-        assert!(models.contains(&"gpt-6-astra-fast".to_string()));
-        assert!(models.contains(&"gpt-6-astra-ultrafast".to_string()));
-        assert!(!models.contains(&"gpt-6-sol-ultrafast".to_string()));
+        assert!(models.iter().any(|name| name == "gpt-5.4"));
+        assert!(models.iter().any(|name| name == "gpt-5.4-mini"));
+        assert!(models.iter().any(|name| name == "gpt-6-astra-fast"));
+        assert!(models.iter().any(|name| name == "gpt-6-astra-ultrafast"));
+        assert!(!models.iter().any(|name| name == "gpt-6-sol-ultrafast"));
     }
 
     #[test]

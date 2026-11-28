@@ -1517,7 +1517,7 @@ mod tests {
         let endpoints = crate::config::resolve_vertex_endpoints(config.path());
         let listed = advertised_models_with(&endpoints);
         assert_eq!(listed.len(), 66, "{listed:?}");
-        assert!(listed.contains(&"vertex/endpoint/my-llm".to_string()));
+        assert!(listed.iter().any(|name| name == "vertex/endpoint/my-llm"));
         assert!(!listed.iter().any(|name| name.contains("broken")));
         let mut sorted = listed.clone();
         sorted.sort_unstable();

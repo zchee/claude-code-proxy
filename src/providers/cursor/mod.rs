@@ -620,10 +620,10 @@ mod tests {
     fn supported_models_includes_legacy_and_agent() {
         let provider = CursorProvider::new();
         let models = provider.supported_models();
-        assert!(models.contains(&"cursor".to_string()));
-        assert!(models.contains(&"cursor-agent".to_string()));
-        assert!(models.contains(&"cursor-plan".to_string()));
-        assert!(models.contains(&"cursor-ask".to_string()));
+        assert!(models.iter().any(|name| name == "cursor"));
+        assert!(models.iter().any(|name| name == "cursor-agent"));
+        assert!(models.iter().any(|name| name == "cursor-plan"));
+        assert!(models.iter().any(|name| name == "cursor-ask"));
     }
 
     #[test]

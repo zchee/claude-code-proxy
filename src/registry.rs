@@ -578,7 +578,12 @@ mod tests {
                 "{model}"
             );
         }
-        assert!(registry.list_provider_names().contains(&"muse".to_string()));
+        assert!(
+            registry
+                .list_provider_names()
+                .iter()
+                .any(|name| name == "muse")
+        );
     }
 
     #[test]
@@ -721,7 +726,8 @@ mod tests {
         assert!(
             registry
                 .list_provider_names()
-                .contains(&"vertex".to_string())
+                .iter()
+                .any(|name| name == "vertex")
         );
     }
 
