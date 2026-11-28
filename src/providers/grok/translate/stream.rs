@@ -51,6 +51,11 @@ impl SseDecoder {
         Ok(events)
     }
 
+    /// Bytes of a frame that has not ended yet.
+    pub fn pending_bytes(&self) -> usize {
+        self.frame.len()
+    }
+
     pub fn finish(&mut self) -> anyhow::Result<()> {
         if self.frame.is_empty() {
             Ok(())

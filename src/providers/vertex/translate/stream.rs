@@ -249,6 +249,32 @@ pub fn error_event(error: &StreamError, sanitize: &dyn Fn(&str) -> String) -> Ve
     encode_sse_event(Some("error"), &data.to_string())
 }
 
+/// What one attempt at a response has received, for logs. Counts and flags
+/// only, so a log line carries none of the response.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Received {
+    /// Thought-summary parts with text, forwarded to the client or not.
+    pub thought_parts: u64,
+    /// Answer-text parts.
+    pub text_parts: u64,
+    /// `functionCall` parts.
+    pub tool_calls: u64,
+    /// Whether a chunk carried `usageMetadata`.
+    pub usage: bool,
+    /// Bytes of an SSE frame that had not ended.
+    pub pending_frame_bytes: usize,
+}
+
+impl Received {
+    fn log_fields(self, fields: &mut Map<String, Value>) {
+        fields.insert("thoughtParts".into(), json!(self.thought_parts));
+        fields.insert("textParts".into(), json!(self.text_parts));
+        fields.insert("toolCalls".into(), json!(self.tool_calls));
+        fields.insert("usage".into(), json!(self.usage));
+        fields.insert("pendingFrameBytes".into(), json!(self.pending_frame_bytes));
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Chunk {
@@ -420,6 +446,11 @@ struct TranslationState {
     block_count: usize,
     open: Option<Open>,
     tool_count: usize,
+    /// Thought-summary parts with text in the current attempt, forwarded or
+    /// not.
+    thought_parts: u64,
+    /// Answer-text parts in the current attempt.
+    text_parts: u64,
     finish: Option<Finish>,
     usage: Option<UsageMetadata>,
 }
@@ -436,6 +467,8 @@ impl TranslationState {
             block_count: 0,
             open: None,
             tool_count: 0,
+            thought_parts: 0,
+            text_parts: 0,
             finish: None,
             usage: None,
         }
@@ -537,11 +570,13 @@ impl TranslationState {
             return Ok(());
         }
         if part.thought == Some(true) {
+            self.thought_parts = self.thought_parts.saturating_add(1);
             if self.config.emit_thinking {
                 self.thinking_delta(&text, out)?;
             }
             Ok(())
         } else {
+            self.text_parts = self.text_parts.saturating_add(1);
             self.text_delta(&text, out)
         }
     }
@@ -1034,6 +1069,22 @@ impl LiveStreamTranslator {
         self.state.finished
     }
 
+    /// What the current attempt has received.
+    pub fn received(&self) -> Received {
+        Received {
+            thought_parts: self.state.thought_parts,
+            text_parts: self.state.text_parts,
+            tool_calls: self.state.tool_count as u64,
+            usage: self.state.usage.is_some(),
+            pending_frame_bytes: self.decoder.pending_bytes(),
+        }
+    }
+
+    /// The model name echoed to the client.
+    pub fn model(&self) -> &str {
+        &self.state.config.model
+    }
+
     /// The non-streaming Anthropic message, once the response is completed.
     ///
     /// # Errors
@@ -1222,6 +1273,7 @@ impl<E> VertexStreamState<E> {
 
     fn fail(&mut self, error: &StreamError) -> Vec<u8> {
         self.done = true;
+        self.log_failure(error);
         let sanitize = self.sinks.sanitize.clone();
         if let Some(outcome) = self.sinks.outcome.as_ref() {
             outcome.fail(error.message_with(&*sanitize));
@@ -1233,6 +1285,23 @@ impl<E> VertexStreamState<E> {
         self.capture_downstream(&output);
         self.finish_capture(false);
         output
+    }
+
+    /// Records a failed stream in the proxy log. The server logs a
+    /// streaming request as completed once the response headers are sent,
+    /// so without this line a failure inside the stream leaves no trace.
+    /// The line holds no upstream prose: [`StreamError`]'s `Display` is
+    /// proxy-authored words and enum tokens.
+    fn log_failure(&self, error: &StreamError) {
+        let mut fields = Map::new();
+        fields.insert("reqId".into(), json!(self.sinks.req_id));
+        fields.insert("model".into(), json!(self.translator.model()));
+        fields.insert("kind".into(), json!(error.kind()));
+        fields.insert("error".into(), json!(error.to_string()));
+        fields.insert("bytes".into(), json!(self.bytes));
+        fields.insert("chunks".into(), json!(self.chunks));
+        self.translator.received().log_fields(&mut fields);
+        crate::logging::create_logger("vertex").warn("vertex_stream_failed", Some(fields));
     }
 
     fn report_progress(&self, output: &[u8]) {
@@ -2478,5 +2547,40 @@ mod tests {
         assert!(text.contains("Vertex AI stream was interrupted"), "{text}");
         assert!(!text.contains("reset"), "{text}");
         assert!(outcome.failure().is_some());
+    }
+
+    fn thought_chunk(text: &str) -> String {
+        json!({"candidates":[{"content":{"role":"model","parts":[{"text":text,"thought":true}]}}]})
+            .to_string()
+    }
+
+    #[test]
+    fn received_counts_the_parts_of_a_response_without_keeping_them() {
+        let mut translator = LiveStreamTranslator::streaming(config(false));
+        assert_eq!(translator.received(), Received::default());
+        let usage = json!({"usageMetadata":{"promptTokenCount":9}}).to_string();
+        let mut input = frames(&[
+            &thought_chunk("plan"),
+            &thought_chunk("more"),
+            &text_chunk("hi"),
+            &call_chunk("Read", Some(SIG_A)),
+            &usage,
+        ]);
+        // The upstream stopped inside a frame.
+        input.push_str("data: {\"candidates\"");
+        translator.push(input.as_bytes()).unwrap();
+        // Thoughts are counted although this translator does not forward
+        // them to the client.
+        assert_eq!(
+            translator.received(),
+            Received {
+                thought_parts: 2,
+                text_parts: 1,
+                tool_calls: 1,
+                usage: true,
+                pending_frame_bytes: "data: {\"candidates\"".len(),
+            }
+        );
+        assert_eq!(translator.model(), format!("vertex/{MODEL}"));
     }
 }
